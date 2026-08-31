@@ -395,11 +395,29 @@ class ExecutionSimulator:
                         trigger_type, pool_name, triggered_signals
                     )
                 # If opposite direction, close existing first (full close)
-                self._execute_close(
+                # and stash the close trade so the engine can collect both
+                close_trade = self._execute_close(
                     account, symbol, current_price, timestamp,
                     trigger_type, pool_name, triggered_signals, "Reverse position",
                     target_portion=1.0
                 )
+                open_trade = self._execute_open(
+                    account, decision, current_price, timestamp,
+                    trigger_type, pool_name, triggered_signals
+                )
+                if close_trade is not None:
+                    # stash for engine loop (supports both old and new engine paths)
+                    self._last_close_trade = close_trade  # type: ignore
+                    # if open failed, still return the close so it is not lost
+                    if open_trade is None:
+                        return close_trade
+                    # return both via a tuple-like container; engine will unpack
+                    # keep backward compat: attach close as attribute on open
+                    try:
+                        open_trade._close_trade = close_trade  # type: ignore
+                    except Exception:
+                        pass
+                return open_trade
 
             return self._execute_open(
                 account, decision, current_price, timestamp,

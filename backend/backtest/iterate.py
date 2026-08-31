@@ -101,17 +101,20 @@ def _mutate_param_jitter(code: str, round_idx: int) -> str:
 
 def _mutate_threshold(code: str, round_idx: int) -> str:
     if "get_indicator" in code and "rsi" in code.lower():
-        rsi_buy = 68 + (round_idx % 5)
-        rsi_sell = 32 - (round_idx % 5)
-        new_code = re.sub(r"rsi[\"\' ]*[><=]+\s*\d+", f"rsi > {rsi_buy}", code)
-        new_code = re.sub(r"rsi\s*<\s*\d+", f"rsi < {rsi_sell}", new_code)
+        # existing rsi filter — jitter thresholds (RSI14, buy when oversold rsi<, sell when overbought rsi>)
+        th_buy = 68 + (round_idx % 5)   # 68..72
+        th_sell = 32 - (round_idx % 5)  # 32..28
+        new_code = re.sub(r"rsi\s*<\s*\d+", f"rsi < {th_buy}", code)
+        new_code = re.sub(r"rsi\s*>\s*\d+", f"rsi > {th_sell}", new_code)
+        # also fix legacy lowercase indicator name
+        new_code = new_code.replace('"rsi"', '"RSI14"').replace("'rsi'", "'RSI14'")
         return new_code
     ind_block = (
-        "        rsi_info = data.get_indicator(\"BTC\", \"rsi\", \"5m\")\n"
+        "        rsi_info = data.get_indicator(\"BTC\", \"RSI14\", \"5m\")\n"
         "        rsi = rsi_info.get(\"value\", 50) if isinstance(rsi_info, dict) else 50\n"
         "        if rsi is None:\n"
         "            rsi = 50\n"
-    )
+     )
     if "rsi_info" not in code:
         new_code = code.replace(
             "        closes = [k.close for k in klines]",

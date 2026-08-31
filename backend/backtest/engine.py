@@ -257,6 +257,31 @@ class ProgramBacktestEngine:
                         pool_name=trigger.pool_name,
                         triggered_signals=signal_names,
                     )
+                    # collect reverse close stashed by simulator
+                    stashed = getattr(simulator, "_last_close_trade", None)
+                    if stashed is not None:
+                        try:
+                            delattr(simulator, "_last_close_trade")
+                        except Exception:
+                            try:
+                                simulator._last_close_trade = None
+                            except Exception:
+                                pass
+                        # avoid double count if already attached
+                        if trade is not None and getattr(trade, "_close_trade", None) is stashed:
+                            try:
+                                delattr(trade, "_close_trade")
+                            except Exception:
+                                pass
+                        trades.append(stashed)
+                    # also handle attached close on trade
+                    attached = getattr(trade, "_close_trade", None) if trade is not None else None
+                    if attached is not None:
+                        trades.append(attached)
+                        try:
+                            delattr(trade, "_close_trade")
+                        except Exception:
+                            pass
                     if trade:
                         trades.append(trade)
 
@@ -499,6 +524,29 @@ class ProgramBacktestEngine:
                         pool_name=trigger.pool_name,
                         triggered_signals=signal_names,
                     )
+                    # collect reverse close stashed by simulator
+                    stashed = getattr(simulator, "_last_close_trade", None)
+                    if stashed is not None:
+                        try:
+                            delattr(simulator, "_last_close_trade")
+                        except Exception:
+                            try:
+                                simulator._last_close_trade = None  # type: ignore
+                            except Exception:
+                                pass
+                        if trade is not None and getattr(trade, "_close_trade", None) is stashed:
+                            try:
+                                delattr(trade, "_close_trade")
+                            except Exception:
+                                pass
+                        all_trades.append(stashed)
+                    attached = getattr(trade, "_close_trade", None) if trade is not None else None
+                    if attached is not None:
+                        all_trades.append(attached)
+                        try:
+                            delattr(trade, "_close_trade")
+                        except Exception:
+                            pass
                     if trade:
                         all_trades.append(trade)
 
