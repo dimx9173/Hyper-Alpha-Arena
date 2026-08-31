@@ -36,6 +36,33 @@ def parse_signal_pool_ids(strategy: AccountStrategyConfig) -> List[int]:
     return []
 
 
+def _validate_trigger_interval_against_kline(db: Session, account_id: int, trigger_interval: Optional[int], scheduled_trigger_enabled: bool) -> None:
+    if not scheduled_trigger_enabled or trigger_interval is None:
+        return
+    try:
+        from services.ai_decision_service import get_max_kline_period_seconds, get_max_kline_period_label, _build_trigger_interval_error
+        from database.models import AccountPromptBinding, PromptTemplate
+    except Exception:
+        return
+    try:
+        binding = db.query(AccountPromptBinding).filter(AccountPromptBinding.account_id == account_id, AccountPromptBinding.is_deleted != True).first()  # type: ignore[attr-defined]
+        if binding is None:
+            return
+        template = db.query(PromptTemplate).filter(PromptTemplate.id == binding.prompt_template_id, PromptTemplate.is_deleted == "false").first()  # type: ignore[attr-defined]
+        if template is None or not getattr(template, "template_text", None):
+            return
+        max_sec = get_max_kline_period_seconds(str(template.template_text))  # type: ignore[arg-type]
+        if max_sec is None:
+            return
+        if trigger_interval <= max_sec:
+            label = get_max_kline_period_label(str(template.template_text)) or str(max_sec)  # type: ignore[arg-type]
+            raise ValueError(_build_trigger_interval_error(trigger_interval, max_sec, label))
+    except ValueError:
+        raise
+    except Exception:
+        return
+
+
 def upsert_strategy(
     db: Session,
     account_id: int,
@@ -51,6 +78,8 @@ def upsert_strategy(
     exchange: str = "hyperliquid",  # "hyperliquid" or "binance"
 ) -> AccountStrategyConfig:
     print(f"upsert_strategy called with: account_id={account_id}, signal_pool_ids={signal_pool_ids}, signal_pool_id={signal_pool_id}")
+    effective_interval = trigger_interval or interval_seconds
+    _validate_trigger_interval_against_kline(db, account_id, effective_interval, scheduled_trigger_enabled)
     strategy = get_strategy_by_account(db, account_id)
     if strategy is None:
         strategy = AccountStrategyConfig(account_id=account_id)
