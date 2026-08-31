@@ -122,7 +122,8 @@ class HistoricalDataProvider:
 
         Priority:
         1. market_asset_metrics.mark_price (15-second granularity, most accurate)
-        2. 1m kline close price (fallback)
+        2. 1m kline close price (fast cache fallback)
+        3. Best available kline (1h/5m/15m) close as last resort - fixes flat 78700 bug
         """
         # Try market_asset_metrics first (15-second granularity)
         try:
@@ -150,11 +151,22 @@ class HistoricalDataProvider:
             if klines:
                 return klines[0]["close"]
 
-        # Final fallback: DB query for kline
+        # Fallback to best available period (fixes flat price when 1m missing)
+        for period in ["1h", "15m", "5m", "4h", "1d"]:
+            ck = f"{symbol}_{period}"
+            if ck in self._kline_cache and self._kline_cache[ck]:
+                klines = self._kline_cache[ck]
+                for k in reversed(klines):
+                    if k["timestamp"] <= timestamp_sec:
+                        return k["close"]
+                if klines:
+                    return klines[0]["close"]
+
+        # Final fallback: DB query for kline (any period)
         try:
             result = self.db.execute(text("""
                 SELECT close_price FROM crypto_klines
-                WHERE symbol = :symbol AND period = '1m' AND exchange = :exchange
+                WHERE symbol = :symbol AND exchange = :exchange
                 AND timestamp <= :ts
                 ORDER BY timestamp DESC LIMIT 1
             """), {"symbol": symbol, "exchange": self.exchange, "ts": timestamp_sec})
