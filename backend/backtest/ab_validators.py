@@ -7,7 +7,14 @@ import time, json
 from typing import Tuple, List, Dict, Any
 
 def _run_one(db, code: str, symbols, start_ms: int, end_ms: int, trigger=3700, fee=0.035, slip=0.05, exchange="binance"):
-    from backtest import BacktestConfig, ProgramBacktestEngine
+    try:
+        from backtest import BacktestConfig, ProgramBacktestEngine
+    except ImportError:
+        try:
+            from backend.backtest import BacktestConfig, ProgramBacktestEngine
+        except ImportError:
+            from backtest.models import BacktestConfig
+            from backtest.engine import ProgramBacktestEngine
     cfg = BacktestConfig(code=code, signal_pool_ids=[], symbols=symbols, start_time_ms=start_ms, end_time_ms=end_ms, scheduled_interval_sec=trigger, initial_balance=10000.0, slippage_percent=slip, fee_rate=fee, exchange=exchange)
     return ProgramBacktestEngine(db).run(cfg)
 
