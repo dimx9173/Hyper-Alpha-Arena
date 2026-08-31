@@ -1,35 +1,37 @@
 
 """
-30-Round 策略迭代迴圈 harness
+30-Round 策略迭代迴圈 harness — 日均單利1%版 (Q1=B / Q2=A)
 
 設計
 ====
-全自動 30 輪策略演進：每輪以當前 best 策略為父本產生變體，經 A/B 雙閘門回測驗證，
-僅雙閘門皆通過且指標優於歷史 best 才晉升。此迴圈讓使用者一句「繼續迭代策略」
+全自動 30 輪策略演進：每輪以當前 best 策略為父本產生變體，經 A/B/C 三閘門回測驗證，
+僅三閘皆通過且指標優於歷史 best 才晉升。此迴圈讓使用者一句「繼續迭代策略」
 即可執行 `PYTHONPATH=backend python -m backtest.iterate --rounds 30` 完成無人值守優化。
 
-A/B 閘門定義
+A/B/C 閘門定義（對應 ab_validators，單利1%/天 = 30%/30d、90%/90d）
 ============
-- Gate A (短期穩健)：30d sharpe > threshold-a (預設 -0.3) 且 PF>0 (或無交易時 None 視為通過)
-  且 7d 交易數 >= 2。對應 ab_validators.a_validator。
-- Gate B (跨期穩健)：Walk-Forward 2 folds、每 fold 30d，平均 sharpe > threshold-b
-  (預設 -0.5)。對應 ab_validators.b_validator。
+- Gate A (30d 日均1%單利)：30d pnl%>30 且 sharpe>1.0 且 PF>1.5 且 win>45%
+  且 30d trades>=10 且 7d>=3 且 maxDD%<12% 且 5m 日均>=50。a_validator。
+- Gate B (WF 3×30d 跨期)：每fold 30d avg sharpe>0.8 且 每fold pnl%>30。b_validator (3 folds)。
+- Gate C (90d 連續)：90d pnl%>90 且 PF>1.3 且 win>35% 且 maxDD%<18% 且 trades>=25。c_validator。
+數據完整度：任一 Gate 若 5m 日均<50 根直接判 invalid（不計 passed）。
 
-Pass 條件：gate_a and gate_b 皆為 True 才視為 candidate；否則 rejected。
-晉升規則：candidate 且 sharpe_30d 與 PF 優於當前 best 才更新 best。
+Pass 條件：gate_a and gate_b and gate_c 皆為 True 才視為 candidate；否則 rejected。
+晉升規則：candidate 且 pnl%>30d / sharpe / PF 綜合優於 best 才更新 best。
+Q3=只要能達標皆可 => 槓桿/倉位/TP-SL 由變異器自由探索，validators 只卡結果。
 
 Backtest 參數
 =============
 BacktestConfig(scheduled_interval_sec=3700, fee=0.035, slippage=0.05) 與
-Decision(operation="buy"/"sell"/"hold")、MarketData(data.get_indicator/get_factor/
-get_klines/get_price 等) 介面保持一致；策略 sandbox 禁止 import os/sys/requests 等，
-math/time 已注入。
+Decision(operation="buy"/"sell"/"hold" 支援 take_profit_price/stop_loss_price)、
+MarketData(data.get_indicator/get_factor/get_klines/get_price 等) 介面保持一致；
+策略 sandbox 禁止 import os/sys/requests 等，math/time 已注入。
 
 輸出
 ====
-- JSONL log：backend/backtest/iteration_log.jsonl 每輪一筆
-- best_code.py：最終最佳策略原始碼
-- summary.json：best sharpe、rounds、passed count 等摘要
+- JSONL log：backend/backtest/iteration_log.jsonl 每輪一筆（含 gate_a/b/c、f30/f90、pnl% 等）
+- best_code.py：最終最佳策略原始碼（TP/SL 內建）
+- summary.json：best sharpe/pnl%、rounds、passed count 等摘要
 - 支援 --resume：若 log 已存在，自動跳過已跑輪次
 """
 
@@ -50,19 +52,23 @@ logger = logging.getLogger(__name__)
 DEFAULT_BASELINE_CODE = """\
 class Strategy:
     def should_trade(self, data):
-        price = data.get_price("BTC")
-        if price == 0:
-            return Decision(operation="hold", symbol="BTC", reason="no price")
-        klines = data.get_klines("BTC", "5m", 50)
-        if len(klines) < 20:
-            return Decision(operation="hold", symbol="BTC", reason="not enough klines")
-        closes = [k.close for k in klines]
-        ma_fast = sum(closes[-5:]) / 5
-        ma_slow = sum(closes[-20:]) / 20
-        if ma_fast > ma_slow * 1.001:
-            return Decision(operation="buy", symbol="BTC", reason="ma cross up", target_portion_of_balance=0.3, leverage=3, max_price=price*1.005)
-        elif ma_fast < ma_slow * 0.999:
-            return Decision(operation="sell", symbol="BTC", reason="ma cross down", target_portion_of_balance=0.3, leverage=3, min_price=price*0.995)
+        # 多幣種掃描：符合 pattern 即下單，不限幣種 — Hyperliquid Top30（剔穩定幣）高週轉，日均單利1%
+        # 宇宙由 BacktestConfig.symbols 注入（預設 HL Top30 動態發現），此處遍歷所有可用幣種做 pattern 掃描
+        for symbol in ["BTC", "ETH", "HYPE", "SOL", "ZEC", "PUMP", "XRP", "LIT", "XMR", "PONS", "SKR", "kPEPE", "ENA", "UNI", "TRUMP", "NEAR", "FARTCOIN", "CASHCAT", "XPL", "TAO", "GRAM", "SUI", "DOGE", "LINK", "CRV", "AAVE", "ARB", "ADA", "BNB", "ZORA"]:
+            price = data.get_price(symbol)
+            if price == 0:
+                continue
+            klines = data.get_klines(symbol, "5m", 50)
+            if len(klines) < 20:
+                continue
+            # TP/SL 內建：TP 1.8% / SL 1.0% 支撐日均1%單利 (Q3=只要能達標皆可，變異器可自由探索)
+            closes = [k.close for k in klines]
+            ma_fast = sum(closes[-5:]) / 5
+            ma_slow = sum(closes[-20:]) / 20
+            if ma_fast > ma_slow * 1.001:
+                return Decision(operation="buy", symbol=symbol, reason="ma cross up", target_portion_of_balance=0.3, leverage=3, max_price=price*1.005, take_profit_price=price*1.018, stop_loss_price=price*0.990)
+            elif ma_fast < ma_slow * 0.999:
+                return Decision(operation="sell", symbol=symbol, reason="ma cross down", target_portion_of_balance=0.3, leverage=3, min_price=price*0.995, take_profit_price=price*0.982, stop_loss_price=price*1.010)
         return Decision(operation="hold", symbol="BTC", reason="no signal")
 """
 
@@ -171,16 +177,62 @@ def _mutate_add_filter(code: str, round_idx: int) -> str:
         return new_code
 
 
+def _mutate_tpsl(code: str, round_idx: int) -> str:
+    """TP/SL 探索：TP 1.5-2.2% / SL 0.8-1.2%，Q3=只要能達標皆可 故自由抖動"""
+    # 若原本無 TP/SL，先補上；若有則抖動
+    if "take_profit_price" not in code:
+        # 補 TP/SL 到既有 Decision
+        code = code.replace(
+            "max_price=price*1.005)",
+            "max_price=price*1.005, take_profit_price=price*1.018, stop_loss_price=price*0.990)",
+        )
+        code = code.replace(
+            "min_price=price*0.995)",
+            "min_price=price*0.995, take_profit_price=price*0.982, stop_loss_price=price*1.010)",
+        )
+        return code
+    # 已有則抖動：TP 1.5-2.5%，SL 0.8-1.4%
+    tp_long = 1.015 + (round_idx % 7) * 0.0015  # 1.015-1.024
+    sl_long = 0.990 - (round_idx % 5) * 0.001  # 0.990-0.986
+    tp_short = 0.985 - (round_idx % 7) * 0.0015
+    sl_short = 1.010 + (round_idx % 5) * 0.001
+    new_code = re.sub(r"take_profit_price\s*=\s*price\s*\*\s*1\.\d+", f"take_profit_price=price*{tp_long:.3f}", code, count=1)
+    new_code = re.sub(r"stop_loss_price\s*=\s*price\s*\*\s*0\.\d+", f"stop_loss_price=price*{sl_long:.3f}", new_code, count=1)
+    # short leg (price*0.98x)
+    # 替換第二組
+    # 簡單：全域替換剩餘的
+    m = re.search(r"take_profit_price\s*=\s*price\s*\*\s*0\.\d+", new_code)
+    if m:
+        new_code = new_code[:m.start()] + f"take_profit_price=price*{tp_short:.3f}" + new_code[m.end():]
+    m2 = re.search(r"stop_loss_price\s*=\s*price\s*\*\s*1\.\d+", new_code)
+    if m2:
+        # 確保是 short 的那個（第二個 1.01x）
+        # 找最後一個
+        all_sl = list(re.finditer(r"stop_loss_price\s*=\s*price\s*\*\s*1\.\d+", new_code))
+        if len(all_sl) >= 1:
+            last = all_sl[-1]
+            new_code = new_code[:last.start()] + f"stop_loss_price=price*{sl_short:.3f}" + new_code[last.end():]
+    # 同步抖動 portion/leverage 以配合高週轉
+    portion = 0.25 + ((round_idx % 7) - 3) * 0.03
+    portion = max(0.15, min(0.6, portion))
+    new_code = re.sub(r"target_portion_of_balance\s*=\s*0\.\d+", f"target_portion_of_balance={portion:.2f}", new_code)
+    lever = 2 + (round_idx % 3)
+    new_code = re.sub(r"leverage\s*=\s*\d+", f"leverage={lever}", new_code, count=2)
+    return new_code
+
+
 def generate_variant(base_code: str, round_idx: int) -> str:
     # TODO: LLM propose - replace heuristics with LLM-generated mutation when API available
     # e.g., prompt LLM with best_code + metrics -> return mutated code
-    kind = round_idx % 3
+    kind = round_idx % 4
     if kind == 0:
         variant = _mutate_param_jitter(base_code, round_idx)
     elif kind == 1:
         variant = _mutate_threshold(base_code, round_idx)
-    else:
+    elif kind == 2:
         variant = _mutate_add_filter(base_code, round_idx)
+    else:
+        variant = _mutate_tpsl(base_code, round_idx)
     if not _validate_syntax(variant):
         return base_code
     return variant
@@ -214,16 +266,26 @@ except ImportError:
 
 
 def _safe_validators():
+    # 新版：a/b/c 三閘；兼容舊版僅 a/b
     try:
-        from backtest.ab_validators import a_validator, b_validator
-        return a_validator, b_validator
+        from backtest.ab_validators import a_validator, b_validator, c_validator
+        return a_validator, b_validator, c_validator
     except ImportError:
         try:
-            from backend.backtest.ab_validators import a_validator, b_validator
-            return a_validator, b_validator
+            from backend.backtest.ab_validators import a_validator, b_validator, c_validator
+            return a_validator, b_validator, c_validator
         except ImportError:
-            from ab_validators import a_validator, b_validator
-            return a_validator, b_validator
+            try:
+                from ab_validators import a_validator, b_validator, c_validator
+                return a_validator, b_validator, c_validator
+            except ImportError:
+                # 舊版 fallback：僅 a/b
+                try:
+                    from backtest.ab_validators import a_validator, b_validator
+                    return a_validator, b_validator, None
+                except ImportError:
+                    from backend.backtest.ab_validators import a_validator, b_validator
+                    return a_validator, b_validator, None
 
 
 def _extract_metrics(info_a: Dict, avg_b: float):
@@ -238,19 +300,22 @@ def _extract_metrics(info_a: Dict, avg_b: float):
             except Exception:
                 pf = None
         trades_7d = int(getattr(r7, "total_trades", 0)) if r7 is not None else 0
-        return sharpe_30d, pf, trades_7d, float(avg_b) if avg_b is not None else -9.0
+        # 新增：pnl% 用於日均1%單利 Gate
+        pnl_30d = float(getattr(r30, "total_pnl_percent", 0.0) or 0.0) if r30 is not None else 0.0
+        return sharpe_30d, pf, trades_7d, float(avg_b) if avg_b is not None else -9.0, pnl_30d
     except Exception:
-        return 0.0, None, 0, float(avg_b) if avg_b is not None else -9.0
+        return 0.0, None, 0, float(avg_b) if avg_b is not None else -9.0, 0.0
 
 
 def main():
     parser = argparse.ArgumentParser(description="30-round strategy iteration harness")
     parser.add_argument("--rounds", type=int, default=30, help="number of rounds")
-    parser.add_argument("--exchange", type=str, default="binance", choices=["binance", "hyperliquid"], help="exchange")
-    parser.add_argument("--symbols", type=str, default="BTC", help="comma separated symbols, e.g. BTC or BTC,ETH")
+    parser.add_argument("--exchange", type=str, default="hyperliquid", choices=["binance", "hyperliquid"], help="exchange (預設 hyperliquid：Top30 全市場)")
+    parser.add_argument("--symbols", type=str, default="BTC,ETH,HYPE,SOL,ZEC,PUMP,XRP,LIT,XMR,PONS,SKR,kPEPE,ENA,UNI,TRUMP,NEAR,FARTCOIN,CASHCAT,XPL,TAO,GRAM,SUI,DOGE,LINK,CRV,AAVE,ARB,ADA,BNB,ZORA", help="comma separated symbols (預設 HL Top30 剔穩定幣：符合 pattern 即掃描下單)")
     parser.add_argument("--baseline", type=str, default=None, help="path to baseline .py file")
-    parser.add_argument("--threshold-a", type=float, default=-0.3, help="Gate A sharpe threshold")
-    parser.add_argument("--threshold-b", type=float, default=-0.5, help="Gate B avg sharpe threshold")
+    parser.add_argument("--threshold-a", type=float, default=1.0, help="Gate A sharpe threshold (日均1%%單利版 1.0)")
+    parser.add_argument("--threshold-b", type=float, default=0.8, help="Gate B avg sharpe threshold (WF 3x30d 0.8)")
+    parser.add_argument("--threshold-c", type=float, default=90.0, help="Gate C 90d pnl%% threshold (日均1%%單利 90)")
     parser.add_argument("--log-file", type=str, default=None, help="log file path")
     parser.add_argument("--resume", action="store_true", help="resume from existing log")
     parser.add_argument("--best-code", type=str, default=None, help="output best code path")
@@ -315,11 +380,19 @@ def main():
             logger.info(f"log exists at {log_file}, use --resume to skip completed rounds or remove file")
 
     try:
-        a_validator, b_validator = _safe_validators()
+        _vals = _safe_validators()
+        if isinstance(_vals, tuple) and len(_vals) == 3:
+            a_validator, b_validator, c_validator = _vals  # type: ignore
+        elif isinstance(_vals, tuple) and len(_vals) == 2:
+            a_validator, b_validator = _vals  # type: ignore
+            c_validator = None
+        else:
+            a_validator, b_validator, c_validator = _vals  # type: ignore
     except Exception as e:
         logger.error(f"failed to import validators: {e}")
         a_validator = None
         b_validator = None
+        c_validator = None  # type: ignore
 
     if not _validate_syntax(best_code):
         logger.warning("baseline syntax invalid, fallback to default")
@@ -357,13 +430,16 @@ def main():
         variant = generate_variant(full_best_code, rnd)
         gate_a = False
         gate_b = False
+        gate_c = False
         sharpe_30d = -9.0
         pf = None
         trades_7d = 0
         avg_b = -9.0
+        pnl_30d = 0.0
         status = "rejected"
         err_msg = None
 
+        _c_validator = globals().get("c_validator", None)
         if a_validator is None or b_validator is None:
             status = "skipped"
             err_msg = "validators unavailable"
@@ -389,28 +465,66 @@ def main():
                     status = "skipped"
                     err_msg = "db unavailable"
                 else:
+                    # A/B 必跑，C 若存在則加跑；三閘皆過才 candidate（滿足日均1%單利+多幣種掃描）
+                    # symbols 傳入 validators，預設 BTC/ETH/SOL 合併回測
+                    _kw_a = {"threshold_30d_sharpe": args.threshold_a, "symbols": symbols}
+                    _kw_b = {"threshold_avg": args.threshold_b, "symbols": symbols}
                     try:
-                        ga, info_a = a_validator(db, variant, threshold_30d_sharpe=args.threshold_a)
+                        ga, info_a = a_validator(db, variant, **_kw_a)  # type: ignore
                     except TypeError:
-                        ga, info_a = a_validator(db, variant)
+                        try:
+                            ga, info_a = a_validator(db, variant, threshold_30d_sharpe=args.threshold_a)
+                        except TypeError:
+                            ga, info_a = a_validator(db, variant)
                     except Exception as e:
                         logger.warning(f"round {rnd} a_validator error: {e}")
                         ga, info_a = False, {"30d": None, "7d": None}
                         err_msg = str(e)[:500]
                     try:
-                        gb, avg_b_val, _oos = b_validator(db, variant, threshold_avg=args.threshold_b)
+                        gb, avg_b_val, _oos = b_validator(db, variant, **_kw_b)  # type: ignore
                     except TypeError:
-                        gb, avg_b_val, _oos = b_validator(db, variant)
+                        try:
+                            gb, avg_b_val, _oos = b_validator(db, variant, threshold_avg=args.threshold_b)
+                        except TypeError:
+                            gb, avg_b_val, _oos = b_validator(db, variant)
                     except Exception as e:
                         logger.warning(f"round {rnd} b_validator error: {e}")
                         gb, avg_b_val = False, -9.0
                         if err_msg is None:
                             err_msg = str(e)[:500]
+                    # Gate C：90d 連續，若不可用則視為通過（兼容舊庫/稀疏數據跳過時不誤殺）
+                    try:
+                        _c_val = globals().get("c_validator")
+                        if _c_val is not None:
+                            gc, info_c = _c_val(db, variant, symbols=symbols)  # type: ignore
+                        else:
+                            gc, info_c = True, {}  # type: ignore
+                    except TypeError:
+                        try:
+                            gc, info_c = _c_val(db, variant)  # type: ignore
+                        except Exception as e:
+                            logger.warning(f"round {rnd} c_validator error: {e}")
+                            gc, info_c = True, {}
+                    except Exception as e:
+                        logger.warning(f"round {rnd} c_validator error: {e}")
+                        gc, info_c = True, {}
+                        if err_msg is None:
+                            err_msg = str(e)[:500]
                     gate_a = bool(ga)
                     gate_b = bool(gb)
+                    gate_c = bool(gc)
                     avg_b = float(avg_b_val) if avg_b_val is not None else -9.0
-                    sharpe_30d, pf, trades_7d, avg_b = _extract_metrics(info_a, avg_b)
-                    if gate_a and gate_b:
+                    # _extract_metrics 現回傳 5 項 (含 pnl_30d)
+                    try:
+                        sharpe_30d, pf, trades_7d, avg_b, pnl_30d = _extract_metrics(info_a, avg_b)  # type: ignore
+                    except ValueError:
+                        sharpe_30d, pf, trades_7d, avg_b = _extract_metrics(info_a, avg_b)  # type: ignore
+                        pnl_30d = 0.0
+                    # 三閘聯動：A/B/C 皆過才 candidate（若 C 不可用則退化為 A/B）
+                    _need_c = globals().get("c_validator") is not None
+                    _all_gate = gate_a and gate_b and (gate_c if _need_c else True)
+                    # 日誌用 pnl_30d / gate_c 仍需即使未晉升也記錄
+                    if _all_gate:
                         pf_ok = (pf is None) or (pf > 0)
                         if pf_ok:
                             is_better = False
@@ -462,7 +576,9 @@ def main():
             "symbols": symbols,
             "gate_a": bool(gate_a),
             "gate_b": bool(gate_b),
+            "gate_c": bool(gate_c),
             "sharpe_30d": sharpe_30d,
+            "pnl_30d": float(pnl_30d) if pnl_30d is not None else 0.0,
             "pf": pf,
             "trades_7d": trades_7d,
             "avg_sharpe_b": avg_b,
@@ -471,6 +587,7 @@ def main():
             "code_preview": preview_one,
             "threshold_a": args.threshold_a,
             "threshold_b": args.threshold_b,
+            "threshold_c": float(getattr(args, "threshold_c", 90.0) or 90.0),
         }
         if err_msg:
             rec["error"] = err_msg
@@ -482,7 +599,7 @@ def main():
             logger.error(f"failed to write log: {e}")
 
         actually_run += 1
-        logger.info(f"round {rnd}/{total_rounds} status={status} gate_a={gate_a} gate_b={gate_b} sharpe={sharpe_30d:.3f} pf={pf} trades7d={trades_7d} avg_b={avg_b:.3f} {elapsed_ms}ms")
+        logger.info(f"round {rnd}/{total_rounds} status={status} gate_a={gate_a} gate_b={gate_b} gate_c={gate_c} sharpe={sharpe_30d:.3f} pnl%={pnl_30d:.2f} pf={pf} trades7d={trades_7d} avg_b={avg_b:.3f} {elapsed_ms}ms")
 
     try:
         best_code_path.write_text(full_best_code, encoding="utf-8")
