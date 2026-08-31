@@ -44,6 +44,22 @@ def get_last_price(symbol: str, market: str = "CRYPTO", environment: str = "main
             return price
         raise Exception(f"Hyperliquid returned invalid price: {price}")
     except Exception as hl_err:
+        # Testnet fallback: reuse mainnet price when testnet feed is empty
+        if environment == "testnet":
+            try:
+                fallback = get_last_price_from_hyperliquid(symbol, "mainnet")
+                if fallback and fallback > 0:
+                    logger.warning(f"Testnet price unavailable for {key}, fallback to mainnet: {fallback}")
+                    cache_price(symbol, market, fallback, environment)
+                    return fallback
+                fallback_ticker = get_ticker_data_from_hyperliquid(symbol, "mainnet")
+                if fallback_ticker and float(fallback_ticker.get("price", 0) or 0) > 0:
+                    fb_price = float(fallback_ticker["price"])
+                    logger.warning(f"Testnet ticker unavailable for {key}, fallback mainnet ticker: {fb_price}")
+                    cache_price(symbol, market, fb_price, environment)
+                    return fb_price
+            except Exception as fb_err:
+                logger.warning(f"Testnet fallback also failed for {key}: {fb_err}")
         logger.error(f"Failed to get price from Hyperliquid ({environment}): {hl_err}")
         raise Exception(f"Unable to get real-time price for {key}: {hl_err}")
 
@@ -160,20 +176,33 @@ def get_ticker_data(symbol: str, market: str = "CRYPTO", environment: str = "mai
             logger.error(f"Failed to get ticker data from Binance ({environment}): {e}")
             raise Exception(f"Unable to get ticker data for {key}: {e}")
 
+    # Testnet fallback: try mainnet ticker when testnet feed is empty
+    effective_env = environment
+    if environment == "testnet":
+        try:
+            probe = get_ticker_data_from_hyperliquid(symbol, "testnet")
+            if probe and float(probe.get("price", 0) or 0) > 0:
+                logger.info(f"Got ticker data for {key}: price={probe['price']}, change24h={probe['change24h']}")
+                return probe
+            raise Exception("Testnet ticker empty")
+        except Exception as te:
+            logger.warning(f"Testnet ticker unavailable for {key}: {te}, fallback to mainnet")
+            effective_env = "mainnet"
+
     try:
-        logger.info(f"[DEBUG] Calling get_ticker_data_from_hyperliquid for {symbol} in {environment}")
-        ticker_data = get_ticker_data_from_hyperliquid(symbol, environment)
+        logger.info(f"[DEBUG] Calling get_ticker_data_from_hyperliquid for {symbol} in {effective_env}")
+        ticker_data = get_ticker_data_from_hyperliquid(symbol, effective_env)
         logger.info(f"[DEBUG] get_ticker_data_from_hyperliquid returned: {ticker_data}")
         if ticker_data:
             logger.info(f"Got ticker data for {key}: price={ticker_data['price']}, change24h={ticker_data['change24h']}")
             return ticker_data
         raise Exception("Hyperliquid returned empty ticker data")
     except Exception as hl_err:
-        logger.error(f"Failed to get ticker data from Hyperliquid ({environment}): {hl_err}")
+        logger.error(f"Failed to get ticker data from Hyperliquid ({effective_env}): {hl_err}")
         # Fallback to price-only data
         logger.info(f"[DEBUG] Falling back to price-only data for {key}")
         try:
-            price = get_last_price(symbol, market, environment)
+            price = get_last_price(symbol, market, effective_env)
             fallback_data = {
                 'symbol': symbol,
                 'price': price,
