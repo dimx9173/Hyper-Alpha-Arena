@@ -66,8 +66,10 @@ class HistoricalDataProvider:
         logger.info(f"Preloading data for {len(self.symbols)} symbols...")
 
         for symbol in self.symbols:
-            # Preload common periods (1m for price accuracy, others for indicators)
-            for period in ["1m", "5m", "15m", "1h", "4h", "1d"]:
+            # Preload common periods
+            # Hyperliquid 無 1m（candleSnapshot 不支援），改以 5m 承接價格/指標，跳過 1m 以避免每幣次數 fetch 空轉/報錯
+            periods = ["5m", "15m", "1h", "4h", "1d"] if self.exchange == "hyperliquid" else ["1m", "5m", "15m", "1h", "4h", "1d"]
+            for period in periods:
                 self._load_klines_to_cache(symbol, period)
 
         logger.info(f"Preload complete. Cache size: {len(self._kline_cache)} entries")
@@ -370,14 +372,25 @@ class HistoricalDataProvider:
             return []
 
     def _fetch_hyperliquid_klines(self, symbol, period, since_ms, until_ms):
-        """Fetch Hyperliquid klines by time range and persist."""
-        from services.hyperliquid_market_data import get_historical_kline_data_from_hyperliquid
-        klines = get_historical_kline_data_from_hyperliquid(
-            symbol=symbol, period=period,
-            since_ms=since_ms, until_ms=until_ms,
-            environment="mainnet"
-        )
+        """Fetch Hyperliquid klines by time range and persist — bypass CCXT (spot None+str crash) via native candleSnapshot."""
+        try:
+            from services.hyperliquid_market_data import HyperliquidClient
+            client = HyperliquidClient(environment="mainnet")
+            klines = client._fetch_kline_native_range(symbol, period, since_ms, until_ms, persist=False)
+        except Exception as e:
+            logger.warning(f"native HL fetch failed {symbol}/{period}: {e}, fallback to CCXT")
+            try:
+                from services.hyperliquid_market_data import get_historical_kline_data_from_hyperliquid
+                klines = get_historical_kline_data_from_hyperliquid(
+                    symbol=symbol, period=period,
+                    since_ms=since_ms, until_ms=until_ms,
+                    environment="mainnet"
+                )
+            except Exception as e2:
+                logger.warning(f"CCXT HL fetch also failed {symbol}/{period}: {e2}")
+                return []
         if klines:
+            # native already returns seconds-timestamp dicts; reuse persist path
             self._persist_klines_to_db(symbol, period, klines, "hyperliquid")
         return klines or []
 

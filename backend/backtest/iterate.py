@@ -115,17 +115,18 @@ def _mutate_threshold(code: str, round_idx: int) -> str:
         # also fix legacy lowercase indicator name
         new_code = new_code.replace('"rsi"', '"RSI14"').replace("'rsi'", "'RSI14'")
         return new_code
+    # 多幣種 baseline closes 在 for 內 12 空格，需動態檢測縮排
+    m = re.search(r"(\n)([ ]+)closes = \[k\.close for k in klines\]", code)
+    indent = m.group(2) if m else "            "  # 12 spaces default
     ind_block = (
-        "        rsi_info = data.get_indicator(\"BTC\", \"RSI14\", \"5m\")\n"
-        "        rsi = rsi_info.get(\"value\", 50) if isinstance(rsi_info, dict) else 50\n"
-        "        if rsi is None:\n"
-        "            rsi = 50\n"
+        f"{indent}rsi_info = data.get_indicator(symbol, \"RSI14\", \"5m\")\n"
+        f"{indent}rsi = rsi_info.get(\"value\", 50) if isinstance(rsi_info, dict) else 50\n"
+        f"{indent}if rsi is None:\n"
+        f"{indent}    rsi = 50\n"
      )
     if "rsi_info" not in code:
-        new_code = code.replace(
-            "        closes = [k.close for k in klines]",
-            ind_block + "        closes = [k.close for k in klines]",
-        )
+        target = f"{indent}closes = [k.close for k in klines]"
+        new_code = code.replace(target, ind_block + target, 1)
         th = 70 - (round_idx % 4) * 2
         tl = 30 + (round_idx % 4) * 2
         new_code = new_code.replace(
@@ -142,16 +143,19 @@ def _mutate_threshold(code: str, round_idx: int) -> str:
 
 def _mutate_add_filter(code: str, round_idx: int) -> str:
     use_regime = (round_idx % 2 == 0)
+    _m2 = re.search(r"(\n)([ ]+)closes = \[k\.close for k in klines\]", code)
+    indent2 = _m2.group(2) if _m2 else "            "
     if use_regime:
         if "get_regime" in code:
             return code
         regime_block = (
-            "        regime_info = data.get_regime(\"BTC\", \"5m\")\n"
-            "        regime = regime_info.regime if hasattr(regime_info, \"regime\") else \"noise\"\n"
+            f"{indent2}regime_info = data.get_regime(symbol, \"5m\")\n"
+            f"{indent2}regime = regime_info.regime if hasattr(regime_info, \"regime\") else \"noise\"\n"
         )
         new_code = code.replace(
-            "        closes = [k.close for k in klines]",
-            regime_block + "        closes = [k.close for k in klines]",
+            f"{indent2}closes = [k.close for k in klines]",
+            regime_block + f"{indent2}closes = [k.close for k in klines]",
+            1,
         )
         new_code = new_code.replace(
             "if ma_fast > ma_slow *",
@@ -162,12 +166,13 @@ def _mutate_add_filter(code: str, round_idx: int) -> str:
         if "get_factor" in code:
             return code
         factor_block = (
-            "        factor_info = data.get_factor(\"BTC\", \"momentum_5m\", \"5m\")\n"
-            "        fval = factor_info.get(\"value\") if isinstance(factor_info, dict) else None\n"
+            f"{indent2}factor_info = data.get_factor(symbol, \"momentum_5m\", \"5m\")\n"
+            f"{indent2}fval = factor_info.get(\"value\") if isinstance(factor_info, dict) else None\n"
         )
         new_code = code.replace(
-            "        closes = [k.close for k in klines]",
-            factor_block + "        closes = [k.close for k in klines]",
+            f"{indent2}closes = [k.close for k in klines]",
+            factor_block + f"{indent2}closes = [k.close for k in klines]",
+            1,
         )
         if "fval is not None" not in new_code:
             new_code = new_code.replace(
