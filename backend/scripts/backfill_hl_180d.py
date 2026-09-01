@@ -67,7 +67,7 @@ def main():
     parser.add_argument("--exchange", type=str, default="hyperliquid", choices=["hyperliquid", "binance"], help="交易所")
     parser.add_argument("--environment", type=str, default="mainnet", help="環境 mainnet/testnet")
     parser.add_argument("--batch-size", type=int, default=500, help="單次拉取上限（HL 單次 500）")
-    parser.add_argument("--sleep", type=float, default=0.35, help="請求間隔秒（限流）")
+    parser.add_argument("--sleep", type=float, default=0.8, help="請求間隔秒（限流，預設 0.8 避免 429）")
     parser.add_argument("--dry-run", action="store_true", help="僅列出將回填的幣種與區間，不寫庫")
     args = parser.parse_args()
 
@@ -110,14 +110,32 @@ def main():
     from repositories.kline_repo import KlineRepository
 
     # 延遲導入 HL 客戶端（僅 hyperliquid 需要）
+    # 注意：CCXT hyperliquid 的 fetch_markets 在當前版本有 spot 解析崩潰（None+str），
+    # 而原生 POST /info candleSnapshot 已驗證正常（BTC 5m 2017根），故直接走原生管線。
+    _hl_client = None
+    _hl_fetch = None  # type: ignore
     if args.exchange == "hyperliquid":
         try:
-            from services.hyperliquid_market_data import get_historical_kline_data_from_hyperliquid
-            _hl_fetch = get_historical_kline_data_from_hyperliquid
-        except ImportError:
-            from backend.services.hyperliquid_market_data import get_historical_kline_data_from_hyperliquid as _hl_fetch
+            try:
+                from services.hyperliquid_market_data import HyperliquidClient
+            except ImportError:
+                from backend.services.hyperliquid_market_data import HyperliquidClient  # type: ignore
+            _hl_client = HyperliquidClient(environment=args.environment)
+
+            def _native_fetch(symbol: str, period: str, since_ms: int, until_ms: int, environment: str = "mainnet"):  # type: ignore
+                # 直接走原生 candleSnapshot，繞過 CCXT
+                return _hl_client._fetch_kline_native_range(symbol, period, since_ms, until_ms)  # type: ignore
+
+            _hl_fetch = _native_fetch  # type: ignore
+        except Exception as e:
+            logger.warning(f"初始化原生 HL 客戶端失敗，嘗試 fallback 到 get_historical_kline_data: {e}")
+            try:
+                from services.hyperliquid_market_data import get_historical_kline_data_from_hyperliquid
+                _hl_fetch = get_historical_kline_data_from_hyperliquid  # type: ignore
+            except ImportError:
+                from backend.services.hyperliquid_market_data import get_historical_kline_data_from_hyperliquid as _hl_fetch  # type: ignore
     else:
-        _hl_fetch = None
+        _hl_fetch = None  # type: ignore
 
     db = SessionLocal()
     repo = KlineRepository(db)
@@ -165,17 +183,30 @@ def main():
                     while cur <= end_ms:
                         batch_since = cur
                         batch_until = min(cur + args.batch_size * sec * 1000, end_ms)
-                        try:
-                            if args.exchange == "hyperliquid":
-                                klines = _hl_fetch(symbol=sym, period=per, since_ms=batch_since, until_ms=batch_until, environment=args.environment)
-                            else:
-                                # Binance 由 HistoricalDataProvider 側補齊，此處提示
-                                logger.warning(f"Binance 回填請用 HistoricalDataProvider 觸發：{sym} {per}")
+                        # 取數帶 429 退避重試
+                        klines = None
+                        for attempt in range(5):
+                            try:
+                                if args.exchange == "hyperliquid":
+                                    klines = _hl_fetch(symbol=sym, period=per, since_ms=batch_since, until_ms=batch_until, environment=args.environment)
+                                else:
+                                    logger.warning(f"Binance 回填請用 HistoricalDataProvider 觸發：{sym} {per}")
+                                    klines = []
+                                break
+                            except Exception as e:
+                                msg = str(e)
+                                if "429" in msg or "Too Many Requests" in msg:
+                                    backoff = 2 * (attempt + 1)
+                                    logger.warning(f"429 限流 {sym} {per} [{batch_since}-{batch_until}] attempt {attempt+1}/5，退避 {backoff}s: {e}")
+                                    time.sleep(backoff)
+                                    continue
+                                logger.warning(f"拉取失敗 {sym} {per} [{batch_since}-{batch_until}]: {e}")
                                 klines = []
-                        except Exception as e:
-                            logger.warning(f"拉取失敗 {sym} {per} [{batch_since}-{batch_until}]: {e}")
+                                total_failed.append(f"{sym}/{per}")
+                                break
+                        if klines is None:
+                            klines = []
                             total_failed.append(f"{sym}/{per}")
-                            break
 
                         if klines:
                             try:
@@ -183,7 +214,12 @@ def main():
                                 total_inserted += res.get("inserted", 0)
                                 logger.info(f"[ok] {sym} {per} [{batch_since//1000}-{batch_until//1000}] 寫入 inserted={res.get('inserted')} updated={res.get('updated')} total={len(klines)}")
                             except Exception as e:
-                                logger.warning(f"save 失敗 {sym} {per}: {e}")
+                                # 唯一鍵衝突會毒化事務，必須 rollback 否則後續全崩
+                                try:
+                                    db.rollback()
+                                except Exception:
+                                    pass
+                                logger.warning(f"save 失敗 {sym} {per} [{batch_since//1000}-{batch_until//1000}]: {e}")
                         else:
                             logger.debug(f"[empty] {sym} {per} [{batch_since}-{batch_until}] 無數據")
 
