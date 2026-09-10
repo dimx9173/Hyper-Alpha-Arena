@@ -187,6 +187,7 @@ class HyperliquidTradingClient:
                 }
             })
             self._disable_hip3_markets()
+            self._disable_spot_markets()
 
             # Skip load_markets() — we use SDK for balance/positions/orders now.
             # CCXT is kept as fallback but market loading crashes on testnet due to
@@ -314,6 +315,19 @@ class HyperliquidTradingClient:
                 return []
             self.exchange.fetch_hip3_markets = _skip_hip3_markets.__get__(self.exchange, type(self.exchange))
             logger.info("HIP3 market fetch disabled for Hyperliquid exchange instance")
+
+    def _disable_spot_markets(self) -> None:
+        # Same CCXT 4.5.11 spotMeta string-index crash as market-data client:
+        # fetch_markets hardcodes swap+spot and `base + '/' + quote` blows up
+        # on None. Trading path only needs perps, so force swap-only here too.
+        try:
+            swap_only = self.exchange.fetch_swap_markets.__get__(self.exchange, type(self.exchange))
+            def _fetch_markets_swap_only(exchange_self, params=None):
+                return swap_only(params or {})
+            self.exchange.fetch_markets = _fetch_markets_swap_only.__get__(self.exchange, type(self.exchange))
+            logger.info("Spot market fetch disabled for trading client (swap-only)")
+        except Exception as e:
+            logger.debug(f"Unable to disable spot markets: {e}")
 
     def _serialize_payload(self, payload: Optional[Any]) -> Optional[str]:
         if payload is None:

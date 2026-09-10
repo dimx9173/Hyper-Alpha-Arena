@@ -53,6 +53,7 @@ class HyperliquidClient:
                 }
             })
             self._disable_hip3_markets()
+            self._disable_spot_markets()
 
             # Pre-load markets to avoid ~3s delay on first API call
             # Markets are cached in the exchange instance
@@ -85,6 +86,21 @@ class HyperliquidClient:
                 return []
             self.exchange.fetch_hip3_markets = _skip_hip3_markets.__get__(self.exchange, type(self.exchange))
             logger.info("HIP3 market fetch disabled for market data client")
+
+    def _disable_spot_markets(self) -> None:
+        # CCXT 4.5.11 fetch_markets hardcodes swap+spot; HL spotMeta returns
+        # string token indexes (e.g. ['1','0']) so safe_integer(list,0) is None
+        # and `base + '/' + quote` crashes with NoneType. We only trade perps,
+        # so override instance fetch_markets to swap-only (same result the
+        # options.fetchMarkets.types=['swap'] config intended but CCXT ignores).
+        try:
+            swap_only = self.exchange.fetch_swap_markets.__get__(self.exchange, type(self.exchange))
+            def _fetch_markets_swap_only(exchange_self, params=None):
+                return swap_only(params or {})
+            self.exchange.fetch_markets = _fetch_markets_swap_only.__get__(self.exchange, type(self.exchange))
+            logger.info("Spot market fetch disabled for market data client (swap-only)")
+        except Exception as e:
+            logger.debug(f"Unable to disable spot markets: {e}")
 
     def get_last_price(self, symbol: str) -> Optional[float]:
         """Get the last price for a symbol"""

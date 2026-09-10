@@ -108,12 +108,10 @@ def _mutate_param_jitter(code: str, round_idx: int) -> str:
 
 def _mutate_threshold(code: str, round_idx: int) -> str:
     if "get_indicator" in code and "rsi" in code.lower():
-        # existing rsi filter — jitter thresholds (RSI14, buy when oversold rsi<, sell when overbought rsi>)
-        th_buy = 68 + (round_idx % 5)   # 68..72
-        th_sell = 32 - (round_idx % 5)  # 32..28
-        new_code = re.sub(r"rsi\s*<\s*\d+", f"rsi < {th_buy}", code)
-        new_code = re.sub(r"rsi\s*>\s*\d+", f"rsi > {th_sell}", new_code)
-        # also fix legacy lowercase indicator name
+        # v4 long-only 只有上沿過濾 rsi > 70；舊雙向抖動會把 rsi>70 誤改為 rsi>31 造成零成交。
+        # 限定只抖上沿 68..72，不碰 rsi<。
+        rsi_hi = 68 + (round_idx % 5)   # 68..72
+        new_code = re.sub(r"(?<![\w])rsi\s*>\s*\d+", f"rsi > {rsi_hi}", code)
         new_code = new_code.replace('"rsi"', '"RSI14"').replace("'rsi'", "'RSI14'")
         return new_code
     # 多幣種 baseline closes 在 for 內 12 空格，需動態檢測縮排
@@ -143,6 +141,16 @@ def _mutate_threshold(code: str, round_idx: int) -> str:
 
 
 def _mutate_add_filter(code: str, round_idx: int) -> str:
+    # kind=2 修復：舊版偶數輪一律注入相同 regime 過濾且 data.get_regime 在回測不存在→異常→零成交；
+    # 且 base 不變時重複輪產生完全相同代碼，浪費 1/6 輪次。改為 ATR/動量閾值微調，保證每輪不同且不零成交。
+    if "atr / price >" in code:
+        thr = 0.0015 + (round_idx % 5) * 0.0004  # 0.0015..0.0031 每輪不同
+        new_code = re.sub(r"atr / price > 0\.\d+", f"atr / price > {thr:.4f}", code, count=1)
+        # 同時微調 mom 閾值避免完全重複
+        thr2 = 0.002 + (round_idx % 4) * 0.001
+        new_code = re.sub(r"mom_20 < 0\.\d+", f"mom_20 < {thr2:.3f}", new_code, count=1)
+        return new_code
+    # 無 ATR 的舊 baseline 才走 regime/因子分支（保留兼容）
     use_regime = (round_idx % 2 == 0)
     _m2 = re.search(r"(\n)([ ]+)closes = \[k\.close for k in klines\]", code)
     indent2 = _m2.group(2) if _m2 else "            "
@@ -273,57 +281,30 @@ def _mutate_llm_guided(base_code: str, round_idx: int) -> str:
 
 
 def _mutate_factor_guided(base_code: str, round_idx: int) -> str:
-    """因子啟動突變：根據因子有效性數據將高 IC 因子注入策略代碼。
-
-    根據 factor_effectiveness 表中的 IC 和 ICIR 計算出高分數因子，
-    然後將其邏輯注入當前策略代碼中。
-    """
-    # 簡化實作：使用預設的高 IC 因子列表
-    # 在實際應用中，這會 queries database 中 factor_effectiveness 表
-    top_factors = [
-        {"name": "VOLUME_SPIKE", "avg_ic": 0.06, "avg_icir": 0.35, "sample_count": 100},
-        {"name": "TREND_STRENGTH", "avg_ic": 0.05, "avg_icir": 0.32, "sample_count": 100},
-        {"name": "MOMENTUM_20", "avg_ic": 0.04, "avg_icir": 0.28, "sample_count": 100},
-    ]
-
-    # 構建因子注入代碼（每行都帶 for 區塊縮排，避免頂格註解破壞縮進）
-    factor_lines = []
-    for factor in top_factors:
-        factor_lines.append('# Factor: ' + factor["name"] + ' (IC=' + str(round(factor["avg_ic"], 3)) + ', ICIR=' + str(round(factor["avg_icir"], 3)) + ')')
-    # 第一行接在 closes 同行註解，其餘行另起一行並保持 12 空格縮進
-    factor_block = factor_lines[0] if len(factor_lines)==1 else factor_lines[0] + "\n            " + "\n            ".join(factor_lines[1:])
-
-    new_code = base_code.replace(
-        "closes = [k.close for k in klines]",
-        "closes = [k.close for k in klines]  # Top factors by ICIR: " + factor_block,
-        1
+    """因子引導：v4 已內建 mom_20 時微調動量閾值 0.002..0.006，避免零變異浪費 1/6 輪次。"""
+    if "mom_20" in base_code:
+        thr = 0.002 + (round_idx % 5) * 0.001  # 0.002..0.006
+        new_code = re.sub(r"mom_20 < 0\.\d+", f"mom_20 < {thr:.3f}", base_code, count=1)
+        return new_code
+    if "factor_mom" in base_code:
+        return base_code
+    _m = re.search(r"(\n)([ ]+)closes = \[k\.close for k in klines\]", base_code)
+    indent = _m.group(2) if _m else "            "
+    factor_block = (
+        f"{indent}mom_20 = (closes[-1] - closes[-20]) / closes[-20] if len(closes) >= 20 and closes[-20] else 0\n"
+        f"{indent}factor_mom_ok = mom_20 > 0.003\n"
     )
-
-    # 量能+趨勢雙確認（替代 RSI/MACD，解決 0 交易）
-    vol_factor = next((f for f in top_factors if "VOLUME" in f["name"]), None)
-    trend_factor = next((f for f in top_factors if "TREND" in f["name"]), None)
-    if vol_factor and trend_factor:
-        new_code = new_code.replace(
-            "closes = [k.close for k in klines]",
-            "closes = [k.close for k in klines]\n            volumes = [k.volume for k in klines]\n            vol_avg = sum(volumes[-20:]) / 20 if volumes else 0",
-            1
-        ).replace(
-            "if ma_fast > ma_slow * 1.001:",
-            "if volumes and volumes[-1] > vol_avg * 1.05 and abs(ma_fast - ma_slow) / ma_slow > 0.002 and ma_fast > ma_slow * 1.001:",
-            1
-        )
-    elif vol_factor:
-        new_code = new_code.replace(
-            "closes = [k.close for k in klines]",
-            "closes = [k.close for k in klines]\n            volumes = [k.volume for k in klines]\n            vol_avg = sum(volumes[-20:]) / 20 if volumes else 0",
-            1
-        ).replace(
-            "if ma_fast > ma_slow * 1.001:",
-            "if volumes and volumes[-1] > vol_avg * 1.05 and ma_fast > ma_slow * 1.001:",
-            1
-        )
-
+    new_code = base_code.replace(
+        f"{indent}volumes = [k.volume for k in klines]",
+        f"{indent}volumes = [k.volume for k in klines]\n" + factor_block.rstrip("\n"),
+        1,
+    )
+    new_code = new_code.replace(
+        "if ma_fast > ma_slow *",
+        "if factor_mom_ok and ma_fast > ma_slow *",
+    )
     return new_code
+
 
 def generate_variant(base_code: str, round_idx: int) -> str:
     """Generate variant code for a given round.
@@ -601,8 +582,8 @@ def main():
                 else:
                     # A/B 必跑，C 若存在則加跑；三閘皆過才 candidate（滿足日均1%單利+多幣種掃描）
                     # symbols 傳入 validators，預設 BTC/ETH/SOL 合併回測
-                    _kw_a = {"threshold_30d_sharpe": args.threshold_a, "symbols": symbols}
-                    _kw_b = {"threshold_avg": args.threshold_b, "symbols": symbols}
+                    _kw_a = {"threshold_30d_sharpe": args.threshold_a, "threshold_30d_pnl_pct": args.threshold_c if hasattr(args, 'threshold_c') and args.threshold_c < 30 else 30.0, "symbols": symbols}
+                    _kw_b = {"threshold_avg": args.threshold_b, "threshold_pnl_pct": args.threshold_c if hasattr(args, 'threshold_c') and args.threshold_c < 30 else 30.0, "symbols": symbols}
                     try:
                         ga, info_a = a_validator(db, variant, **_kw_a)  # type: ignore
                     except TypeError:

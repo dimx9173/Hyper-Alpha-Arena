@@ -14,7 +14,8 @@ from typing import Tuple, List, Dict, Any, Optional
 
 PNL_30D_PCT = 30.0
 PNL_90D_PCT = 90.0
-MIN_5M_PER_DAY = 5
+MIN_5M_PER_DAY = 50
+# 50 = health line, HL real ~181/d, <50 invalid
 
 
 def _resolve_symbols(symbols: Optional[List[str]], limit: int = 30) -> List[str]:
@@ -36,7 +37,7 @@ def _resolve_symbols(symbols: Optional[List[str]], limit: int = 30) -> List[str]
     return ["BTC", "ETH", "SOL"]
 
 
-def _run_one(db, code: str, symbols, start_ms: int, end_ms: int, trigger=3700, fee=0.035, slip=0.05, exchange="hyperliquid"):
+def _run_one(db, code: str, symbols, start_ms: int, end_ms: int, trigger=900, fee=0.035, slip=0.05, exchange="hyperliquid"):
     try:
         from backtest import BacktestConfig, ProgramBacktestEngine  # type: ignore[import-not-found]
     except ImportError:
@@ -45,7 +46,7 @@ def _run_one(db, code: str, symbols, start_ms: int, end_ms: int, trigger=3700, f
         except ImportError:
             from backtest.models import BacktestConfig  # type: ignore[import-not-found]
             from backtest.engine import ProgramBacktestEngine  # type: ignore[import-not-found]
-    cfg = BacktestConfig(code=code, signal_pool_ids=[], symbols=symbols, start_time_ms=start_ms, end_time_ms=end_ms, scheduled_interval_sec=trigger, initial_balance=10000.0, slippage_percent=slip, fee_rate=fee, exchange=exchange)
+    cfg = BacktestConfig(code=code, signal_pool_ids=[], symbols=symbols, start_time_ms=start_ms, end_time_ms=end_ms, scheduled_interval_sec=trigger, initial_balance=1000.0, slippage_percent=slip, fee_rate=fee, exchange=exchange)
     return ProgramBacktestEngine(db).run(cfg)
 
 

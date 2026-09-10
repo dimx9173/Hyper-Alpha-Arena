@@ -7,6 +7,7 @@ Interface compatible with DataProvider for strategy code reuse.
 
 import logging
 from typing import Dict, List, Any, Optional
+import time
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -201,6 +202,20 @@ class HistoricalDataProvider:
         all_klines = self._kline_cache.get(cache_key, [])
         filtered = [k for k in all_klines if k["timestamp"] <= timestamp_sec]
 
+        # Hyperliquid fallback: 5m only 17d, 15m 50d — for WF older windows 5m is empty,
+        # transparently fall back to 15m then 1h so strategy still gets data
+        if not filtered and self.exchange == "hyperliquid" and period in ("5m", "15m"):
+            for fb_period in (["15m", "1h"] if period == "5m" else ["1h", "4h"]):
+                fb_key = f"{symbol}_{fb_period}"
+                if fb_key not in self._kline_cache:
+                    self._load_klines_to_cache(symbol, fb_period)
+                fb_klines = self._kline_cache.get(fb_key, [])
+                fb_filtered = [k for k in fb_klines if k["timestamp"] <= timestamp_sec]
+                if fb_filtered:
+                    logger.debug(f"Fallback {symbol} {period} -> {fb_period} ({len(fb_filtered)} klines)")
+                    filtered = fb_filtered
+                    break
+
         # Build virtual current K-line to match real-time API behavior
         virtual_kline = self._build_virtual_kline(symbol, period, timestamp_sec)
         if virtual_kline:
@@ -257,32 +272,53 @@ class HistoricalDataProvider:
         start_sec = (self.start_time_ms // 1000) - buffer_seconds
         end_sec = self.end_time_ms // 1000
 
-        # Minimum required klines for indicator calculation (EMA100 needs ~150)
-        min_required = 150
+        # Minimum required per period (1d only has ~53 klines for new HL tokens, so lower it)
+        _min_by_period = {"1d": 30, "4h": 40, "1h": 80, "15m": 80, "5m": 120, "1m": 120}
+        min_required = _min_by_period.get(period, 80)
 
         try:
             # First, query from database
             klines = self._query_klines_from_db(symbol, period, start_sec, end_sec)
 
-            # Check if data is sufficient:
-            # 1. Need at least min_required klines for indicator calculation
-            # 2. Data must cover close to end_time (gap < 2 periods means OK)
+            # Check if data is sufficient — HL trailing gap optimization:
+            # HL 5m caps at 5000 (≈17d) and live tail is always 20-30 periods behind due to
+            # backfill batch boundaries. Fetching 30×3 gaps per backtest preload would be
+            # 90 API calls ×6 backtests/round = 540 calls/round → timeout.
+            # For HL small trailing gaps we just use cached data.
+            _gap_tolerance = {"5m": 100, "15m": 50, "1h": 10, "4h": 10, "1d": 5, "1m": 10}
+            gap_tol = _gap_tolerance.get(period, 2)
+            if self.exchange == "hyperliquid":
+                # increase tolerance to avoid per-round fetch storm
+                gap_tol = max(gap_tol, 50 if period in ("5m", "15m") else gap_tol)
+            # HL hard caps: 5m 17d / 15m 50d — older WF windows cannot be fetched, use fallback (15m/1h) instead
+            if self.exchange == "hyperliquid" and period in ("5m", "15m"):
+                max_lookback = 17 * 86400 if period == "5m" else 50 * 86400
+                now_sec_probe = int(time.time())
+                if start_sec < now_sec_probe - max_lookback - buffer_seconds:
+                    # older than HL can serve — don't storm API, let get_klines fallback handle it
+                    self._kline_cache[cache_key] = klines  # may be empty
+                    logger.debug(f"Skip fetch {symbol}/{period}/HL: window too old for HL caps, use fallback")
+                    return
             needs_fetch = False
             if len(klines) < min_required:
-                needs_fetch = True
-                logger.warning(
-                    f"[Backtest] Insufficient kline data for {symbol}/{period}/{self.exchange}: "
-                    f"got {len(klines)}, need {min_required}. Fetching from API..."
-                )
+                # HL 1d for new tokens (CASHCAT etc) naturally has 53, not 150 — don't fetch storm
+                if self.exchange == "hyperliquid" and period == "1d" and len(klines) >= 30:
+                    needs_fetch = False
+                else:
+                    needs_fetch = True
+                    logger.warning(
+                        f"[Backtest] Insufficient kline data for {symbol}/{period}/{self.exchange}: "
+                        f"got {len(klines)}, need {min_required}. Fetching from API..."
+                    )
             elif klines:
                 # Check if latest kline is too far from end_time
                 latest_ts = klines[-1]["timestamp"]
                 gap_periods = (end_sec - latest_ts) / period_sec
-                if gap_periods > 2:
+                if gap_periods > gap_tol:
                     needs_fetch = True
                     logger.warning(
                         f"[Backtest] Kline data gap for {symbol}/{period}/{self.exchange}: "
-                        f"latest={latest_ts}, end={end_sec}, gap={gap_periods:.0f} periods. Fetching from API..."
+                        f"latest={latest_ts}, end={end_sec}, gap={gap_periods:.0f} periods (tol {gap_tol}). Fetching from API..."
                     )
 
             if needs_fetch:

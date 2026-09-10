@@ -334,3 +334,18 @@ prompts/
 # Internal docs (not for public repo)
 docs/*.md
 backend/scripts/
+
+# Backtest iteration outputs (ephemeral, auto-generated)
+backend/backtest/iterate_run_*.log
+backend/backtest/iteration_log_*.jsonl.bak*
+
+# Backtest artifacts: symlinks to local cold-data (absolute paths, machine-specific)
+backend/backtest/iteration_log*.jsonl
+backend/backtest/summary.json
+backend/backtest/summary_top30_relaxed.json
+backend/backtest/round_codes
+backend/backtest/*.bak*
+backend/backtest/*.bak2
+backend/backtest/*.pre_adjust
+backend/backtest/best_code_top30*.py
+backend/backtest/*_candidate.py
