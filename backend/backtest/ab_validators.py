@@ -37,7 +37,11 @@ def _resolve_symbols(symbols: Optional[List[str]], limit: int = 30) -> List[str]
     return ["BTC", "ETH", "SOL"]
 
 
-def _run_one(db, code: str, symbols, start_ms: int, end_ms: int, trigger=900, fee=0.035, slip=0.05, exchange="hyperliquid"):
+CONSERVATIVE_FEE = 0.07
+CONSERVATIVE_SLIP = 0.20
+
+
+def _run_one(db, code: str, symbols, start_ms: int, end_ms: int, trigger=900, fee=CONSERVATIVE_FEE, slip=CONSERVATIVE_SLIP, exchange="hyperliquid"):
     try:
         from backtest import BacktestConfig, ProgramBacktestEngine  # type: ignore[import-not-found]
     except ImportError:
