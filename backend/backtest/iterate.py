@@ -334,6 +334,21 @@ def generate_variant(base_code: str, round_idx: int) -> str:
         variant = _mutate_factor_guided(base_code, round_idx)
     if not _validate_syntax(variant):
         return base_code
+    # constrained run: clamp leverage<=2 (r6 lev4 blew maxDD 40%)
+    import re as _re_clamp
+    try:
+        variant = _re_clamp.sub(r"leverage=2", "LEVX", variant) if False else variant
+        def _cap_lev(m):
+            try:
+                v = int(m.group(1))
+            except Exception:
+                return m.group(0)
+            return f"leverage={min(v, 2)}"
+        variant = _re_clamp.sub(r"leverage\s*=\s*(\d+)", _cap_lev, variant)
+    except Exception:
+        pass
+    if not _validate_syntax(variant):
+        return base_code
     return variant
 
 
