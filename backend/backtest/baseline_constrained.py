@@ -1,13 +1,24 @@
 class Strategy:
     def should_trade(self, data):
-        # constrained: single-position, no-add, lev2, wide TP6%/SL2.5%, 1h trend
+        # constrained v2: max 3 coins each one position, no-add same coin, lev2, wide TP6%/SL2.5%, 1h trend
         try:
             open_pos = data.positions or {}
         except Exception:
             open_pos = {}
-        if open_pos:
-            return Decision(operation="hold", symbol="BTC", reason="single-position guard")
+        try:
+            n_open = len(open_pos)
+        except Exception:
+            n_open = 0
+        if n_open >= 3:
+            return Decision(operation="hold", symbol="BTC", reason="max-3-positions guard")
+        skip = set()
+        try:
+            skip = set(open_pos.keys())
+        except Exception:
+            skip = set()
         for symbol in ["BTC", "ETH", "SOL", "HYPE", "BNB", "AVAX", "NEAR", "SUI", "DOGE", "ARB"]:
+            if symbol in skip:
+                continue
             price = data.get_price(symbol)
             if price == 0:
                 continue
