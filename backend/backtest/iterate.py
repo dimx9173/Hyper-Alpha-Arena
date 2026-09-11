@@ -150,6 +150,11 @@ def _mutate_add_filter(code: str, round_idx: int) -> str:
         thr2 = 0.002 + (round_idx % 4) * 0.001
         new_code = re.sub(r"mom_20 < 0\.\d+", f"mom_20 < {thr2:.3f}", new_code, count=1)
         return new_code
+    # MR/BOLL 基線：只微調 pos/rsi 閾值，不注入 regime/factor（回測易異常滅活）
+    if "pos > -" in code:
+        lv = -1.0 - (round_idx % 4) * 0.1  # -1.0..-1.3
+        new_code = re.sub(r"pos > -\d\.\d", f"pos > {lv:.1f}", code, count=1)
+        return new_code
     # 無 ATR 的舊 baseline 才走 regime/因子分支（保留兼容）
     use_regime = (round_idx % 2 == 0)
     _m2 = re.search(r"(\n)([ ]+)closes = \[k\.close for k in klines\]", code)
