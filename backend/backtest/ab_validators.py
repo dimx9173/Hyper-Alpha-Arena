@@ -109,7 +109,7 @@ def a_validator(
     threshold_pf: float = 1.5,
     threshold_win_pct: float = 45.0,
     threshold_trades_30d: int = 10,
-    threshold_trades_7d: int = 3,
+    threshold_trades_7d: int = 2,
     threshold_maxdd_pct: float = 12.0,
     symbols: Optional[List[str]] = None,
     exchange: str = "hyperliquid",
