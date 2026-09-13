@@ -782,6 +782,27 @@ class ProgramExecutionService:
                 self._create_hyperliquid_trade(
                     binding, decision, order_result, wallet_address, environment, exchange
                 )
+            # PRP-P2-4: TP/SL對賬 — 主單filled但子單缺失即告警
+            try:
+                if order_status == 'filled' and (getattr(decision, 'take_profit_price', None) or getattr(decision, 'stop_loss_price', None)):
+                    if not order_result.get('tp_order_id') and getattr(decision, 'take_profit_price', None):
+                        logger.error(f"[ProgramExecution][ALERT] binding {binding.id} TP missing for {decision.symbol}")
+                    if not order_result.get('sl_order_id') and getattr(decision, 'stop_loss_price', None):
+                        logger.error(f"[ProgramExecution][ALERT] binding {binding.id} SL missing for {decision.symbol}, consider market close")
+            except Exception:
+                pass
+            # PRP-P2-4: 連虧暫停 — 近5筆4虧即停用
+            try:
+                from database.models import ProgramExecutionLog as _PEL3
+                _last5 = db.query(_PEL3).filter(_PEL3.binding_id == binding.id).order_by(_PEL3.id.desc()).limit(5).all()
+                if len(_last5) >= 5:
+                    _loss = sum(1 for _l in _last5 if _l.success is False)
+                    if _loss >= 4:
+                        binding.is_active = False
+                        db.commit()
+                        logger.error(f"[ProgramExecution][ALERT] binding {binding.id} 4/5 losses, auto-paused")
+            except Exception:
+                pass
 
         except Exception as e:
             logger.error(f"[ProgramExecution] Failed to update log with order: {e}")
