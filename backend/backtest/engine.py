@@ -225,6 +225,23 @@ class ProgramBacktestEngine:
 
             # Update equity after TP/SL
             account.update_equity(prices)
+            # PRP-P1-1: funding shadow — 每trigger按持倉時間估算 (long付0.01%/8h, short收)
+            try:
+                _dt_h = max(0.0, (trigger.timestamp - last_trigger_time) / 3600000.0)
+                if _dt_h > 0 and _dt_h < 24:
+                    for _sym, _pos in list(account.positions.items()):
+                        _px = prices.get(_sym, 0) or 0
+                        if _px <= 0:
+                            continue
+                        _notional = abs(_pos.size) * _px
+                        _rate_h = 0.0001 / 8  # 保守 0.01%/8h
+                        _pay = _notional * _rate_h * _dt_h
+                        if _pos.side == "long":
+                            account.total_funding_shadow += _pay
+                        else:
+                            account.total_funding_shadow -= _pay
+            except Exception:
+                pass
 
             # Determine trigger symbol
             trigger_symbol = trigger.symbol if trigger.symbol else config.symbols[0]

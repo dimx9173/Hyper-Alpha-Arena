@@ -83,6 +83,9 @@ class VirtualAccount:
         self.realized_pnl_total = 0.0      # Cumulative realized PnL
         self.unrealized_pnl_total = 0.0    # Current unrealized PnL
         self.total_fees = 0.0              # Cumulative fees paid
+        # PRP-P1-1: funding shadow (perp_funding表空, 用保守常數估算, 不計入equity)
+        self.total_funding_shadow = 0.0    # shadow funding cost estimate
+        self.funding_enabled = False       # 轉正前保持False
 
         # Drawdown tracking
         self.peak_equity = initial_balance
@@ -99,6 +102,7 @@ class VirtualAccount:
         self.realized_pnl_total = 0.0
         self.unrealized_pnl_total = 0.0
         self.total_fees = 0.0
+        self.total_funding_shadow = 0.0
         self.peak_equity = self.initial_balance
         self.max_drawdown = 0.0
         self.max_drawdown_percent = 0.0
