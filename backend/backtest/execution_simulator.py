@@ -44,16 +44,22 @@ class ExecutionSimulator:
         self,
         slippage_percent: float = 0.05,
         fee_rate: float = 0.035,
+        maker_fee_rate: float = 0.02,
+        realistic_tpsl: bool = True,
     ):
         """
         Initialize execution simulator.
 
         Args:
             slippage_percent: Default slippage in percent (0.05 = 0.05%)
-            fee_rate: Trading fee rate in percent (0.035 = 0.035%)
+            fee_rate: Trading fee rate in percent (0.035 = 0.035%, taker)
+            maker_fee_rate: Maker fee rate in percent (PRP-P1-2, TP limit)
+            realistic_tpsl: TP needs close-confirm, SL pays taker (default True)
         """
         self.slippage_percent = slippage_percent
         self.fee_rate = fee_rate
+        self.maker_fee_rate = maker_fee_rate
+        self.realistic_tpsl = realistic_tpsl
 
     def calculate_execution_price(
         self,
@@ -257,11 +263,19 @@ class ExecutionSimulator:
                 trigger_price = order.trigger_price
 
                 # Check trigger condition using kline high/low
+                # PRP-P1-2: TP needs close-confirm (影線碰不算成交), SL keeps wick trigger
+                close = kline.get("close", 0) or 0
                 if order.order_type == "take_profit":
-                    if pos.side == "long" and high >= trigger_price:
-                        should_trigger = True
-                    elif pos.side == "short" and low <= trigger_price:
-                        should_trigger = True
+                    if self.realistic_tpsl:
+                        if pos.side == "long" and close >= trigger_price:
+                            should_trigger = True
+                        elif pos.side == "short" and close <= trigger_price:
+                            should_trigger = True
+                    else:
+                        if pos.side == "long" and high >= trigger_price:
+                            should_trigger = True
+                        elif pos.side == "short" and low <= trigger_price:
+                            should_trigger = True
                 elif order.order_type == "stop_loss":
                     if pos.side == "long" and low <= trigger_price:
                         should_trigger = True
@@ -282,8 +296,9 @@ class ExecutionSimulator:
                         continue
 
                     # Calculate fee for actual close size
+                    # PRP-P1-2: TP maker fee, SL taker fee
                     notional = actual_close_size * executed_price
-                    fee = self.calculate_fee(notional)
+                    fee = self.calculate_fee(notional, fee_rate=self.maker_fee_rate if order.order_type == "take_profit" else None)
 
                     # Partial close position
                     pnl = account.partial_close_position(
