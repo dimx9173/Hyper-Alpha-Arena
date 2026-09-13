@@ -337,8 +337,26 @@ def generate_variant(base_code: str, round_idx: int) -> str:
         variant = _mutate_llm_guided(base_code, round_idx)
     else:  # kind == 5
         variant = _mutate_factor_guided(base_code, round_idx)
+    # PRP-P0-3: dedup — same sha1 as base => try next kinds, else mark duplicate
+    import hashlib as _hl
+    def _norm(s):
+        return "".join(s.split())
+    base_hash = _hl.sha1(_norm(base_code).encode()).hexdigest()[:12]
+    if _hl.sha1(_norm(variant).encode()).hexdigest()[:12] == base_hash:
+        for _k in range(1, 6):
+            try:
+                alt = [_mutate_param_jitter, _mutate_threshold, _mutate_add_filter,
+                       _mutate_tpsl, _mutate_llm_guided, _mutate_factor_guided][(round_idx + _k) % 6](base_code, round_idx + _k)
+                if _validate_syntax(alt) and _hl.sha1(_norm(alt).encode()).hexdigest()[:12] != base_hash:
+                    variant = alt
+                    break
+            except Exception:
+                continue
     if not _validate_syntax(variant):
         return base_code
+    variant_hash = _hl.sha1(_norm(variant).encode()).hexdigest()[:12]
+    if variant_hash == base_hash:
+        return base_code + "\n# DUPLICATE_NOCHANGE\n"
     # constrained run: clamp leverage<=2 (r6 lev4 blew maxDD 40%)
     import re as _re_clamp
     try:
@@ -563,6 +581,39 @@ def main():
             continue
         t0 = time.time()
         variant = generate_variant(full_best_code, rnd)
+        # PRP-P0-3: duplicate/smoke short-circuit (no backtest cost)
+        if variant.rstrip().endswith("# DUPLICATE_NOCHANGE"):
+            gate_a = False
+            gate_b = False
+            gate_c = True
+            sharpe_30d = -9.0
+            pf = None
+            trades_7d = 0
+            avg_b = -9.0
+            pnl_30d = 0.0
+            status = "skipped_duplicate"
+            err_msg = "duplicate variant"
+            elapsed_ms = int((time.time() - t0) * 1000)
+            code_preview = variant[:2000] if len(variant) > 2000 else variant
+            preview_one = code_preview.replace("\n", "\\n")[:600]
+            import hashlib as _hl2
+            code_hash = _hl2.sha256(variant.encode("utf-8")).hexdigest()[:16]
+            rec = {"round": rnd, "exchange": args.exchange, "symbols": symbols,
+                   "gate_a": False, "gate_b": False, "gate_c": True,
+                   "sharpe_30d": sharpe_30d, "pnl_30d": float(pnl_30d),
+                   "pf": pf, "trades_7d": trades_7d, "avg_sharpe_b": avg_b,
+                   "elapsed_ms": elapsed_ms, "status": status, "code_preview": preview_one,
+                   "code_hash": code_hash, "threshold_a": args.threshold_a,
+                   "threshold_b": args.threshold_b,
+                   "threshold_c": float(getattr(args, "threshold_c", 90.0) or 90.0)}
+            try:
+                with log_file.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            except Exception as ex:
+                logger.error(f"failed to write log: {ex}")
+            actually_run += 1
+            logger.info(f"round {rnd}/{total_rounds} status={status} (duplicate skip)")
+            continue
         gate_a = False
         gate_b = False
         gate_c = False
@@ -615,18 +666,23 @@ def main():
                         logger.warning(f"round {rnd} a_validator error: {e}")
                         ga, info_a = False, {"30d": None, "7d": None}
                         err_msg = str(e)[:500]
-                    try:
-                        gb, avg_b_val, _oos = b_validator(db, variant, **_kw_b)  # type: ignore
-                    except TypeError:
+                    # PRP-P0-4: early stop — A不過不跑B
+                    if not ga:
+                        gb, avg_b_val, _oos = False, -9.0, []
+                        logger.info(f"round {rnd} early-stop at GateA")
+                    else:
                         try:
-                            gb, avg_b_val, _oos = b_validator(db, variant, threshold_avg=args.threshold_b)
+                            gb, avg_b_val, _oos = b_validator(db, variant, **_kw_b)  # type: ignore
                         except TypeError:
-                            gb, avg_b_val, _oos = b_validator(db, variant)
-                    except Exception as e:
-                        logger.warning(f"round {rnd} b_validator error: {e}")
-                        gb, avg_b_val = False, -9.0
-                        if err_msg is None:
-                            err_msg = str(e)[:500]
+                            try:
+                                gb, avg_b_val, _oos = b_validator(db, variant, threshold_avg=args.threshold_b)
+                            except TypeError:
+                                gb, avg_b_val, _oos = b_validator(db, variant)
+                        except Exception as e:
+                            logger.warning(f"round {rnd} b_validator error: {e}")
+                            gb, avg_b_val = False, -9.0
+                            if err_msg is None:
+                                err_msg = str(e)[:500]
                     # Gate C：90d 連續。realistic 模式 threshold_c<30 時自動通過（僅 A/B 生效，DB 僅 23d）
                     try:
                         _c_val = globals().get("c_validator")
