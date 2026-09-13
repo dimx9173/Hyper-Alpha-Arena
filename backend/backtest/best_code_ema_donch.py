@@ -15,7 +15,7 @@ class Strategy:
             skip = set(open_pos.keys())
         except Exception:
             skip = set()
-        for symbol in ["BTC", "ETH", "SOL", "HYPE", "BNB", "AVAX", "NEAR", "SUI", "DOGE", "ARB", "LINK", "UNI", "AAVE", "TAO", "TRUMP"]:
+        for symbol in ["BTC", "ETH", "SOL", "HYPE", "BNB", "AVAX", "NEAR", "SUI", "DOGE", "ARB", "AAVE", "TAO"]:
             if symbol in skip:
                 continue
             price = data.get_price(symbol)
