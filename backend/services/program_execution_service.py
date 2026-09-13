@@ -961,6 +961,51 @@ class ProgramExecutionService:
                     logger.error(f"[ProgramExecution] Invalid TP/SL: {tp_errors}")
                     return False
 
+            # PRP-P2-3: portfolio guard — 總暴露<=2x equity, 單幣<=40%, 同簇<=60%, 日虧5%熔斷
+            if op in ("buy", "sell"):
+                try:
+                    _acct = client.get_account_state(db)
+                    _eq = float(_acct.get("total_equity", 0) or 0)
+                    _positions = data_provider.get_positions() if environment and client else {}
+                    _total_notional = 0.0
+                    _cluster_notional = 0.0
+                    _CLUSTER = {"BTC", "ETH", "SOL", "HYPE", "BNB", "AVAX", "NEAR"}
+                    try:
+                        from services.hyperliquid_market_data import get_last_price_from_hyperliquid as _lp
+                    except Exception:
+                        _lp = None
+                    for _s, _pp in (_positions or {}).items():
+                        try:
+                            _px = _lp(_s, environment) if _lp else 0
+                            _nv = abs(float(getattr(_pp, "size", 0) or 0)) * float(_px or 0)
+                            _total_notional += _nv
+                            if _s in _CLUSTER:
+                                _cluster_notional += _nv
+                        except Exception:
+                            continue
+                    _new_margin = available_balance * float(getattr(decision, 'target_portion_of_balance', 0))
+                    _new_notional = _new_margin * int(getattr(decision, 'leverage', 1) or 1)
+                    if _eq > 0 and (_total_notional + _new_notional) > _eq * 2:
+                        logger.warning(f"[ProgramExecution] portfolio guard: exposure cap, skip {decision.symbol}")
+                        return None
+                    if _eq > 0 and _new_notional > _eq * 0.4:
+                        logger.warning(f"[ProgramExecution] portfolio guard: single-coin cap, skip {decision.symbol}")
+                        return None
+                    if decision.symbol in _CLUSTER and _eq > 0 and (_cluster_notional + _new_notional) > _eq * 0.6:
+                        logger.warning(f"[ProgramExecution] portfolio guard: cluster cap, skip {decision.symbol}")
+                        return None
+                    from database.models import ProgramExecutionLog as _PEL2
+                    from datetime import timedelta as _td2
+                    _day = datetime.now(timezone.utc) - _td2(hours=24)
+                    _logs = db.query(_PEL2).filter(_PEL2.binding_id == binding.id, _PEL2.created_at >= _day).all()
+                    _day_pnl = sum(float(getattr(_l, "pnl", 0) or 0) for _l in _logs)
+                    if _eq > 0 and _day_pnl < -_eq * 0.05:
+                        logger.error(f"[ProgramExecution] portfolio guard: daily loss fuse, disabling binding {binding.id}")
+                        binding.is_active = False
+                        db.commit()
+                        return None
+                except Exception as _ge:
+                    logger.warning(f"[ProgramExecution] portfolio guard check failed: {_ge}")
             # PRP-P1-3: same-direction add cooldown 4h (4h訊號不反覆加倉)
             if op in ("buy", "sell"):
                 _pos = positions_dict.get(decision.symbol)
