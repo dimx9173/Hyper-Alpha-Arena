@@ -39,5 +39,5 @@ class Strategy:
             hh = max(highs[-21:-1])
             if closes[-1] < hh * 0.97:
                 continue
-            return Decision(operation="buy", symbol=symbol, reason="ema-donch", target_portion_of_balance=0.25, leverage=2, max_price=price*1.005, take_profit_price=price*1.08, stop_loss_price=price*0.97)
+            return Decision(operation="buy", symbol=symbol, reason="ema-donch", target_portion_of_balance=0.25, leverage=2, max_price=price*1.005, take_profit_price=price*1.08, stop_loss_price=price*0.97, sl_execution="market")
         return Decision(operation="hold", symbol="BTC", reason="no signal")

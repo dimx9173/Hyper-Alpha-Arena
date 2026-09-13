@@ -270,8 +270,10 @@ class ExecutionSimulator:
 
                 if should_trigger:
                     # Execute at trigger price (not kline close)
+                    # PRP-P0-1: SL market penalty x3 slip (穿價保證成交但多付滑點)
                     close_side = "sell" if pos.side == "long" else "buy"
-                    executed_price, _ = self.calculate_execution_price(trigger_price, close_side)
+                    eff_slip = self.slippage_percent * 3 if order.order_type == "stop_loss" else self.slippage_percent
+                    executed_price, _ = self.calculate_execution_price(trigger_price, close_side, slippage_pct=eff_slip)
 
                     # Use actual close size (min of order size and remaining position)
                     actual_close_size = min(order.size, pos.size)
