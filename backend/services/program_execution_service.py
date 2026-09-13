@@ -961,6 +961,27 @@ class ProgramExecutionService:
                     logger.error(f"[ProgramExecution] Invalid TP/SL: {tp_errors}")
                     return False
 
+            # PRP-P1-3: same-direction add cooldown 4h (4h訊號不反覆加倉)
+            if op in ("buy", "sell"):
+                _pos = positions_dict.get(decision.symbol)
+                if _pos:
+                    _same = (_pos.get("side") == "long" and op == "buy") or (_pos.get("side") == "short" and op == "sell")
+                    if _same:
+                        from database.models import ProgramExecutionLog as _PEL
+                        from datetime import timedelta as _td
+                        try:
+                            _cut = datetime.now(timezone.utc) - _td(hours=4)
+                            _recent = db.query(_PEL).filter(
+                                _PEL.binding_id == binding.id,
+                                _PEL.created_at >= _cut,
+                                _PEL.decision_action.in_(["buy", "sell"]),
+                            ).order_by(_PEL.id.desc()).first()
+                            if _recent is not None:
+                                logger.info(f"[ProgramExecution] Binding {binding.id} {decision.symbol} same-direction cooldown, skip add")
+                                return None
+                        except Exception as _ce:
+                            logger.warning(f"[ProgramExecution] cooldown check failed: {_ce}")
+
             # Execute based on operation type
             order_result = None
             if op == "buy":
@@ -1021,7 +1042,7 @@ class ProgramExecutionService:
             take_profit_price=getattr(decision, 'take_profit_price', None),
             stop_loss_price=getattr(decision, 'stop_loss_price', None),
             tp_execution=getattr(decision, 'tp_execution', 'limit'),
-            sl_execution=getattr(decision, 'sl_execution', 'limit'),
+            sl_execution=getattr(decision, 'sl_execution', 'market'),
         )
 
         # IOC->GTC retry if no liquidity
@@ -1035,7 +1056,7 @@ class ProgramExecutionService:
                     take_profit_price=getattr(decision, 'take_profit_price', None),
                     stop_loss_price=getattr(decision, 'stop_loss_price', None),
                     tp_execution=getattr(decision, 'tp_execution', 'limit'),
-                    sl_execution=getattr(decision, 'sl_execution', 'limit'),
+                    sl_execution=getattr(decision, 'sl_execution', 'market'),
                 )
                 if order_result and order_result.get('status') in ['filled', 'resting']:
                     logger.info(f"[ProgramExecution] BUY {symbol} GTC fallback succeeded")
@@ -1074,7 +1095,7 @@ class ProgramExecutionService:
             take_profit_price=getattr(decision, 'take_profit_price', None),
             stop_loss_price=getattr(decision, 'stop_loss_price', None),
             tp_execution=getattr(decision, 'tp_execution', 'limit'),
-            sl_execution=getattr(decision, 'sl_execution', 'limit'),
+            sl_execution=getattr(decision, 'sl_execution', 'market'),
         )
 
         # IOC->GTC retry if no liquidity
@@ -1088,7 +1109,7 @@ class ProgramExecutionService:
                     take_profit_price=getattr(decision, 'take_profit_price', None),
                     stop_loss_price=getattr(decision, 'stop_loss_price', None),
                     tp_execution=getattr(decision, 'tp_execution', 'limit'),
-                    sl_execution=getattr(decision, 'sl_execution', 'limit'),
+                    sl_execution=getattr(decision, 'sl_execution', 'market'),
                 )
                 if order_result and order_result.get('status') in ['filled', 'resting']:
                     logger.info(f"[ProgramExecution] SELL {symbol} GTC fallback succeeded")
