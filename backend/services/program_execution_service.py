@@ -1060,6 +1060,18 @@ class ProgramExecutionService:
                 )
                 if order_result and order_result.get('status') in ['filled', 'resting']:
                     logger.info(f"[ProgramExecution] BUY {symbol} GTC fallback succeeded")
+                    # PRP-P2-2: GTC TTL 90s — resting單超時撤單, 防計劃外成交
+                    if order_result.get('status') == 'resting':
+                        try:
+                            import time as _t
+                            _oid = order_result.get('order_id')
+                            _t.sleep(90)
+                            _st = client.get_order_status(db, _oid, symbol) if hasattr(client, 'get_order_status') else None
+                            if isinstance(_st, dict) and _st.get('status') == 'resting':
+                                client.cancel_order(db, _oid, symbol)
+                                logger.warning(f"[ProgramExecution] BUY {symbol} GTC TTL expired, cancelled {_oid}")
+                        except Exception as _e:
+                            logger.warning(f"[ProgramExecution] GTC TTL check failed: {_e}")
 
         return order_result
 
@@ -1113,6 +1125,18 @@ class ProgramExecutionService:
                 )
                 if order_result and order_result.get('status') in ['filled', 'resting']:
                     logger.info(f"[ProgramExecution] SELL {symbol} GTC fallback succeeded")
+                    # PRP-P2-2: GTC TTL 90s
+                    if order_result.get('status') == 'resting':
+                        try:
+                            import time as _t
+                            _oid = order_result.get('order_id')
+                            _t.sleep(90)
+                            _st = client.get_order_status(db, _oid, symbol) if hasattr(client, 'get_order_status') else None
+                            if isinstance(_st, dict) and _st.get('status') == 'resting':
+                                client.cancel_order(db, _oid, symbol)
+                                logger.warning(f"[ProgramExecution] SELL {symbol} GTC TTL expired, cancelled {_oid}")
+                        except Exception as _e:
+                            logger.warning(f"[ProgramExecution] GTC TTL check failed: {_e}")
 
         return order_result
 
