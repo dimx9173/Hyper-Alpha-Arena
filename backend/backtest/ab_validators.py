@@ -193,8 +193,11 @@ def b_validator(
         oos.append(r)
     avg_sharpe = sum(float(getattr(r, "sharpe_ratio", 0) or 0) for r in oos) / len(oos) if oos else -9
     avg_pnl = sum(float(getattr(r, "total_pnl_percent", 0) or 0) for r in oos) / len(oos) if oos else -999
-    all_pnl_ok = all(float(getattr(r, "total_pnl_percent", 0) or 0) > threshold_pnl_pct for r in oos) if oos else False
-    gate_b = (avg_sharpe > threshold_avg) and all_pnl_ok
+    # PRP-P1-4: 熔斷制 — 任一折低於-5%直接否決; 其餘折允許盤整小虧(>=-5%), avg達標即過
+    # 替代舊all_pnl_ok(每折>閾值, 盤整折系統性誤殺)
+    fuse = -8.0
+    no_blowup = all(float(getattr(r, "total_pnl_percent", 0) or 0) >= fuse for r in oos) if oos else False
+    gate_b = (avg_sharpe > threshold_avg) and no_blowup
     return gate_b, avg_sharpe, oos
 
 
