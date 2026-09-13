@@ -55,6 +55,8 @@ class HistoricalDataProvider:
         self._kline_cache: Dict[str, List[Dict]] = {}
         self._flow_cache: Dict[str, Dict] = {}
         self._price_cache: Dict[str, float] = {}
+        # PRP-P0-2: indicator series cache {(symbol, period, IND): (ts_list, val_list)}
+        self._indicator_cache: Dict[str, Any] = {}
 
         # Query tracking for logging
         self._query_log: List[Dict[str, Any]] = []
@@ -572,51 +574,54 @@ class HistoricalDataProvider:
         """
         from services.technical_indicators import calculate_indicators
 
-        # Get klines (enough for indicator calculation)
-        klines = self.get_klines(symbol, period, 500)
-        if not klines:
+        # PRP-P0-2: full-window once + bisect slice
+        import bisect as _bisect
+        indicator_upper = indicator.upper()
+        ck = f"{symbol}_{period}_{indicator_upper}"
+        ts_now = self.current_time_ms // 1000
+        hit = self._indicator_cache.get(ck)
+        if hit is None:
+            klines_full = self.get_klines(symbol, period, 5000)
+            if not klines_full:
+                self._log_query("get_indicator", {"symbol": symbol, "indicator": indicator, "period": period, "exchange": self.exchange}, {})
+                return {}
+            kline_data = [
+                {"timestamp": k.timestamp, "open": k.open, "high": k.high,
+                 "low": k.low, "close": k.close, "volume": k.volume}
+                for k in klines_full
+            ]
+            try:
+                calculated = calculate_indicators(kline_data, [indicator_upper])
+            except Exception as ex:
+                logger.warning(f"Failed to calculate {indicator} for {symbol}: {ex}")
+                self._log_query("get_indicator", {"symbol": symbol, "indicator": indicator, "period": period, "exchange": self.exchange}, {})
+                return {}
+            raw = calculated.get(indicator_upper)
+            ts_list = [k["timestamp"] for k in kline_data]
+            if isinstance(raw, list):
+                self._indicator_cache[ck] = (ts_list, raw)
+            elif isinstance(raw, dict):
+                self._indicator_cache[ck] = (ts_list, raw)
+            else:
+                self._indicator_cache[ck] = (ts_list, raw)
+            hit = self._indicator_cache.get(ck)
+        ts_list, raw = hit
+        idx = _bisect.bisect_right(ts_list, ts_now) - 1
+        if idx < 0:
             self._log_query("get_indicator", {"symbol": symbol, "indicator": indicator, "period": period, "exchange": self.exchange}, {})
             return {}
-
-        # Convert to format expected by calculate_indicators
-        kline_data = [
-            {
-                "timestamp": k.timestamp,
-                "open": k.open,
-                "high": k.high,
-                "low": k.low,
-                "close": k.close,
-                "volume": k.volume,
-            }
-            for k in klines
-        ]
-
-        result = {}
-        try:
-            indicator_upper = indicator.upper()
-            calculated = calculate_indicators(kline_data, [indicator_upper])
-
-            if indicator_upper in calculated and calculated[indicator_upper] is not None:
-                value = calculated[indicator_upper]
-                if isinstance(value, list):
-                    result = {'value': value[-1] if value else None, 'series': value}
-                elif isinstance(value, dict):
-                    latest = {}
-                    for k, v in value.items():
-                        if isinstance(v, list) and v:
-                            latest[k] = v[-1]
-                        else:
-                            latest[k] = v
-                    result = latest
-                else:
-                    result = {'value': value}
-        except Exception as e:
-            logger.warning(f"Failed to calculate {indicator} for {symbol}: {e}")
-
-        # Log with result (exclude series to save space)
-        log_result = {k: v for k, v in result.items() if k != 'series'} if result else {}
-        self._log_query("get_indicator", {"symbol": symbol, "indicator": indicator, "period": period, "exchange": self.exchange}, log_result)
-
+        if isinstance(raw, list):
+            result = {'value': raw[idx] if idx < len(raw) else None}
+            self._log_query("get_indicator", {"symbol": symbol, "indicator": indicator, "period": period, "exchange": self.exchange}, {k: v for k, v in result.items()})
+            return result
+        if isinstance(raw, dict):
+            latest = {}
+            for k, v in raw.items():
+                latest[k] = v[idx] if isinstance(v, list) and idx < len(v) else v
+            self._log_query("get_indicator", {"symbol": symbol, "indicator": indicator, "period": period, "exchange": self.exchange}, {k: v for k, v in latest.items() if k != 'series'})
+            return latest
+        result = {'value': raw}
+        self._log_query("get_indicator", {"symbol": symbol, "indicator": indicator, "period": period, "exchange": self.exchange}, result)
         return result
 
     def get_flow(self, symbol: str, metric: str, period: str) -> Dict[str, Any]:
