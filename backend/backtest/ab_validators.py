@@ -234,3 +234,70 @@ def c_validator(
     }
     gate_c = all(cond.values())
     return gate_c, {"90d": r90, "gate_c": gate_c, "cond": cond, "f90": f90, "health": health}
+
+
+# === ANNUAL VALIDATOR (365d) ===
+# 目標：月均 10% (年化 120%)，maxDD 5%
+PNL_365D_PCT = 120.0
+MIN_5M_PER_DAY_365 = 50  # 同健康檢查
+
+def annual_validator(
+    db,
+    code: str,
+    threshold_365d_pnl_pct: float = PNL_365D_PCT,
+    threshold_maxdd_pct: float = 5.0,
+    threshold_pf: float = 1.5,
+    threshold_sharpe: float = 0.5,
+    threshold_win_pct: float = 45.0,
+    threshold_trades: int = 50,
+    symbols: Optional[List[str]] = None,
+    exchange: str = "hyperliquid",
+) -> Tuple[bool, Dict]:
+    """
+    Annual Gate — 365d 回測
+    需同時滿足：
+    - pnl% >= 120% (月均 10%)
+    - maxDD% <= 5%
+    - PF > 1.5
+    - Sharpe > 0.5
+    - Win > 45%
+    - Trades >= 50 (年均)
+    - 5m 日均 >= 50 (健康)
+    """
+    symbols = _resolve_symbols(symbols, 30)
+    now_ms = int(time.time() * 1000)
+    r365 = _run_one(db, code, symbols, now_ms - 365 * 24 * 3600 * 1000, now_ms, exchange=exchange)
+    f365 = _extract_gate_fields(r365)
+    win365 = _win_pct(r365)
+    pf = r365.profit_factor
+    pf_ok = (pf is not None) and (float(pf) > threshold_pf)
+    health_ok, health = _data_health_ok(db, days=365, symbol=symbols[0] if symbols else "BTC", exchange=exchange)
+    
+    cond = {
+        "pnl_pct": f365["pnl_percent"] >= threshold_365d_pnl_pct,
+        "maxdd": f365["maxdd_pct"] <= threshold_maxdd_pct if f365["maxdd_pct"] is not None else False,
+        "pf": pf_ok,
+        "sharpe": f365["sharpe"] > threshold_sharpe,
+        "win": win365 > threshold_win_pct,
+        "trades": f365["trades"] >= threshold_trades,
+        "health": health_ok,
+    }
+    gate_annual = all(cond.values())
+    return gate_annual, {
+        "365d": r365,
+        "gate_annual": gate_annual,
+        "cond": cond,
+        "f365": f365,
+        "health": health,
+        "pf_ok": pf_ok,
+        "thresholds": {
+            "pnl_pct": threshold_365d_pnl_pct,
+            "maxdd_pct": threshold_maxdd_pct,
+            "pf": threshold_pf,
+            "sharpe": threshold_sharpe,
+            "win": threshold_win_pct,
+            "trades": threshold_trades,
+        },
+    }
+
+
