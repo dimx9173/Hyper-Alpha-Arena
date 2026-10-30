@@ -10,10 +10,12 @@
 不依賴真實回測資料庫，全部用假的 account / trades / equity_curve，
 所以可以快速執行且不受資料覆蓋影響。
 """
-import sys, math
+import math
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
-sys.path.insert(0, "/home/brian/project/Hyper-Alpha-Arena/backend")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backtest.virtual_account import VirtualAccount
 from backtest.models import BacktestConfig, BacktestTradeRecord

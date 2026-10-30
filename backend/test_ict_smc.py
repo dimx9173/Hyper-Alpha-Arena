@@ -9,8 +9,9 @@
 在定義上就不存在 swing 點，detect_structure 回傳空是正確行為。
 """
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "/home/brian/project/Hyper-Alpha-Arena/backend")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from services.ict_smc_indicators import (
     find_swings, detect_structure, find_order_blocks, find_fvgs,

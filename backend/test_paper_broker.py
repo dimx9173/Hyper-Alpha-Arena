@@ -4,8 +4,9 @@
 會計錯了，績效數字就沒有任何意義。
 """
 import sys, os, tempfile
+from pathlib import Path
 
-sys.path.insert(0, "/home/brian/project/Hyper-Alpha-Arena/backend")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from services.paper_broker import PaperBroker, FeeModel, PaperPosition, PaperTrade
 

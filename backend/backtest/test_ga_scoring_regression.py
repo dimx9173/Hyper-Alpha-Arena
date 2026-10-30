@@ -12,8 +12,10 @@
 """
 import math
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "/home/brian/project/Hyper-Alpha-Arena/backend")
+_BACKEND = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_BACKEND))
 
 from backtest.ga_annual import (
     _pnl_score, dd_penalty_score, pf_score, gate_violation, calculate_fitness,
@@ -473,7 +475,7 @@ print("=" * 72)
 # 舊碼用 zip(population, eval_results)，而 eval_results 來自 as_completed，
 # 是「完成順序」而非「提交順序」。結果每個基因組都配上別人的 fitness：
 # 精英保留、交叉父代選擇、best_genome 存檔全部錯誤。
-_RUNNER = _P("/home/brian/project/Hyper-Alpha-Arena/backend/backtest/iterate_annual_ga.py")
+_RUNNER = _BACKEND / "backtest" / "iterate_annual_ga.py"
 _src = _RUNNER.read_text()
 _TOKEN = "eval_by_ind[0]"
 _code_only = "\n".join(ln for ln in _src.splitlines() if not ln.strip().startswith("#"))
@@ -518,14 +520,14 @@ print("=" * 72)
 # 原本 validator 內部各自用 int(time.time()*1000)，同一基因組在不同評估
 # 會得到不同指標（實測 DD 3.69% -> 5.01%、PnL 26.73% -> 26.51%），
 # GA 因此在對時間漂移造成的雜訊最佳化，且漂動正好落在 DD 綁定約束上。
-_va = _P("/home/brian/project/Hyper-Alpha-Arena/backend/backtest/ab_validators.py").read_text()
+_va = (_BACKEND / "backtest" / "ab_validators.py").read_text()
 check("annual_validator 接受 end_time_ms 參數",
       "end_time_ms: Optional[int] = None" in _va)
 check("exploration_validator 接受並轉傳 end_time_ms",
       _va.count("end_time_ms: Optional[int] = None") >= 2 and "end_time_ms=end_time_ms" in _va)
 check("視窗終點改為可固定，不再硬取 time.time()",
       "now_ms = int(end_time_ms) if end_time_ms else int(time.time() * 1000)" in _va)
-_ga_src = _P("/home/brian/project/Hyper-Alpha-Arena/backend/backtest/ga_annual.py").read_text()
+_ga_src = (_BACKEND / "backtest" / "ga_annual.py").read_text()
 check("evaluate_individual 接受 end_time_ms 與多視窗 windows 參數",
       "end_time_ms: Optional[int] = None" in _ga_src
       and "windows: Optional[List[Tuple[int, int, float]]] = None" in _ga_src)
@@ -630,7 +632,7 @@ print("=" * 72)
 print("10. RSI 基因不再是死維度")
 print("=" * 72)
 import re as _re
-_src = open("/home/brian/project/Hyper-Alpha-Arena/backend/backtest/ga_annual.py").read()
+_src = (_BACKEND / "backtest" / "ga_annual.py").read_text()
 _i = _src.find("if genome.use_rsi:")
 _seg = _src[_i:_i + 1400]
 check("RSI 下限門檻用 rsi_buy_thr", "rsi_buy_thr" in _seg)

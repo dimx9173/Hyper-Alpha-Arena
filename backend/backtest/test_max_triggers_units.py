@@ -23,7 +23,7 @@ import re
 import sys
 from pathlib import Path
 
-SRC_PATH = Path("/home/brian/project/Hyper-Alpha-Arena/backend/backtest/ab_validators.py")
+SRC_PATH = Path(__file__).resolve().parent / "ab_validators.py"
 src = SRC_PATH.read_text()
 
 PASS = 0
