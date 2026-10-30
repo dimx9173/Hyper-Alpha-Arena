@@ -1215,8 +1215,121 @@ def test_wallet_connection(
 # ========== Global Trading Mode Management ==========
 
 class TradingModeRequest(BaseModel):
-    """Request model for trading mode update"""
-    mode: str = Field(..., pattern="^(testnet|mainnet)$", description="Trading environment mode")
+    """全域交易模式。
+
+    paper    = Hyperliquid mainnet 行情 + 本地計算帳戶（不鏈上下單、不動真錢）
+    testnet  = 真的在 testnet 鏈上下單（測試幣）
+    mainnet  = 真的在 mainnet 鏈上下單（真錢）
+
+    paper 模式的存在理由（2026-10-03 實測）：
+    Hyperliquid testnet 的價格與 binance/mainnet 不一致。ZEC 在 testnet 是
+    138.65，在 mainnet 與 binance 都是約 1305（差 9.4 倍）。回測用 binance
+    資料、在 testnet 執行，回測績效無法預測實盤結果。paper 模式行情走
+    mainnet（與 binance 一致），資金與持倉完全本地計算。
+    """
+    mode: str = Field(..., pattern="^(paper|testnet|mainnet)$", description="Trading mode")
+
+
+@router.get("/paper/{account_id}")
+def get_paper_performance(account_id: int, db: Session = Depends(get_db)):
+    """Paper 帳戶的帳務與績效。
+
+    Paper 模式用 Hyperliquid mainnet 行情，但資金與持倉完全本地計算，
+    不簽名、不廣播任何交易。回傳的數字是模型輸出，不是實盤成交結果。
+    """
+    try:
+        from database.models import Account
+        from services.paper_trading_client import PaperTradingClient
+        from services.program_execution_service import PAPER_STATE_PATH
+
+        account = db.query(Account).filter(
+            Account.id == account_id, Account.is_deleted != True
+        ).first()
+        if not account:
+            raise HTTPException(status_code=404, detail=f"Account {account_id} not found")
+
+        capital = float(account.initial_capital or 10000.0)
+        client = PaperTradingClient(
+            account_id=account_id,
+            state_path=PAPER_STATE_PATH,
+            initial_capital=capital,
+        )
+        return {
+            "success": True,
+            "account_id": account_id,
+            "account_name": account.name,
+            "mode": "paper",
+            "data_source": "hyperliquid_mainnet",
+            "account_state": client.get_account_state(db),
+            "positions": client.get_positions(db),
+            "performance": client.performance(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get paper performance: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
+
+
+@router.post("/paper/{account_id}/reset")
+def reset_paper_account(account_id: int, db: Session = Depends(get_db)):
+    """清空 paper 帳戶，回到初始資金。"""
+    try:
+        from database.models import Account
+        from services.paper_trading_client import PaperTradingClient
+        from services.program_execution_service import PAPER_STATE_PATH
+
+        account = db.query(Account).filter(
+            Account.id == account_id, Account.is_deleted != True
+        ).first()
+        if not account:
+            raise HTTPException(status_code=404, detail=f"Account {account_id} not found")
+
+        client = PaperTradingClient(
+            account_id=account_id,
+            state_path=PAPER_STATE_PATH,
+            initial_capital=float(account.initial_capital or 10000.0),
+        )
+        client.reset()
+        return {"success": True, "account_id": account_id, "message": "paper account reset"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to reset paper account: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
+
+
+@router.post("/paper/{account_id}/check-exits")
+def paper_check_exits(account_id: int, db: Session = Depends(get_db)):
+    """手動觸發 TP/SL 掃描（排程也會自動跑，這裡是給除錯用）。"""
+    try:
+        from database.models import Account
+        from services.paper_trading_client import PaperTradingClient
+        from services.program_execution_service import PAPER_STATE_PATH
+
+        account = db.query(Account).filter(
+            Account.id == account_id, Account.is_deleted != True
+        ).first()
+        if not account:
+            raise HTTPException(status_code=404, detail=f"Account {account_id} not found")
+
+        client = PaperTradingClient(
+            account_id=account_id,
+            state_path=PAPER_STATE_PATH,
+            initial_capital=float(account.initial_capital or 10000.0),
+        )
+        closed = client.check_exits()
+        return {
+            "success": True,
+            "closed_count": len(closed),
+            "closed": closed,
+            "performance": client.performance(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to check exits: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
 
 
 @router.get("/trading-mode")
@@ -1234,7 +1347,11 @@ def get_trading_mode(db: Session = Depends(get_db)):
         return {
             'success': True,
             'mode': mode,
-            'description': 'Testnet (paper trading)' if mode == 'testnet' else 'Mainnet (real funds)'
+            'description': {
+                'paper': 'Paper mode — Hyperliquid mainnet quotes, local accounting, no on-chain orders',
+                'testnet': 'Testnet (on-chain orders with test tokens)',
+                'mainnet': 'Mainnet (real funds)',
+            }.get(mode, 'Unknown')
         }
 
     except Exception as e:

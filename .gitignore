@@ -349,3 +349,17 @@ backend/backtest/*.bak2
 backend/backtest/*.pre_adjust
 backend/backtest/best_code_top30*.py
 backend/backtest/*_candidate.py
+
+# GA annual run artifacts (ephemeral per-run output: generated strategies, meta, summaries)
+backend/backtest/best_code_annual_ga*.py
+backend/backtest/best_code_ga*.py
+backend/backtest/best_code_paper*.py
+backend/backtest/ga_*.meta.json
+backend/backtest/summary_annual_ga*.json
+
+# Machine-specific symlink into pCloud cold storage
+cold-data
+
+# Local scratch/debug scripts with hardcoded absolute paths
+test_worker.py
+test_worker_fixed.py

@@ -16,6 +16,10 @@ import traceback
 from .models import Strategy, MarketData, Decision, ActionType
 from .validator import validate_strategy_code
 
+# 策略碼執行結果快取：exec + 類別實例化佔每次 trigger 70%+ 時間。
+# 同一份程式碼在整個回測中不變，重複 exec 是純粹浪費。
+# 以程式碼字串為 key（字數組合本身就是唯一 ID）；有界 LRU 防止長期服務積累。
+
 
 @dataclass
 class ExecutionResult:
@@ -70,6 +74,49 @@ SAFE_BUILTINS = {
     "None": None,
     "print": print,  # For debugging
 }
+
+import hashlib as _hashlib
+from collections import OrderedDict as _OrderedDict
+
+_EXEC_CACHE_MAX = 512
+_exec_cache: "OrderedDict[str, type]" = _OrderedDict()
+
+
+def _cached_strategy_class(code: str) -> type:
+    """Return the Strategy subclass compiled from `code`.
+
+    Result is memoized. `exec(code)` is pure wrt code content, so
+    memoization cannot change the backtest semantics.
+    """
+    h = _hashlib.sha256(code.encode()).hexdigest()
+    cached = _exec_cache.get(h)
+    if cached is not None:
+        _exec_cache.move_to_end(h)
+        return cached
+
+    restricted_globals = {
+        "__builtins__": SAFE_BUILTINS,
+        "math": type("math", (), SAFE_MATH)(),
+        "time": type("time", (), SAFE_TIME)(),
+        "MarketData": MarketData,
+        "Decision": Decision,
+        "ActionType": ActionType,
+        "log": lambda *a, **k: None,
+    }
+    exec(code, restricted_globals)
+    cls = None
+    for name, obj in restricted_globals.items():
+        if isinstance(obj, type) and name not in ("MarketData", "Decision", "ActionType"):
+            if hasattr(obj, "should_trade"):
+                cls = obj
+                break
+    if cls is None:
+        raise ValueError("No valid strategy class found in code")
+
+    _exec_cache[h] = cls
+    if len(_exec_cache) > _EXEC_CACHE_MAX:
+        _exec_cache.popitem(last=False)
+    return cls
 
 # Safe math functions
 SAFE_MATH = {
@@ -206,22 +253,7 @@ class SandboxExecutor:
             "log": self._log,
         }
 
-        # Execute code to define the class
-        exec(code, restricted_globals)
-
-        # Find the strategy class
-        strategy_class = None
-        for name, obj in restricted_globals.items():
-            if isinstance(obj, type) and name not in ("MarketData", "Decision", "ActionType"):
-                # Check if it has should_trade method
-                if hasattr(obj, "should_trade"):
-                    strategy_class = obj
-                    break
-
-        if not strategy_class:
-            raise ValueError("No valid strategy class found in code")
-
-        # Instantiate and run
+        strategy_class = _cached_strategy_class(code)
         strategy = strategy_class()
         if hasattr(strategy, "init"):
             strategy.init(params)

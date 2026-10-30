@@ -9,6 +9,7 @@ import logging
 import time
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .models import BacktestConfig, TriggerEvent, BacktestResult, BacktestTradeRecord, TriggerExecutionResult
@@ -226,22 +227,24 @@ class ProgramBacktestEngine:
             # Update equity after TP/SL
             account.update_equity(prices)
             # PRP-P1-1: funding shadow — 每trigger按持倉時間估算 (long付0.01%/8h, short收)
-            try:
-                _dt_h = max(0.0, (trigger.timestamp - last_trigger_time) / 3600000.0)
-                if _dt_h > 0 and _dt_h < 24:
-                    for _sym, _pos in list(account.positions.items()):
-                        _px = prices.get(_sym, 0) or 0
-                        if _px <= 0:
-                            continue
-                        _notional = abs(_pos.size) * _px
-                        _rate_h = 0.0001 / 8  # 保守 0.01%/8h
-                        _pay = _notional * _rate_h * _dt_h
-                        if _pos.side == "long":
-                            account.total_funding_shadow += _pay
-                        else:
-                            account.total_funding_shadow -= _pay
-            except Exception:
-                pass
+            # 只有在 account.funding_enabled=True 時才累加（預設 False，避免回測被保守估值污染）
+            if getattr(account, 'funding_enabled', False):
+                try:
+                    _dt_h = max(0.0, (trigger.timestamp - last_trigger_time) / 3600000.0)
+                    if _dt_h > 0 and _dt_h < 24:
+                        for _sym, _pos in list(account.positions.items()):
+                            _px = prices.get(_sym, 0) or 0
+                            if _px <= 0:
+                                continue
+                            _notional = abs(_pos.size) * _px
+                            _rate_h = 0.0001 / 8  # 保守 0.01%/8h
+                            _pay = _notional * _rate_h * _dt_h
+                            if _pos.side == "long":
+                                account.total_funding_shadow += _pay
+                            else:
+                                account.total_funding_shadow -= _pay
+                except Exception:
+                    pass
 
             # Determine trigger symbol
             trigger_symbol = trigger.symbol if trigger.symbol else config.symbols[0]
@@ -734,6 +737,178 @@ class ProgramBacktestEngine:
             _data_provider=data_provider,
         )
 
+
+    def _force_close_all(
+        self,
+        account: VirtualAccount,
+        config: BacktestConfig,
+        trades: List[BacktestTradeRecord],
+        equity_curve: List[Dict[str, Any]],
+        triggers: List[TriggerEvent],
+    ) -> None:
+        """
+        Force close all open positions at the end of backtest (方案乙).
+
+        為什麼需要：舊的 _calculate_stats 只統計 exit_price is not None 的交易，
+        導致回測結束時仍持有的部位，其浮盈浮虧完全不進入 PnL / trades / PF / 勝率，
+        但 MaxDD 走 equity curve（盯市）。兩種會計基礎混用會讓 GA 系統性偏好
+        「在視窗內把盈虧實現掉」的高換手 genome。
+
+        這裡在視窗終點用最後一根已收盤 K 線的價格強制平倉，走與正常平倉
+        相同的 fee/slippage 模型，於是五個 per-trade 指標的定義與 gate 門檻
+        語意保持不變（見 ab_validators.annual_validator）。
+
+        不變式：呼叫後 account.positions 必須為空，且
+        account.equity - initial_balance == Σ(所有平倉交易的 pnl)。
+        """
+        if not account.positions:
+            return
+
+        end_time_ms = config.end_time_ms
+        end_time_sec = end_time_ms // 1000
+
+        # 價格一律取 <= end_time_ms 的最後一根「已收盤」K 線收盤價。
+        # 不用 data_provider.get_current_prices()：那裡的 current time 是最後一次
+        # trigger 的時間戳，會系統性地漏掉最後數小時的部位，也讓強平價取到
+        # 未收盤的變動價格，造成候選間不可比。
+        prices: Dict[str, float] = {}
+        for symbol in account.positions:
+            row = self.db.execute(text(
+                "SELECT close_price FROM crypto_klines "
+                "WHERE symbol = :s AND exchange = :ex AND period = '1h' "
+                "AND timestamp <= :t ORDER BY timestamp DESC LIMIT 1"
+            ), {"s": symbol, "ex": config.exchange, "t": end_time_sec}).fetchone()
+            if row and row[0] is not None:
+                prices[symbol] = float(row[0])
+            else:
+                # fallback：允許更粗的週期，但必須 <= end_time_sec。
+                # 寧可降級到 5m/15m，也不要拿 end_time 之後的資料造成前視偏差。
+                row2 = self.db.execute(text(
+                    "SELECT close_price, timestamp FROM crypto_klines "
+                    "WHERE symbol = :s AND exchange = :ex "
+                    "AND period IN ('1h','5m','15m') AND timestamp <= :t "
+                    "ORDER BY timestamp DESC LIMIT 1"
+                ), {"s": symbol, "ex": config.exchange, "t": end_time_sec}).fetchone()
+                if row2 and row2[0] is not None:
+                    prices[symbol] = float(row2[0])
+                    if int(row2[1]) < end_time_sec - 7 * 86400:
+                        logger.warning(
+                            "force-close %s: 價格過舊 (%s 秒前)，結果不可比",
+                            symbol, end_time_sec - int(row2[1]),
+                        )
+                else:
+                    # 沒有任何可用價格 -> 明確記錄，不靜默跳過。
+                    # 保留部位會讓會計恆等式失敗，比跳過更容易察覺。
+                    logger.error(
+                        "force-close: %s 在 end_time 之前沒有任何可用的收盤價，"
+                        "該部位不會被平倉，會計恆等式將失敗", symbol,
+                    )
+
+        # 與正常平倉完全相同的 ExecutionSimulator 參數，確保 fee/slippage 一致。
+        simulator = ExecutionSimulator(
+            slippage_percent=config.slippage_percent,
+            fee_rate=config.fee_rate,
+        )
+
+        forced = 0
+        for symbol, price in prices.items():
+            if symbol not in account.positions:
+                continue
+            if account.positions[symbol].size <= 0:
+                continue
+            record = simulator._execute_close(
+                account=account,
+                symbol=symbol,
+                current_price=price,
+                timestamp=end_time_ms,
+                trigger_type="scheduled",
+                pool_name="",
+                triggered_signals=[],
+                reason="end_of_backtest",
+                target_portion=1.0,
+            )
+            if record is not None:
+                record.exit_reason = "end_of_backtest"
+                trades.append(record)
+                forced += 1
+
+        if forced:
+            # 只在全部平倉後補一個終點，並且以最後一根的價格更新 equity，
+            # 讓 equity_curve 的終點與平倉後的帳面一致。
+            final_prices = dict(prices)
+            account.update_equity(final_prices)
+            equity_curve.append({
+                "timestamp": end_time_ms,
+                "equity": account.equity,
+                "balance": account.balance,
+                "drawdown": account.max_drawdown,
+            })
+            logger.info("force-close: %d 個未平倉部位已在終點平倉", forced)
+
+    def _resample_equity_daily(
+        self,
+        equity_curve: List[Dict[str, Any]],
+        start_time_ms: int,
+        end_time_ms: int,
+    ) -> List[float]:
+        """
+        Resample equity curve from irregular trigger timestamps to fixed daily 00:00 UTC grid.
+        Uses linear interpolation between points.
+        
+        Returns list of equity values at daily 00:00 UTC, suitable for daily return calculation.
+        """
+        if not equity_curve or len(equity_curve) < 2:
+            return []
+        
+        import math
+        from datetime import datetime, timezone
+        
+        # Convert to (timestamp_ms, equity) pairs, sorted by timestamp
+        points = []
+        for p in equity_curve:
+            ts = p.get("timestamp", 0)
+            eq = p.get("equity", 0.0)
+            if ts > 0 and eq > 0:
+                points.append((ts, eq))
+        
+        if len(points) < 2:
+            return []
+        
+        points.sort(key=lambda x: x[0])
+        
+        # Determine daily grid: start at 00:00 UTC of start day, end at 00:00 UTC of end day
+        start_day = (start_time_ms // 86400000) * 86400000
+        end_day = (end_time_ms // 86400000) * 86400000
+        
+        # Build daily equity values by linear interpolation
+        daily_equity = []
+        point_idx = 0
+        
+        for day_ts in range(start_day, end_day + 86400000, 86400000):
+            # Find the two points surrounding this day_ts
+            # Move point_idx forward until we find the right interval
+            while point_idx + 1 < len(points) and points[point_idx + 1][0] <= day_ts:
+                point_idx += 1
+            
+            if point_idx == 0:
+                # Before first point - use first point's equity
+                daily_equity.append(points[0][1])
+            elif point_idx == len(points) - 1:
+                # After last point - use last point's equity
+                daily_equity.append(points[-1][1])
+            else:
+                # Interpolate between points[point_idx] and points[point_idx + 1]
+                t1, e1 = points[point_idx]
+                t2, e2 = points[point_idx + 1]
+                if t2 == t1:
+                    daily_equity.append(e1)
+                else:
+                    # Linear interpolation
+                    alpha = (day_ts - t1) / (t2 - t1)
+                    interp_eq = e1 + alpha * (e2 - e1)
+                    daily_equity.append(interp_eq)
+        
+        return daily_equity
     def _calculate_result(
         self,
         trades: List[BacktestTradeRecord],
@@ -743,7 +918,18 @@ class ProgramBacktestEngine:
         config: BacktestConfig,
     ) -> BacktestResult:
         """Calculate backtest statistics."""
-        # Filter closed trades (with exit_price)
+        # Accounting: funding shadow -> deduct from balance/equity before metrics
+        # This ensures funding cost is reflected in PnL, maxDD, Sharpe consistently.
+        if hasattr(account, 'total_funding_shadow') and account.total_funding_shadow != 0:
+            account.total_fees += account.total_funding_shadow
+            account.total_funding_shadow = 0.0
+            # Recalculate equity after funding deduction
+            account.update_equity({})  # prices empty ok, just refreshes equity from realized/unrealized/fees
+        
+        # Force close all open positions at end of backtest
+        self._force_close_all(account, config, trades, equity_curve, triggers)
+        
+        # Filter closed trades (with exit_price) - NOW INCLUDES FORCED CLOSES
         closed_trades = [t for t in trades if t.exit_price is not None]
 
         # Basic counts
@@ -752,7 +938,14 @@ class ProgramBacktestEngine:
         losing_trades = [t for t in closed_trades if t.pnl <= 0]
 
         # PnL calculations
-        total_pnl = sum(t.pnl for t in closed_trades)
+        # NOTE: t.pnl 是「平倉前未扣本次出場費」的毛利（見 VirtualAccount.close_position
+        # 回傳的是 fee 前的 realized_pnl，fee 另外記在 account.total_fees）。
+        # 舊碼 total_pnl = sum(t.pnl) 是稅前毛值，但 MaxDD / equity 走的是
+        # 扣費後的 account.equity -> 兩種會計基礎不一致，且 fee + funding 完全不
+        # 反映在 PnL 上（實測 BTC 買入持有 10 天：毛 941.56、淨 901.82，差 39.74）。
+        # 這裡改為淨值，使 PnL 與 equity/MaxDD/Sharpe 同一會計基礎。
+        total_pnl_gross = sum(t.pnl for t in closed_trades)
+        total_pnl = total_pnl_gross - account.total_fees
         total_pnl_percent = (total_pnl / config.initial_balance * 100) if config.initial_balance > 0 else 0
 
         # Win rate
@@ -776,26 +969,46 @@ class ProgramBacktestEngine:
         signal_triggers = sum(1 for t in triggers if t.trigger_type == "signal")
         scheduled_triggers = sum(1 for t in triggers if t.trigger_type == "scheduled")
 
-        # Sharpe ratio (simplified - annualized)
+        # Sharpe ratio (annualized) - resample equity curve to daily grid first
+        # Crypto trades 24/7, so use 365 days, not 252.
+        # The equity_curve points are at trigger times (irregular), so resample to daily 00:00 UTC.
         sharpe_ratio = 0.0
         if equity_curve and len(equity_curve) > 1:
-            returns = []
-            for i in range(1, len(equity_curve)):
-                prev_eq = equity_curve[i-1]["equity"]
-                curr_eq = equity_curve[i]["equity"]
-                if prev_eq > 0:
-                    returns.append((curr_eq - prev_eq) / prev_eq)
+            daily_equity = self._resample_equity_daily(equity_curve, config.start_time_ms, config.end_time_ms)
+            if len(daily_equity) > 1:
+                returns = []
+                for i in range(1, len(daily_equity)):
+                    prev_eq = daily_equity[i-1]
+                    curr_eq = daily_equity[i]
+                    if prev_eq > 0:
+                        returns.append((curr_eq - prev_eq) / prev_eq)
+                if returns:
+                    import statistics
+                    mean_return = statistics.mean(returns)
+                    std_return = statistics.stdev(returns) if len(returns) > 1 else 0
+                    if std_return > 0:
+                        # Annualize: daily returns * sqrt(365)
+                        sharpe_ratio = (mean_return / std_return) * (365 ** 0.5)
 
-            if returns:
-                import statistics
-                mean_return = statistics.mean(returns)
-                std_return = statistics.stdev(returns) if len(returns) > 1 else 0
-                if std_return > 0:
-                    # Annualize (assume daily returns, 252 trading days)
-                    sharpe_ratio = (mean_return / std_return) * (252 ** 0.5)
+        # Accounting identity: final equity - initial_balance == sum of all closed trade PnL
+        # This is the fundamental check that our force-close + metrics are consistent.
+        all_closed = [t for t in trades if t.exit_price is not None]
+        sum_closed_pnl = sum(t.pnl for t in all_closed)
+        equity_diff = account.equity - config.initial_balance
+        # equity = initial + Σ(平倉毛利) - total_fees（含 funding），因此恆等式要帶費用。
+        expected = sum_closed_pnl - account.total_fees
+        if abs(equity_diff - expected) > 1e-6:
+            import logging
+            logging.warning(
+                "Accounting identity violation: equity_diff=%.6f expected=%.6f "
+                "(gross=%.6f fees=%.6f) diff=%.6f. Bug in force-close or metrics.",
+                equity_diff, expected, sum_closed_pnl, account.total_fees,
+                equity_diff - expected
+            )
 
         return BacktestResult(
             success=True,
+            error=None,
             total_pnl=total_pnl,
             total_pnl_percent=total_pnl_percent,
             max_drawdown=account.max_drawdown,

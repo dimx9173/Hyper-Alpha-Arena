@@ -1,0 +1,308 @@
+{
+  "phase": "code",
+  "feature": "engine_mtm_fix",
+  "prp_path": "/home/brian/project/Hyper-Alpha-Arena/backend/.prpcc/engine_mtm_fix/PRP.md",
+  "plan_path": "/home/brian/project/Hyper-Alpha-Arena/backend/.prpcc/engine_mtm_fix/PLAN.md",
+  "review_path": "/home/brian/project/Hyper-Alpha-Arena/backend/.prpcc/engine_mtm_fix/REVIEW.md",
+  "tasks": {
+    "T1": {
+      "status": "done",
+      "desc": "強制平倉核心邏輯"
+    },
+    "T2": {
+      "status": "done",
+      "desc": "Equity Curve 重取樣與 Sharpe 年化修正"
+    },
+    "T3": {
+      "status": "done",
+      "desc": "Funding 費用入帳"
+    },
+    "T4": {
+      "status": "done",
+      "desc": "會計恆等式斷言"
+    },
+    "T5": {
+      "status": "done",
+      "desc": "回歸測試更新與新增測試"
+    },
+    "T6": {
+      "status": "done",
+      "desc": "基準驗證與重跑"
+    },
+    "T7": {
+      "name": "修第五個缺陷（max_triggers 單位）",
+      "status": "done"
+    },
+    "T8": {
+      "name": "修第七、八個缺陷（funding_enabled、DB fallback）",
+      "status": "done"
+    },
+    "T9": {
+      "name": "修第九、十個缺陷（前視偏差、random seed）",
+      "status": "done"
+    }
+  },
+  "signoffs": {
+    "planner": true,
+    "architect": true,
+    "reviewer": false
+  },
+  "created": "2026-09-28T21:00:00Z",
+  "engine_version": "v3.2-lookahead-fixed-random-seeded",
+  "extra_defect_found": "total_pnl 為稅前毛值，fee/funding 未進 PnL（Kimi 未提到，實作時發現）",
+  "impl_errors_fixed": [
+    "simulator=self 取不到 _execute_close",
+    "SQL 欄位應為 close_price 非 close",
+    "另開 DB session 改用 self.db"
+  ],
+  "defect_5": {
+    "name": "max_triggers 單位錯誤（毫秒當秒用）",
+    "location": "backend/backtest/ab_validators.py: annual_validator 計算 trigger",
+    "expr": "max(300, 86400000 // max(1, max_triggers // 365))",
+    "correct": "86400000 是毫秒/天，scheduled_interval_sec 是秒 → 大 1000 倍",
+    "impact_ga": "真實 GA 傳 max_triggers=50000 → 間隔 635294 秒 = 7.35 天 → 三年僅 148 個 trigger、逐年僅 49 個（預期 50000，缺口 338~1020 倍）",
+    "consequence": "所有「交易數 < 20」的 gate 失敗是取樣不足造成，非策略缺陷；GA 系統性偏向低頻策略；基準 BTC 買入持有回報 0 筆",
+    "aggravating": "_run_one 內部 B 分支算出正確值 1892 秒，但 max(trigger=635294, 1892) 讓錯值勝出，正確值被架空",
+    "pre_existing": "是，先於本次 T1-T4 修復",
+    "status": "fixed",
+    "fix": "抽出 _compute_trigger_interval_sec(max_triggers, window_days, floor=300) 作為單一實算來源（單位：秒，用 86400）。annual_validator 與 _run_one 都改呼叫它。同時把上游的「365 天基準」統一為「視窗長度基準」。",
+    "after_fix": {
+      "interval_3y_50000": "1892 秒 → 50004 個 trigger（預期 50000，比率 1.00）",
+      "interval_1y_50000": "630 秒 → 50057 個 trigger（比率 1.00）",
+      "interval_1y_30000": "1051 秒 → 30005 個 trigger（比率 1.00）"
+    }
+  },
+  "tests_added": [
+    "backtest/test_engine_accounting.py (31 checks)",
+    "backtest/test_max_triggers_units.py (23 checks)"
+  ],
+  "note_all_historical_ga_invalid": "五個缺陷意味所有歷史 GA 結果（fitness/PnL/MaxDD/交易數）皆無效，必須在 v3 引擎下重跑。未啟動任何正式 run。",
+  "defect_7": {
+    "name": "db session 交易壞狀態未復原，導致後續查詢全數失敗",
+    "location": "backend/backtest/ab_validators.py: _run_one",
+    "issue": "查詢失敗後未 rollback，SQLAlchemy session 進入 InFailedSqlTransaction，後續所有指令被拒。實測連續 3 個視窗的視窗終點查詢全部失敗。",
+    "impact": "adjusted_end_ms 靜默 fallback 到 end_ms，回測可能跑進無資料時段，產生 PnL=0 但 success=True 的靜默失敗",
+    "fix": "在 _run_one 開頭先 db.rollback()（在查詢之前，不是之後），並保留 WARNING 記錄",
+    "status": "fixed",
+    "verified": "修復後 Y1/Y2/Y3 三視窗查詢全部成功，無 WARNING"
+  },
+  "defect_8": {
+    "name": "_run_one DB 查詢失敗靜默 fallback",
+    "location": "backend/backtest/ab_validators.py:88",
+    "issue": "查最新 K 線失敗時 except: pass，導致回測跑到無資料時段",
+    "impact": "可能產生 PnL=0 但 success=True 的靜默失敗",
+    "fix": "改為記錄 WARNING 並繼續，保留靜默 fallback 行為但留下可追蹤痕跡",
+    "status": "fixed"
+  },
+  "defect_9": {
+    "name": "前視偏差：快取無對應 bar 時回傳未來價格",
+    "location": "backend/backtest/historical_data_provider.py: _get_price_at_time",
+    "issue": "循環結束後 fallback 回傳 klines[0][close]（最早的 bar）。當請求時間早於所有快取 bar 時，該價格是未來的。",
+    "impact": "策略在 T 時刻看到 T+1 收盤價，GA 會偏好只能在未來看懂的策略",
+    "fix": "改為回傳 None + WARNING，拒絕洩漏未來價格",
+    "status": "fixed",
+    "verified": "前視測試：請求早於所有 bar -> None；範圍內 -> 正確 bar；範圍後 -> 最後一根"
+  },
+  "defect_10": {
+    "name": "random.seed 從未呼叫（GA 不可重現）",
+    "location": "backend/backtest/iterate_annual_ga.py",
+    "issue": "ga_annual.py 有 30 處 random.* 呼叫，但全專案無任何 random.seed()。且 --seed 參數未 add_argument 定義。",
+    "impact": "同一組參數重跑得到不同初始族群，GA 結果無法重現或回溯比對",
+    "fix": "新增 --seed 參數，main() 開頭呼叫 random.seed(args.seed or int(time.time()))，並記錄 logger.info",
+    "status": "fixed",
+    "note": "評分決定性不受影響（那由 end_time_ms 固定解決），受影響的是初始族群產生"
+  },
+  "T6_result": {
+    "Y3_pnl": -23.77,
+    "Y3_dd": 53.8,
+    "Y3_sharpe": -0.358,
+    "Y3_trades": 1,
+    "Y3_forced": 1,
+    "Y2_pnl": 65.28,
+    "Y2_dd": 30.98,
+    "Y2_sharpe": 1.389,
+    "Y2_trades": 1,
+    "Y2_forced": 1,
+    "Y1_pnl": 143.11,
+    "Y1_dd": 32.4,
+    "Y1_sharpe": 1.993,
+    "Y1_trades": 1,
+    "Y1_forced": 1,
+    "interpretation": "BTC 買入持有在三年內 MaxDD 30-53% 遠超 8% 門檻，且只有 1 筆交易（買進+強制平倉），PF 無法計算。這是正確的 gate 失敗，不是引擎錯誤。forced=1 確認 T1 強制平倉生效。",
+    "reproducible": "兩次獨立執行結果完全一致（-23.77/65.28/143.11）"
+  },
+  "defect_4": {
+    "name": "total_pnl 為稅前毛值，fee/funding 未進 PnL",
+    "location": "backend/backtest/engine.py: _calculate_result",
+    "issue": "total_pnl = sum(t.pnl) 未扣 account.total_fees，但 MaxDD/equity 走的是扣費後的數字。兩種會計基礎混用。",
+    "impact": "BTC 買入持有 10 天：毛利 941.56、淨值 901.82，差 39.74（4.2%）。與 MTM 量測的 10~20pp 偏差同源。",
+    "fix": "total_pnl = sum(t.pnl) - account.total_fees；恆等式改為 equity - initial == Σ毛利 - total_fees",
+    "status": "fixed",
+    "direction": "收緊（所有 PnL 變更低）",
+    "found_by": "實作過程中發現，Kimi 的 T1-T4 規格未提及"
+  },
+  "defect_6": {
+    "name": "funding_enabled 旗標被忽略（死碼）",
+    "location": "backend/backtest/engine.py funding 計算塊",
+    "issue": "virtual_account.py 定義 funding_enabled=False（註解「轉正前保持False」），但 engine.py 的 funding 累加完全不檢查此旗標，無條件執行。旗標是死碼。",
+    "impact": "T3 的 funding 修復實為無條件生效，語意與註解矛盾。沒有真實 funding 資料時不該臆造成本。",
+    "fix": "加 if getattr(account, \"funding_enabled\", False): 守衛 → funding 現在預設不計入",
+    "status": "fixed",
+    "note": "這使 T3 的原始修法預設不生效，但語意更正確（無真實資料不臆造成本）。"
+  },
+  "defect_5_interaction": {
+    "name": "缺陷 5 使缺陷 3（funding）失效",
+    "detail": "funding 計算的守衛條件是 _dt_h < 24（小於 24 小時）。修好缺陷 5 之前 trigger 間隔是 7.35 天 = 176.4 小時 → 條件不成立 → funding 完全沒被累加。修好後間隔 0.53 小時 → 條件成立。",
+    "implication": "T3 的 funding 修復在缺陷 5 未修前無法生效，兩者必須一起修才有效果。",
+    "status": "resolved"
+  },
+  "summary": {
+    "total_defects_fixed": 10,
+    "engine_version": "v3.2-lookahead-fixed-random-seeded",
+    "tests": "test_engine_accounting.py (31) + test_max_triggers_units.py (23) + test_ga_scoring_regression.py = 全部通過",
+    "all_historical_ga_invalid": true,
+    "reason": "10 個缺陷涵蓋：會計基礎（4,6）、取樣（5）、決定性（10）、前視偏差（9）、旗標語意（7,8）。所有歷史 GA 的 fitness/PnL/MaxDD/交易數皆在此缺陷組合下算出，全部無效。",
+    "no_run_started": true,
+    "deployment": "未部署到 paper/live"
+  },
+  "defect_1": {
+    "name": "未平倉部位不計入 PnL/trades/PF/勝率（censoring bias）",
+    "location": "backend/backtest/engine.py: _calculate_result",
+    "issue": "只統計 exit_price is not None 的交易，回測結束時仍持有的部位其浮盈浮虧完全不進 PnL，但 MaxDD 走 equity curve（盯市）。兩種會計基礎混用。",
+    "impact": "GA 系統性偏好「在視窗內把盈虧實現掉」的高換手 genome",
+    "fix": "新增 _force_close_all()，用最後一根已收盤 K 線價格強制平倉，走同一 fee/slippage 模型",
+    "status": "fixed",
+    "verified": "BTC 買入持有 forced=1，exit_reason=end_of_backtest"
+  },
+  "defect_2": {
+    "name": "Sharpe 用 per-trigger 報酬年化，且用 √252",
+    "location": "backend/backtest/engine.py",
+    "issue": "equity_curve 是不規則的 trigger 時間戳，直接算報酬再年化；且 crypto 24/7 應用 365 而非 252。",
+    "impact": "Sharpe 嚴重偏誤，且對不同 trigger 間隔的 genome 不可比",
+    "fix": "新增 _resample_equity_daily() 重取樣到 UTC 00:00 日頻網格，年化改 √365",
+    "status": "fixed"
+  },
+  "defect_3": {
+    "name": "total_funding_shadow 累計但未扣 equity",
+    "location": "backend/backtest/engine.py",
+    "issue": "funding shadow 在每個 trigger 累加，但從不影響 account.equity。",
+    "impact": "funding 成本完全不影響 PnL/MaxDD/Sharpe",
+    "fix": "_calculate_result 開頭把 shadow 扣入 total_fees 並重算 equity",
+    "status": "fixed",
+    "caveat": "見 defect_5_interaction — 此修復需與 defect_5 同時生效才有意義"
+  },
+  "defect_11": {
+    "name": "fast_fail 是死碼：宣告但從未實作",
+    "location": "backend/backtest/ab_validators.py: annual_validator (行 333-457)",
+    "issue": "annual_validator 宣告 fast_fail: bool = True 並在行 108-109 留了「Early exit checks if fast_fail enabled」註解，但整個函式從未讀取該參數。exploration_validator 也只是把它往下傳。",
+    "impact": "每個個體都跑滿 50000 個 trigger 才能知道結果。GA-100 實測單個體 122 秒（pool 環境），100 代需 8.5 小時。若能在明確不可能過門檻時提早中止，可省下大部分時間。",
+    "status": "open — 需要設計決策",
+    "why_not_auto_fixed": "中途 abort 需要一個「確定不可能過門檻」的判準。PnL/MaxDD 在回測中途是部分值，可能後續反轉；PF/勝率在樣本不足時無意義。直接實作容易把會通過的個體誤殺，等於改變 gate 語意 —— 那是比效能更嚴重的問題。"
+  },
+  "defect_12": {
+    "name": "--early-stop 0 語意相反：想停不停，不想停會停",
+    "location": "backend/backtest/iterate_annual_ga.py:395",
+    "issue": "原碼 `if no_improve_count >= args.early_stop:`。傳 0（直覺上「不早停」）時，第 1 代結束時 no_improve_count=0，0>=0 成立 → 立即停止。",
+    "impact": "GA-100 實際只跑了 1 代就結束，log 顯示「Early stop: no improvement for 0 generations」隨即「=== GA Annual complete ===」。整輪 run 作廢。",
+    "fix": "改為 `if args.early_stop > 0 and no_improve_count >= args.early_stop:`，0 = 不早停",
+    "status": "fixed",
+    "lesson": "我自己寫的 run 腳本用了 --early-stop 0，卻沒讀 --help 確認語意。CLI 參數的邊界值必須實測，不是靠直覺。",
+    "fixed_note": "已驗證：bench 顯示 early_stop=0 現在跑到第 100 代，GA-100 第 1 代正常進入第 2 代"
+  },
+  "perf_work": {
+    "engine_version": "v3.2-lookahead-fixed-random-seeded",
+    "total_defects_fixed": 12,
+    "perf_optimizations": [
+      {
+        "what": "validate_strategy_code 加 keyed LRU memo",
+        "why": "每個 trigger 對同一份程式碼重跑完整 AST 安全檢查",
+        "gain": "55.9s -> 29.7s (單行程)"
+      },
+      {
+        "what": "_get_price_at_time 改 bisect",
+        "why": "對 26280 根 cache 做反向線性掃描",
+        "gain": "-10s"
+      },
+      {
+        "what": "_cached_strategy_class 快取編譯後 class",
+        "why": "每個 trigger 重跑 exec(code)",
+        "gain": "19.6s -> 7.8s (單行程)"
+      },
+      {
+        "what": "market_asset_metrics 空表跳過",
+        "why": "回測 DB 該表 0 列，但每次呼叫都查",
+        "gain": "解除 DB 停擺"
+      },
+      {
+        "what": "get_klines 改 _bisect_right",
+        "why": "每次呼叫掃全表並建立完整副本；50000 triggers x 8760 根 = 4.4 億次比較 + 4.4 億次 list.append",
+        "gain": "pool 單個體 308s -> 122s",
+        "share": "tottime 650/764 秒 = 85%"
+      }
+    ],
+    "verification": "bisect 等價性 3000 組隨機測試 0 不一致；三個測試檔全通過（31/23/全部）",
+    "remaining_bottleneck": "exploration_validator 與 annual_validator 是同一份程式碼的兩組門檻參數，不是重複計算。單個體 122s × 2000 個體 ÷ 4 workers ≈ 8.5 小時 / 100 代"
+  },
+  "ga100_run": {
+    "status": "completed",
+    "started": "2026-09-29 09:34:44 UTC",
+    "finished": "2026-09-29 23:04:28 UTC",
+    "duration": "13.5 小時，2000 個個體，100 代",
+    "config": "generations=100 pop_size=20 elite=2 seed=42 windows=1 backtest_days=365 workers=8 early_stop=0",
+    "best_generation": 45,
+    "best_fitness": 0.0164,
+    "verdict_strict": "FAIL — PnL 15.20% (需 20%), 勝率 31.20% (需 35%)。MaxDD 5.39%/8, Sharpe 1.466/0.5, PF 1.641/1.5, Trades 125 全數達標",
+    "verdict_exploration": "PASS — 8 項條件全過",
+    "threshold_switch_finding": "exploration_gens 預設 50。第 45 代寬鬆門檻下有 6 個個體通過、best fitness 為正 +0.016；第 51 代切嚴格門檻後立刻全滅 (passed 0/20)，之後 50 代只推進 0.014 (-1.484 -> -1.470)。切換不是提高標準，是清空族群，代價約 8 小時。程式碼註解（2026-09-27）已描述同一問題。",
+    "symbol_count_finding": "21 標的結果 (PnL 15.20%) 明顯優於 30 標的 (PnL 11.83%, PF 1.444)。策略碼寫死 30 個標的清單，其中 9 個資料不足。標的清單是搜尋效果的重要變因。",
+    "logs": {
+      "run": "/tmp/ga100_run.log",
+      "individuals": "/tmp/ga100_iteration_log.jsonl",
+      "summary": "/tmp/ga100_summary.json",
+      "best_code": "/tmp/ga100_best_code.py"
+    }
+  },
+  "measurements_to_remember": [
+    "歷史資料中只有 21 個標的（不是 30）有完整三年 1h K 線。HYPE/TAKE/NIL/MUBARAK/TAO/ENA/PENGU/TRUMP/PUMP 資料不足，依約束不可偽造上市前資料。",
+    "end_time_ms 單位是毫秒。DB 最後一根 1h K 線 = 1790218800 秒 = 1790218800000 毫秒 = 2026-09-24 03:00 UTC。",
+    "這台機器 16 核 30GB。GA 用 8 workers 比 4 workers 快 1.7 倍。",
+    "回測 DB 的 market_asset_metrics 表是空的（0 列），任何查詢它的路徑都會拖慢。",
+    "專案裡沒有既有的 validator.py / executor.py 測試檔。executor 的 class 快取有真實風險：策略若用類別層級可變狀態，行為會變（已用差異測試確認目前安全，因為 GA 產生的 genome 是固定模板）。"
+  ],
+  "defect_13": {
+    "name": "GA 報告的最佳個體指標是錯的（索引未同步）",
+    "location": "backend/backtest/iterate_annual_ga.py:337-377",
+    "issue": "pop_fitness 在行 337 依 fitness 排序，但 eval_by_ind 沒跟著排序，仍是 population 原始順序。行 347/368/369/370/377 讀 eval_by_ind[0]，拿到的是 population[0] 的結果，不是最佳個體。",
+    "evidence": "GA-100 Gen 45：log 印 pnl=10.93% dd=5.75% sharpe=1.136 pf=1.475（fitness=-0.0857，族群排名第 3）；真正的 best 是 pnl=15.20% dd=5.39% sharpe=1.466 pf=1.641（fitness=0.0164）。獨立重跑 best_code.py 得到 15.20/5.39/1.466/1.6405，與 iteration log 真正的 best 逐位吻合。",
+    "impact": "只影響報告，不影響搜尋。gen_best（fitness）、best_genome（存檔基因組）、passed 計數、選擇/交叉/突變全部正確。GA-100 的搜尋結果有效。",
+    "fix": "在行 337 之後加上 eval_by_ind.sort(key=fitness, reverse=True)，讓兩者索引對齊",
+    "verification": "用 Gen 45 實際資料重現：舊行為印 population[0]，新行為印 15.2%/5.4%/1.466/1.6405，與獨立回測吻合",
+    "status": "fixed"
+  },
+  "next_actions": [
+    "用 --exploration-gens 覆寫預設 50，改為 80/20 或 90/10，避免探索期清空族群",
+    "決定標的清單：21 個有完整資料的 vs 30 個原始清單。實測 21 個明顯較好",
+    "考慮 --windows 3 避免單一強行情主導",
+    "genome 模板只有 12 個參數，best 解是 EMA24/63 + Donchian + RSI30/55、TP 9%/SL 2.27%、倉位 15%。若要過 20% PnL 門檻可能需要更豐富的模板"
+  ],
+  "defect_14": {
+    "name": "Portfolio guard 靜默跳過被誤記為訂單失敗，且部分「成功」紀錄實際未下單",
+    "location": "backend/services/program_execution_service.py",
+    "issue": "_handle_decision 有 5 條風控路徑直接 `return None`（exposure cap / single-coin cap / cluster cap / daily loss fuse / same-direction cooldown），呼叫端無法區分「風控跳過」與「訂單送出後失敗」，_update_log_with_order 一律記成 \"[Order execution failed]\"。另外 execution log 在下單前就寫成 success=True，當 _handle_decision 提前 return 時 log 不會被改，留下「成功」但從未下單的假紀錄。",
+    "remote_evidence": "遠端 180 筆執行紀錄：42 筆標記失敗，錯誤訊息只有 \"[Order execution failed]\"；id 165/166 標記 success=true 但 hyperliquid_order_id/tp_order_id/sl_order_id 皆為 NULL。沒有任何一筆真正成交。",
+    "root_cause": "已部署策略 portion=0.28 leverage=3 -> notional = equity*0.84，single-coin cap 是 equity*0.4，必然觸發。這是 100% 必然阻擋，不是偶發。",
+    "fix": "新增 SKIP_REASONS 與 _skip_result()，5 條風控路徑改回傳結構化 {__skipped__, reason, detail}；_update_log_with_order 辨識 __skipped__ 後記錄真實原因；並在 _update_log_with_order 呼叫後加對帳，非 hold 決策若無任何 order_id 則改標為未執行。",
+    "status": "fixed",
+    "verification": "_skip_result 與 SKIP_REASONS 測試通過；guard 區域已無殘留 return None；確認舊策略 0.28x3 觸發跳過、GA-100 v2 的 0.15x1 (notional 149.8 < cap 399.6) 可下單"
+  },
+  "defect_15": {
+    "name": "Docker 重建後 SQLAlchemy 2.1 預設改用 psycopg3，容器崩潰迴圈",
+    "location": "backend/database/connection.py, backend/database/snapshot_connection.py",
+    "issue": "pyproject 只寫 \"sqlalchemy>=2.0.0\"（未鎖上界）。重建映像時 pip 裝到 SQLAlchemy 2.1.1，而 2.1 把 bare postgresql:// 的預設 driver 從 psycopg2 改成 psycopg (v3)。專案只安裝 psycopg2-binary，容器啟動即 ModuleNotFoundError: No module named psycopg，無限重啟。舊映像是 2.0.44 所以正常。",
+    "impact": "生產容器完全不可用（Restarting 狀態）。",
+    "fix": "新增 _normalize_db_url()，把 bare postgresql:// 與 postgres:// 正規化為 postgresql+psycopg2://；DATABASE_URL 與 SNAPSHOT_DATABASE_URL 都經過正規化。已明確指定 driver 的 URL 不變。",
+    "status": "fixed",
+    "verification": "5 個 URL case 測試通過；scp 到遠端後 docker compose restart app，容器 healthy，/api/health 回 200",
+    "lesson": "我在生產環境執行了 docker compose --build，且沒有先在 staging 驗證。這是我的操作錯誤。volume mount 的 backend/database 目錄讓程式碼修正只需 restart，但依賴變更必須重建映像，這條路徑沒有 staging。"
+  }
+}

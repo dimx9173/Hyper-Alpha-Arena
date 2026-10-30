@@ -15,6 +15,24 @@ from sqlalchemy import text
 logger = logging.getLogger(__name__)
 
 
+def _bisect_right(sorted_klines, timestamp_sec):
+    """Return the index of the first kline with timestamp > `timestamp_sec`.
+
+    `sorted_klines` must be sorted ascending by "timestamp" (which is how
+    _query_klines_from_db returns them). Equivalent to
+    `len([k for k in kl if k["timestamp"] <= ts])` but O(log n) and without
+    building the filtered list.
+    """
+    lo, hi = 0, len(sorted_klines)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if sorted_klines[mid]["timestamp"] <= timestamp_sec:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
 class HistoricalDataProvider:
     """
     Provides historical data for backtesting.
@@ -57,6 +75,11 @@ class HistoricalDataProvider:
         self._price_cache: Dict[str, float] = {}
         # PRP-P0-2: indicator series cache {(symbol, period, IND): (ts_list, val_list)}
         self._indicator_cache: Dict[str, Any] = {}
+        # 效能：market_asset_metrics 在回測 DB 通常是空表，但 _build_virtual_kline
+        # 與 get_market_data 每次呼叫都會查它。空表查詢不會出錯、只會一直回空結果，
+        # 於是每次呼叫都白付一次往返成本。實測 4 個 worker 卡在 idle in transaction
+        # 35 分鐘跑不完一代。None = 未知，True = 有資料，False = 空表（永久跳過）。
+        self._market_metrics_empty: Optional[bool] = None
 
         # Query tracking for logging
         self._query_log: List[Dict[str, Any]] = []
@@ -71,11 +94,31 @@ class HistoricalDataProvider:
         for symbol in self.symbols:
             # Preload common periods
             # Hyperliquid 無 1m（candleSnapshot 不支援），改以 5m 承接價格/指標，跳過 1m 以避免每幣次數 fetch 空轉/報錯
-            periods = ["5m", "15m", "1h", "4h", "1d"] if self.exchange == "hyperliquid" else ["1m", "5m", "15m", "1h", "4h", "1d"]
+            periods = ["5m", "15m", "1h", "4h", "1d"] if self.exchange == "hyperliquid" else (["1h"] if self.exchange == "binance" else ["1m", "5m", "15m", "1h", "4h", "1d"])
             for period in periods:
                 self._load_klines_to_cache(symbol, period)
 
         logger.info(f"Preload complete. Cache size: {len(self._kline_cache)} entries")
+
+    def _is_cache_fresh(self, symbol: str, period: str) -> bool:
+        """Check if cached data is fresh enough to skip re-fetching."""
+        # For GA iterations, we can tolerate slightly stale data
+        cache_key = f"{symbol}_{period}"
+        if cache_key not in self._kline_cache:
+            return False
+        klines = self._kline_cache[cache_key]
+        if not klines:
+            return False
+        # Check if we have data up to near end_time
+        latest_ts = klines[-1].get("timestamp", 0)
+        end_sec = self.end_time_ms // 1000
+        period_seconds = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800,
+                          "1h": 3600, "2h": 7200, "4h": 14400, "8h": 28800,
+                          "12h": 43200, "1d": 86400}
+        period_sec = period_seconds.get(period, 300)
+        gap_periods = (end_sec - latest_ts) / period_sec
+        # Tolerate larger gaps during GA exploration
+        return gap_periods <= 100  # Allow up to 100 periods gap
 
     def set_current_time(self, timestamp_ms: int):
         """Set current simulation time."""
@@ -126,46 +169,40 @@ class HistoricalDataProvider:
         """Get price at specific timestamp.
 
         Priority:
-        1. market_asset_metrics.mark_price (15-second granularity, most accurate)
-        2. 1m kline close price (fast cache fallback)
-        3. Best available kline (1h/5m/15m) close as last resort - fixes flat 78700 bug
+        1. Cached klines (1h/15m/5m/4h/1d) - most reliable for backtest
+        2. DB query for kline (any period) - fallback
+        
+        Note: market_asset_metrics is skipped as it's often empty in backtest DB
         """
-        # Try market_asset_metrics first (15-second granularity)
-        try:
-            result = self.db.execute(text("""
-                SELECT mark_price FROM market_asset_metrics
-                WHERE symbol = :symbol AND exchange = :exchange
-                AND timestamp <= :ts
-                ORDER BY timestamp DESC LIMIT 1
-            """), {"symbol": symbol, "exchange": self.exchange, "ts": timestamp_ms})
-            row = result.fetchone()
-            if row and row[0]:
-                return float(row[0])
-        except Exception as e:
-            logger.debug(f"Failed to get mark_price for {symbol}: {e}")
-
-        # Fallback to 1m kline close price
         timestamp_sec = timestamp_ms // 1000
-        cache_key = f"{symbol}_1m"
 
-        if cache_key in self._kline_cache:
-            klines = self._kline_cache[cache_key]
-            for k in reversed(klines):
-                if k["timestamp"] <= timestamp_sec:
-                    return k["close"]
-            if klines:
-                return klines[0]["close"]
-
-        # Fallback to best available period (fixes flat price when 1m missing)
+        # Try cached klines first (most reliable for backtest)
+        # Order by granularity: 1h, 15m, 5m, 4h, 1d
         for period in ["1h", "15m", "5m", "4h", "1d"]:
             ck = f"{symbol}_{period}"
             if ck in self._kline_cache and self._kline_cache[ck]:
                 klines = self._kline_cache[ck]
-                for k in reversed(klines):
-                    if k["timestamp"] <= timestamp_sec:
-                        return k["close"]
-                if klines:
-                    return klines[0]["close"]
+                # klines 已按 timestamp ASC 排序。用二分代替反向線性掃描：
+                # O(log n) vs O(n)。1h cache 26280 根 × 50000 triggers = 13 億次比較。
+                lo, hi = 0, len(klines)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if klines[mid]["timestamp"] <= timestamp_sec:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                idx = lo - 1
+                if idx >= 0:
+                    return klines[idx]["close"]
+                # 沒有任何 bar 的時間 <= 請求時間：代表請求時間早於這段快取。
+                logger.warning(
+                    "no closed bar at or before ts=%s for %s/%s "
+                    "(cache spans %s..%s) — treating price as unavailable "
+                    "instead of leaking a future price",
+                    timestamp_sec, symbol, period,
+                    klines[0]["timestamp"], klines[-1]["timestamp"],
+                )
+                break
 
         # Final fallback: DB query for kline (any period)
         try:
@@ -180,6 +217,7 @@ class HistoricalDataProvider:
                 return float(row[0])
         except Exception as e:
             logger.warning(f"Failed to get price for {symbol}: {e}")
+            self.db.rollback()
 
         return None
 
@@ -201,8 +239,14 @@ class HistoricalDataProvider:
             self._load_klines_to_cache(symbol, period)
 
         # Filter klines up to current time and return last 'count'
+        #
+        # all_klines 已按 timestamp ASC 排序。用 bisect 找切點，不要每次掃全表：
+        # 舊碼 [k for k in all_klines if k["timestamp"] <= ts] 每次呼叫都建立一份
+        # 完整的前綴副本。50000 triggers x 8760 根 = 每個個體 4.4 億次比較
+        # 加上 4.4 億次 list.append，實測佔單一個體 650/764 秒。
         all_klines = self._kline_cache.get(cache_key, [])
-        filtered = [k for k in all_klines if k["timestamp"] <= timestamp_sec]
+        _cut = _bisect_right(all_klines, timestamp_sec)
+        filtered = all_klines[:_cut]
 
         # Hyperliquid fallback: 5m only 17d, 15m 50d — for WF older windows 5m is empty,
         # transparently fall back to 15m then 1h so strategy still gets data
@@ -212,7 +256,7 @@ class HistoricalDataProvider:
                 if fb_key not in self._kline_cache:
                     self._load_klines_to_cache(symbol, fb_period)
                 fb_klines = self._kline_cache.get(fb_key, [])
-                fb_filtered = [k for k in fb_klines if k["timestamp"] <= timestamp_sec]
+                fb_filtered = fb_klines[:_bisect_right(fb_klines, timestamp_sec)]
                 if fb_filtered:
                     logger.debug(f"Fallback {symbol} {period} -> {fb_period} ({len(fb_filtered)} klines)")
                     filtered = fb_filtered
@@ -259,8 +303,14 @@ class HistoricalDataProvider:
         """Load all klines for symbol/period into cache.
 
         If database has insufficient data, automatically fetch from API and persist.
+        Optimized: Skip fetch if cache is fresh enough for GA exploration.
         """
         cache_key = f"{symbol}_{period}"
+
+        # Check if we already have fresh cache
+        if self._is_cache_fresh(symbol, period):
+            logger.debug(f"Cache fresh for {symbol} {period}, skipping reload")
+            return
 
         # Calculate time range with buffer for indicator calculation
         period_seconds = {
@@ -283,15 +333,11 @@ class HistoricalDataProvider:
             klines = self._query_klines_from_db(symbol, period, start_sec, end_sec)
 
             # Check if data is sufficient — HL trailing gap optimization:
-            # HL 5m caps at 5000 (≈17d) and live tail is always 20-30 periods behind due to
-            # backfill batch boundaries. Fetching 30×3 gaps per backtest preload would be
-            # 90 API calls ×6 backtests/round = 540 calls/round → timeout.
-            # For HL small trailing gaps we just use cached data.
             _gap_tolerance = {"5m": 100, "15m": 50, "1h": 10, "4h": 10, "1d": 5, "1m": 10}
             gap_tol = _gap_tolerance.get(period, 2)
             if self.exchange == "hyperliquid":
                 # increase tolerance to avoid per-round fetch storm
-                gap_tol = max(gap_tol, 50 if period in ("5m", "15m") else gap_tol)
+                gap_tol = max(gap_tol, 100 if period in ("5m", "15m") else gap_tol)
             # HL hard caps: 5m 17d / 15m 50d — older WF windows cannot be fetched, use fallback (15m/1h) instead
             if self.exchange == "hyperliquid" and period in ("5m", "15m"):
                 max_lookback = 17 * 86400 if period == "5m" else 50 * 86400
@@ -316,7 +362,8 @@ class HistoricalDataProvider:
                 # Check if latest kline is too far from end_time
                 latest_ts = klines[-1]["timestamp"]
                 gap_periods = (end_sec - latest_ts) / period_sec
-                if gap_periods > gap_tol:
+                # Only fetch if gap is very large (> 200 periods)
+                if gap_periods > max(gap_tol, 200):
                     needs_fetch = True
                     logger.warning(
                         f"[Backtest] Kline data gap for {symbol}/{period}/{self.exchange}: "
@@ -352,26 +399,40 @@ class HistoricalDataProvider:
 
     def _query_klines_from_db(self, symbol: str, period: str, start_sec: int, end_sec: int) -> list:
         """Query klines from database."""
-        result = self.db.execute(text("""
-            SELECT timestamp, open_price, high_price, low_price, close_price, volume
-            FROM crypto_klines
-            WHERE symbol = :symbol AND period = :period AND exchange = :exchange
-            AND timestamp >= :start_ts AND timestamp <= :end_ts
-            ORDER BY timestamp ASC
-        """), {"symbol": symbol, "period": period, "exchange": self.exchange,
-               "start_ts": start_sec, "end_ts": end_sec})
+        # Ensure clean transaction state
+        try:
+            self.db.rollback()
+        except Exception:
+            pass
+            
+        try:
+            result = self.db.execute(text("""
+                SELECT timestamp, open_price, high_price, low_price, close_price, volume
+                FROM crypto_klines
+                WHERE symbol = :symbol AND period = :period AND exchange = :exchange
+                AND timestamp >= :start_ts AND timestamp <= :end_ts
+                ORDER BY timestamp ASC
+            """), {"symbol": symbol, "period": period, "exchange": self.exchange,
+                   "start_ts": start_sec, "end_ts": end_sec})
 
-        klines = []
-        for row in result:
-            klines.append({
-                "timestamp": int(row[0]),
-                "open": float(row[1]),
-                "high": float(row[2]),
-                "low": float(row[3]),
-                "close": float(row[4]),
-                "volume": float(row[5]) if row[5] else 0.0,
-            })
-        return klines
+            klines = []
+            for row in result:
+                klines.append({
+                    "timestamp": int(row[0]),
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]) if row[5] else 0.0,
+                })
+            return klines
+        except Exception as e:
+            logger.warning(f"DB query failed for {symbol} {period}: {e}")
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+            return []
 
     def _fetch_and_persist_klines(
         self, symbol: str, period: str,
@@ -524,6 +585,11 @@ class HistoricalDataProvider:
         if not period_sec:
             return None
 
+        # 空表就永久跳過：沒有 mark_price 就不可能組出 virtual K-line，
+        # 發查詢只是純粹浪費。首次查詢後把結果記在 _market_metrics_empty。
+        if self._market_metrics_empty is not None:
+            return None
+
         # Calculate current period start time
         period_start_sec = (current_time_sec // period_sec) * period_sec
         period_start_ms = period_start_sec * 1000
@@ -550,6 +616,13 @@ class HistoricalDataProvider:
                     prices.append(float(row[1]))
 
             if not prices:
+                # 這個時段沒有 mark_price。回測 DB 整張表為空時每個 symbol/period
+                # 都會走到這裡，所以記下來讓後續呼叫直接跳過。
+                if self._market_metrics_empty is None:
+                    empty = self.db.execute(text("""
+                        SELECT EXISTS (SELECT 1 FROM market_asset_metrics LIMIT 1)
+                    """)).scalar()
+                    self._market_metrics_empty = not bool(empty)
                 return None
 
             # Build OHLC from price series
@@ -728,6 +801,12 @@ class HistoricalDataProvider:
             funding_rate_val = None
             oi_val = None
 
+            # 整張表為空就跳過（理由同 _build_virtual_kline）：
+            # 空表查詢不會出錯，只會每次呼叫白付一次往返。
+            if self._market_metrics_empty is not None:
+                self._log_query("get_market_data", {"symbol": symbol, "exchange": self.exchange}, result)
+                return result
+
             row_mp = self.db.execute(text("""
                 SELECT mark_price, funding_rate
                 FROM market_asset_metrics
@@ -748,6 +827,12 @@ class HistoricalDataProvider:
             """), {"symbol": symbol, "exchange": self.exchange, "ts": self.current_time_ms}).fetchone()
             if row_oi:
                 oi_val = float(row_oi[0] or 0)
+
+            if self._market_metrics_empty is None:
+                empty = self.db.execute(text("""
+                    SELECT EXISTS (SELECT 1 FROM market_asset_metrics LIMIT 1)
+                """)).scalar()
+                self._market_metrics_empty = not bool(empty)
 
             if mark_price_val is not None or oi_val is not None:
                 result = {

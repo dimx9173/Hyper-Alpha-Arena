@@ -14,6 +14,20 @@
 [![English](https://img.shields.io/badge/Lang-English-blue)](https://www.akooi.com/docs/)
 [![中文](https://img.shields.io/badge/语言-中文-red)](https://www.akooi.com/docs/zh/)
 
+## 策略核心：滚动的学习循环，不是圣杯
+
+**没有一成不变的策略。** 任何参数组合都不会永远有效——市场结构会变，已部署的策略不过是「截至某个时刻看起来最好」的快照。
+
+所以本项目的目标不是「找到最好的策略」，而是 **建立一个能持续学习、持续自我修正的滚动系统**：
+
+```
+训练 → 策略迭代（GA 搜索）→ 交易（测试网）→ 复盘（回测 vs 实盘）→ 再循环
+```
+
+这个循环没有终止条件。成功意味着系统能持续运转并自我修正，而不是找到了一条永久有效的赚钱路径。
+
+📄 **[STRATEGY_CORE.md](./STRATEGY_CORE.md)** — 循环的完整说明：四个阶段的定义、风控护栏、Annual Gate 门槛、当前部署状态，以及驱动下一轮迭代的落差分析。
+
 ## 这是什么
 
 Hyper Alpha Arena 是一个 AI 交易平台——让 GPT、Claude、Deepseek 这些大模型帮你盯盘、分析、下单，全自动。灵感来自 [nof1 Alpha Arena](https://nof1.ai)。

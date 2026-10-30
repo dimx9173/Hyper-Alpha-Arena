@@ -72,6 +72,8 @@ def calculate_indicators(kline_data: List[Dict[str, Any]], indicators: List[str]
                     results['STOCH'] = _calculate_stochastic(df)
                 elif indicator == 'OBV':
                     results['OBV'] = _calculate_obv(df)
+                elif indicator.startswith('ICT'):
+                    results[indicator] = _calculate_ict(df, indicator)
                 else:
                     logger.warning(f"Unknown indicator: {indicator}")
 
@@ -84,6 +86,83 @@ def calculate_indicators(kline_data: List[Dict[str, Any]], indicators: List[str]
     except Exception as e:
         logger.error(f"Error in calculate_indicators: {e}")
         return {}
+
+
+def _calculate_ict(df: pd.DataFrame, indicator: str) -> Dict[str, Any]:
+    """计算 ICT / SMC 价格结构指标。
+
+    indicator 命名（策略端用 data.get_indicator(symbol, "<name>", period)）：
+
+      ICT              → 完整 payload（swings / structure / OB / FVG / sweeps / PD / OTE）
+      ICT_STRUCTURE    → 仅结构方向与最后一个事件
+      ICT_OTE          → 仅 confluence 打分（GA 最常用这个）
+      ICT_FVG          → 未填补的 FVG 列表
+      ICT_ORDERBLOCK   → 未回补的 Order Block 列表
+
+    可在名称后加 "_<left>" 覆盖 swing 确认根数，例如 ICT_OTE_3。
+    """
+    from services.ict_smc_indicators import (
+        compute_ict, detect_structure, optimal_trade_entry, find_fvgs, find_order_blocks,
+    )
+
+    # 从 df 还原成 ict_smc_indicators 需要的 dict 序列
+    kl = [
+        {
+            "open": float(r.open), "high": float(r.high),
+            "low": float(r.low), "close": float(r.close),
+            "volume": float(r.volume),
+        }
+        for r in df.itertuples()
+    ]
+
+    name = indicator
+    left = right = 5
+    parts = name.split("_")
+    # 允许 ICT_<SUB>_<left> 形式覆盖确认根数
+    if parts[-1].isdigit():
+        try:
+            left = right = int(parts[-1])
+            name = "_".join(parts[:-1])
+        except ValueError:
+            pass
+
+    try:
+        if name == "ICT_STRUCTURE":
+            st = detect_structure(kl, left, right)
+            last = st["events"][-1] if st.get("events") else None
+            return {
+                "value": 1.0 if st.get("dir") == "up" else (-1.0 if st.get("dir") == "down" else 0.0),
+                "direction": st.get("dir"),
+                "last_event": last,
+                "event_count": len(st.get("events", [])),
+            }
+
+        if name == "ICT_OTE":
+            ote = optimal_trade_entry(kl, left, right)
+            return ote
+
+        if name == "ICT_FVG":
+            gaps = [f for f in find_fvgs(kl) if not f["filled"]]
+            return {
+                "value": len(gaps),
+                "count": len(gaps),
+                "nearest": gaps[0] if gaps else None,
+            }
+
+        if name == "ICT_ORDERBLOCK":
+            st = detect_structure(kl, left, right)
+            blocks = [b for b in find_order_blocks(kl, st, left, right) if not b["mitigated"]]
+            return {
+                "value": len(blocks),
+                "count": len(blocks),
+                "nearest": blocks[0] if blocks else None,
+            }
+
+        # 默认 = 完整 payload
+        return compute_ict(kl, swing_left=left, swing_right=right)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ICT indicator %s failed: %s", indicator, exc)
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 def _calculate_ema(df: pd.DataFrame, period: int) -> List[float]:

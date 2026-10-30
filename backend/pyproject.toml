@@ -44,4 +44,4 @@ dev-dependencies = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["main.py"]
+packages = ["backtest", "api", "config", "database", "factors", "program_trader", "repositories", "routes", "schemas", "scripts", "services", "utils"]

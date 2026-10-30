@@ -10,6 +10,7 @@ Architecture:
 
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -42,6 +43,10 @@ from program_trader.data_provider import DataProvider
 from config.settings import BINANCE_DAILY_QUOTA_LIMIT
 
 logger = logging.getLogger(__name__)
+
+# Paper mode state file. Lives in /app/data because that's the volume mount,
+# so the paper account survives container restarts.
+PAPER_STATE_PATH = os.environ.get("PAPER_STATE_PATH", "/app/data/paper_state.json")
 
 
 class ProgramExecutionService:
@@ -365,6 +370,39 @@ class ProgramExecutionService:
                         logger.warning(f"[ProgramExecution] Failed to create Binance trading client: {e}")
                 # Get leverage settings from BinanceWallet
                 leverage_settings = self._get_binance_leverage_settings(db, account.id, environment or "mainnet")
+            elif environment == "paper":
+                # Paper mode: Hyperliquid mainnet 行情 + 本地計算帳戶。
+                # 不簽名、不廣播任何交易，只更新 /app/data/paper_state.json。
+                #
+                # 為什麼需要這個模式（2026-10-03 實測）：
+                #   Hyperliquid testnet 與 binance/mainnet 的價格結構不同。
+                #   ZEC 在 testnet 是 138.65，在 mainnet/binance 是約 1305（差 9.4 倍）。
+                #   回測用 binance 資料、在 testnet 執行 → 回測績效無法預測實盤。
+                #   paper 模式行情走 mainnet（與 binance 一致），資金走本地計算。
+                try:
+                    from services.paper_trading_client import PaperTradingClient
+                    from services.paper_broker import FeeModel
+
+                    state_path = PAPER_STATE_PATH
+                    cap = self._get_paper_capital(db, account.id)
+                    trading_client = PaperTradingClient(
+                        account_id=account.id,
+                        state_path=state_path,
+                        initial_capital=cap,
+                        environment="mainnet",
+                    )
+                    # 每次觸發先掃 TP/SL —— 鏈上没有掛單，本地必須自己判定
+                    closed = trading_client.check_exits()
+                    if closed:
+                        logger.info(
+                            "[ProgramExecution] paper mode: closed %d position(s) for account %s: %s",
+                            len(closed), account.id,
+                            [(c["symbol"], c["reason"], round(c["net_pnl"], 4)) for c in closed],
+                        )
+                except Exception as e:
+                    logger.error(f"[ProgramExecution] Failed to create paper trading client: {e}", exc_info=True)
+
+                leverage_settings = {"max_leverage": 5, "default_leverage": 1}
             else:
                 # Use Hyperliquid trading client (default)
                 if environment and wallet_address:
@@ -378,9 +416,13 @@ class ProgramExecutionService:
             max_leverage = leverage_settings["max_leverage"]
             default_leverage = leverage_settings["default_leverage"]
 
+            # paper 模式的行情來自 mainnet，所以 data provider 也必須用 mainnet，
+            # 否則 get_price/get_klines 會去 testnet 拿與回測不一致的價格。
+            data_env = "mainnet" if environment == "paper" else (environment or "mainnet")
+
             # Build MarketData with trading client (enable query recording for analysis)
             data_provider = DataProvider(
-                db, account.id, environment or "mainnet", trading_client,
+                db, account.id, data_env, trading_client,
                 record_queries=True, exchange=exchange
             )
             market_data = self._build_market_data(
@@ -391,7 +433,7 @@ class ProgramExecutionService:
                 triggered_signals=triggered_signals,
                 trigger_type=trigger_type,
                 signal_source_type="wallet_tracking" if isinstance(pool.get("wallet_event"), dict) else None,
-                environment=environment or "mainnet",
+                environment=data_env,
                 max_leverage=max_leverage,
                 default_leverage=default_leverage,
             )
@@ -463,6 +505,25 @@ class ProgramExecutionService:
                         db, log_id, order_result, binding, result.decision,
                         wallet_address, environment or "mainnet", exchange=exchange
                     )
+                    # 2026-09-30：log 在下單前就寫成 success=True。當 _handle_decision
+                    # 走了提前 return（無錢包 / 無價格 / TP-SL 驗證失敗 / 風控跳過），
+                    # order_result 是 None 且 log 不會被改，於是留下一筆「成功」但
+                    # 從未下單的假紀錄。實測遠端 id 165/166 就是這樣：
+                    # success=true 但 order_id/tp_order_id/sl_order_id 皆 NULL。
+                    # 這裡補一次對帳 —— 非 hold 卻沒有任何訂單 ID，一律改為未執行。
+                    try:
+                        _chk = db.query(ProgramExecutionLog).filter(
+                            ProgramExecutionLog.id == log_id).first()
+                        if _chk is not None and _chk.success is True and not _chk.hyperliquid_order_id:
+                            _chk.success = False
+                            _chk.error_message = (
+                                (_chk.error_message or "")
+                                + " [not executed: no order submitted, decision aborted before order placement]")
+                            db.commit()
+                            logger.info(f"[ProgramExecution] Log {log_id} marked failed: "
+                                        f"{op} decision produced no order id")
+                    except Exception as _reconcile_err:
+                        logger.warning(f"[ProgramExecution] order reconciliation failed: {_reconcile_err}")
 
         except Exception as e:
             logger.error(f"[ProgramExecution] Error executing binding {binding_id}: {e}")
@@ -495,6 +556,20 @@ class ProgramExecutionService:
                 HyperliquidWallet.is_active == "true"
             ).first()
             return wallet.wallet_address if wallet else None
+
+    def _get_paper_capital(self, db, account_id: int) -> float:
+        """Paper 模式的初始資金。
+
+        用帳戶的 initial_capital，讓 paper 帳戶的可投資金額與真實帳戶設定一致。
+        讀不到時退回 10000（與前端預設相同）。
+        """
+        try:
+            account = db.query(Account).filter(Account.id == account_id).first()
+            if account is not None and account.initial_capital:
+                return float(account.initial_capital)
+        except Exception as e:
+            logger.warning(f"[ProgramExecution] failed to read paper capital: {e}")
+        return 10000.0
 
     def _get_binance_leverage_settings(self, db, account_id: int, environment: str) -> dict:
         """Get leverage settings from BinanceWallet."""
@@ -727,6 +802,33 @@ class ProgramExecutionService:
             logger.error(f"[ProgramExecution] Failed to log execution: {e}")
             return None
 
+    # 2026-09-30 PRP-P1-4 修正：portfolio guard / cooldown 跳過時原本直接
+    # `return None`，呼叫端 (行 462) 無法區分「風控跳過」與「訂單送出後失敗」，
+    # 於是 _update_log_with_order 一律記成 "[Order execution failed]"。
+    # 實測：已部署策略 portion=0.28 leverage=3 -> notional 0.84x equity，
+    # 必然超過 single-coin cap 0.4，100% 被擋下，180 筆執行紀錄沒有任何一筆
+    # 真正成交，卻顯示 138 筆 success。改為帶明確 skip_reason 的結構化回傳。
+    SKIP_REASONS = {
+        "exposure_cap": "skipped: total exposure cap (2x equity)",
+        "single_coin_cap": "skipped: single-coin cap (40% equity)",
+        "cluster_cap": "skipped: cluster cap (60% equity)",
+        "daily_loss_fuse": "skipped: daily loss fuse (-5% equity)",
+        "same_direction_cooldown": "skipped: same-direction add cooldown (4h)",
+    }
+
+    @classmethod
+    def _skip_result(cls, reason_key: str, detail: str = "") -> Dict[str, Any]:
+        """Build a structured 'skipped by risk guard' result.
+
+        Returned instead of bare None so the caller can log the real reason
+        instead of a misleading generic order failure.
+        """
+        return {
+            "__skipped__": True,
+            "reason": cls.SKIP_REASONS.get(reason_key, f"skipped: {reason_key}"),
+            "detail": detail,
+        }
+
     def _update_log_with_order(
         self,
         db,
@@ -742,6 +844,20 @@ class ProgramExecutionService:
         try:
             log = db.query(ProgramExecutionLog).filter(ProgramExecutionLog.id == log_id).first()
             if not log:
+                return
+
+            # 2026-09-30：風控跳過不是訂單失敗。
+            # order_result 帶 __skipped__ 時代表執行服務主動跳過（未送出訂單），
+            # 必須記錄真實原因，不能記成 "[Order execution failed]"。
+            if isinstance(order_result, dict) and order_result.get("__skipped__"):
+                log.success = False
+                log.error_message = (log.error_message or "") + " " + order_result.get("reason", "skipped")
+                detail = order_result.get("detail") or ""
+                if detail:
+                    log.error_message += f" ({detail})"
+                db.commit()
+                logger.info(f"[ProgramExecution] Log {log_id} skipped by risk guard: "
+                            f"{order_result.get('reason')} {detail}")
                 return
 
             # If order failed (order_result is None), mark the log as failed
@@ -943,12 +1059,16 @@ class ProgramExecutionService:
         )
 
         # Check wallet (for Binance, wallet_address may be API key indicator)
-        if not wallet_address and exchange != "binance":
+        # paper 模式不需要鏈上錢包 —— 資金與持倉都在本地，沒有鏈上身分。
+        # 2026-10-03：原本 paper 模式在這裡直接 return False，導致整條下單路徑走不通。
+        is_paper = (environment == "paper")
+        if not wallet_address and exchange != "binance" and not is_paper:
             logger.error(f"[ProgramExecution] No wallet address for binding {binding.id}")
             return False
 
         if not environment:
             logger.error(f"[ProgramExecution] No trading environment configured")
+            return False
             return False
 
         try:
@@ -957,11 +1077,15 @@ class ProgramExecutionService:
             available_balance = account_info.get("available_balance", 0)
 
             # Get real-time market price based on exchange
+            # paper 模式的行情必須走 mainnet（與回測的 binance 價格同源），
+            # 不能傳 "paper" 給 get_last_price_from_hyperliquid —— 那個函式
+            # 只認 testnet / mainnet。
+            price_env = "mainnet" if is_paper else environment
             if exchange == "binance":
                 market_price = client.get_mark_price(decision.symbol)
             else:
                 from services.hyperliquid_market_data import get_last_price_from_hyperliquid
-                market_price = get_last_price_from_hyperliquid(decision.symbol, environment)
+                market_price = get_last_price_from_hyperliquid(decision.symbol, price_env)
 
             if not market_price or market_price <= 0:
                 market_price = getattr(decision, 'max_price', None) or getattr(decision, 'min_price', None)
@@ -1008,13 +1132,17 @@ class ProgramExecutionService:
                     _new_notional = _new_margin * int(getattr(decision, 'leverage', 1) or 1)
                     if _eq > 0 and (_total_notional + _new_notional) > _eq * 2:
                         logger.warning(f"[ProgramExecution] portfolio guard: exposure cap, skip {decision.symbol}")
-                        return None
+                        return self._skip_result("exposure_cap",
+                            f"total={_total_notional:.1f} + new={_new_notional:.1f} > cap={_eq * 2:.1f}")
                     if _eq > 0 and _new_notional > _eq * 0.4:
                         logger.warning(f"[ProgramExecution] portfolio guard: single-coin cap, skip {decision.symbol}")
-                        return None
+                        return self._skip_result("single_coin_cap",
+                            f"new_notional={_new_notional:.1f} > cap={_eq * 0.4:.1f} "
+                            f"(portion={getattr(decision, 'target_portion_of_balance', 0)} leverage={getattr(decision, 'leverage', 1)})")
                     if decision.symbol in _CLUSTER and _eq > 0 and (_cluster_notional + _new_notional) > _eq * 0.6:
                         logger.warning(f"[ProgramExecution] portfolio guard: cluster cap, skip {decision.symbol}")
-                        return None
+                        return self._skip_result("cluster_cap",
+                            f"cluster={_cluster_notional:.1f} + new={_new_notional:.1f} > cap={_eq * 0.6:.1f}")
                     from database.models import ProgramExecutionLog as _PEL2
                     from datetime import timedelta as _td2
                     _day = datetime.now(timezone.utc) - _td2(hours=24)
@@ -1024,7 +1152,7 @@ class ProgramExecutionService:
                         logger.error(f"[ProgramExecution] portfolio guard: daily loss fuse, disabling binding {binding.id}")
                         binding.is_active = False
                         db.commit()
-                        return None
+                        return self._skip_result("daily_loss_fuse", f"day_pnl={_day_pnl:.1f} limit={-_eq * 0.05:.1f}")
                 except Exception as _ge:
                     logger.warning(f"[ProgramExecution] portfolio guard check failed: {_ge}")
             # PRP-P1-3: same-direction add cooldown 4h (4h訊號不反覆加倉)
@@ -1044,7 +1172,8 @@ class ProgramExecutionService:
                             ).order_by(_PEL.id.desc()).first()
                             if _recent is not None:
                                 logger.info(f"[ProgramExecution] Binding {binding.id} {decision.symbol} same-direction cooldown, skip add")
-                                return None
+                                return self._skip_result("same_direction_cooldown",
+                                    f"last add at {_recent.created_at}")
                         except Exception as _ce:
                             logger.warning(f"[ProgramExecution] cooldown check failed: {_ce}")
 
