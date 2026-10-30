@@ -133,7 +133,7 @@ class PaperBroker:
 
         # 風控護欄（與 program_execution_service 的限制對齊，
         # 常數來源：config/guardrails.py）
-        self.CLUSTER = set(CLUSTER)
+        self.CLUSTER = CLUSTER
 
         # 同向加倉冷卻
         self._last_add_time: Dict[str, datetime] = {}

@@ -49,7 +49,17 @@ def single_coin_violation(portion: float, leverage: int) -> float:
     """相對超標量：0 = 可部署；1.0 = 超標 100%（名目達上限兩倍）。
 
     與 `gate_violation` 現有 PnL/DD 項同量綱（相對違規量），直接進 `max()`。
+
+    fail-closed：portion/leverage 非有限或名目為負（髒基因）一律回 1.0，
+    與 max_trades 硬否決同級，不讓格式越爛懲罰越小。
     """
+    import math as _math
+    try:
+        notional = single_coin_notional(float(portion), int(leverage))
+    except (TypeError, ValueError):
+        return 1.0
+    if not _math.isfinite(notional) or notional < 0:
+        return 1.0
     if MAX_SINGLE_COIN <= 0:
         return 0.0
-    return max(0.0, (single_coin_notional(portion, leverage) - MAX_SINGLE_COIN) / MAX_SINGLE_COIN)
+    return max(0.0, (notional - MAX_SINGLE_COIN) / MAX_SINGLE_COIN)

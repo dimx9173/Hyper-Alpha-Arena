@@ -490,12 +490,13 @@ def gate_violation(result: "EvalResult") -> float:
     _portion = getattr(_genome, "portion", None)
     _leverage = getattr(_genome, "leverage", None)
     if _portion is None or _leverage is None:
+        # 舊 seed log 的 _SeedResult 無 genome：回退為 0，不誤殺（會在 log 留痕請見下）。
         deploy_violation = 0.0
+        logger.warning("gate_violation: result 無 genome portion/leverage，deploy 項回退為 0")
     else:
-        try:
-            deploy_violation = single_coin_violation(float(_portion), int(_leverage))
-        except (TypeError, ValueError):
-            deploy_violation = 0.0
+        # fail-closed 住在 single_coin_violation 內部（nan/inf/負值/轉型失敗一律 1.0）；
+        # 這裡只接結果，不重複守衛。
+        deploy_violation = single_coin_violation(_portion, _leverage)
     v = max(
         (t["pnl"] - float(result.pnl_365d)) / t["pnl"],
         (dd - t["dd"]) / t["dd"],

@@ -40,6 +40,7 @@ from database.models import (
 from program_trader.executor import execute_strategy
 from program_trader.models import MarketData, ActionType
 from program_trader.data_provider import DataProvider
+from config.settings import BINANCE_DAILY_QUOTA_LIMIT
 from config.guardrails import MAX_TOTAL_LEVERAGE, MAX_SINGLE_COIN, MAX_CLUSTER, CLUSTER
 
 logger = logging.getLogger(__name__)
@@ -1114,7 +1115,7 @@ class ProgramExecutionService:
                     _positions = data_provider.get_positions() if environment and client else {}
                     _total_notional = 0.0
                     _cluster_notional = 0.0
-                    _CLUSTER = set(CLUSTER)
+                    _CLUSTER = CLUSTER
                     try:
                         from services.hyperliquid_market_data import get_last_price_from_hyperliquid as _lp
                     except Exception:
