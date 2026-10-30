@@ -12,6 +12,8 @@ import logging
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 
+from config.fees import FeeSchedule
+
 from .virtual_account import VirtualAccount, VirtualPosition
 from .models import BacktestTradeRecord
 
@@ -42,24 +44,50 @@ class ExecutionSimulator:
 
     def __init__(
         self,
-        slippage_percent: float = 0.05,
-        fee_rate: float = 0.035,
-        maker_fee_rate: float = 0.02,
+        slippage_percent: Optional[float] = None,
+        fee_rate: Optional[float] = None,
+        maker_fee_rate: Optional[float] = None,
         realistic_tpsl: bool = True,
+        fee_schedule: Optional[FeeSchedule] = None,
     ):
         """
         Initialize execution simulator.
 
         Args:
-            slippage_percent: Default slippage in percent (0.05 = 0.05%)
-            fee_rate: Trading fee rate in percent (0.035 = 0.035%, taker)
-            maker_fee_rate: Maker fee rate in percent (PRP-P1-2, TP limit)
+            slippage_percent: Default slippage in percent (legacy; converted
+                once here via ``FeeSchedule.from_percent``).
+            fee_rate: Trading fee rate in percent, taker (legacy).
+            maker_fee_rate: Maker fee rate in percent, TP limit (legacy).
             realistic_tpsl: TP needs close-confirm, SL pays taker (default True)
+            fee_schedule: Single source of truth. When given, legacy percent
+                args must be None; the schedule's bps values are used as-is.
         """
-        self.slippage_percent = slippage_percent
-        self.fee_rate = fee_rate
-        self.maker_fee_rate = maker_fee_rate
+        if fee_schedule is not None:
+            if slippage_percent is not None or fee_rate is not None or maker_fee_rate is not None:
+                raise ValueError("pass either fee_schedule or legacy percent args, not both")
+            self.fees = fee_schedule
+        else:
+            self.fees = FeeSchedule.from_percent(
+                maker_fee_pct=maker_fee_rate if maker_fee_rate is not None else 0.02,
+                taker_fee_pct=fee_rate if fee_rate is not None else 0.035,
+                slippage_pct=slippage_percent if slippage_percent is not None else 0.05,
+            )
         self.realistic_tpsl = realistic_tpsl
+
+    @property
+    def slippage_percent(self) -> float:
+        """Legacy percent-unit view (``percent = bps / 100``)."""
+        return self.fees.slippage_bps / 100.0
+
+    @property
+    def fee_rate(self) -> float:
+        """Legacy percent-unit taker view."""
+        return self.fees.taker_fee_bps / 100.0
+
+    @property
+    def maker_fee_rate(self) -> float:
+        """Legacy percent-unit maker view."""
+        return self.fees.maker_fee_bps / 100.0
 
     def calculate_execution_price(
         self,
@@ -94,19 +122,23 @@ class ExecutionSimulator:
         self,
         notional: float,
         fee_rate: Optional[float] = None,
+        is_maker: bool = False,
     ) -> float:
         """
         Calculate trading fee.
 
         Args:
             notional: Trade notional value (size * price)
-            fee_rate: Override fee rate
+            fee_rate: Legacy override fee rate in percent (deprecated; when
+                given it is converted once here, not at call sites).
+            is_maker: Use the schedule's maker rate when no override given.
 
         Returns:
             Fee amount
         """
-        rate = fee_rate if fee_rate is not None else self.fee_rate
-        return notional * rate / 100
+        if fee_rate is not None:
+            return abs(notional) * fee_rate / 100
+        return self.fees.fee(notional, is_maker=is_maker)
 
     def check_tp_sl_triggers(
         self,
@@ -298,7 +330,7 @@ class ExecutionSimulator:
                     # Calculate fee for actual close size
                     # PRP-P1-2: TP maker fee, SL taker fee
                     notional = actual_close_size * executed_price
-                    fee = self.calculate_fee(notional, fee_rate=self.maker_fee_rate if order.order_type == "take_profit" else None)
+                    fee = self.calculate_fee(notional, is_maker=(order.order_type == "take_profit"))
 
                     # Partial close position
                     pnl = account.partial_close_position(

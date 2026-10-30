@@ -18,6 +18,8 @@ from datetime import datetime
 import time
 
 from .models import MarketData, Decision, ActionType, Kline, Position, RegimeInfo
+from config.fees import FeeSchedule
+
 
 
 @dataclass
@@ -169,10 +171,28 @@ class BacktestEngine:
     def __init__(
         self,
         initial_balance: float = 10000.0,
-        fee_rate: float = 0.0006,  # 0.06% taker fee
+        fee_rate: Optional[float] = None,  # legacy fraction unit (0.0006 = 0.06%); converted once here
+        fee_schedule: Optional[FeeSchedule] = None,
     ):
         self.initial_balance = initial_balance
-        self.fee_rate = fee_rate
+        if fee_schedule is not None:
+            if fee_rate is not None:
+                raise ValueError("pass either fee_schedule or fee_rate, not both")
+            self.fees = fee_schedule
+        elif fee_rate is not None:
+            self.fees = FeeSchedule(maker_fee_bps=fee_rate * 10000.0, taker_fee_bps=fee_rate * 10000.0,
+                                    slippage_bps=FeeSchedule().slippage_bps)
+        else:
+            default = FeeSchedule()
+            self.fees = FeeSchedule(maker_fee_bps=default.taker_fee_bps,
+                                    taker_fee_bps=default.taker_fee_bps,
+                                    slippage_bps=default.slippage_bps)
+
+    @property
+    def fee_rate(self) -> float:
+        """Legacy fraction-unit taker view."""
+        return self.fees.taker_fee_bps / 10000.0
+
 
     def run(
         self,
@@ -234,7 +254,7 @@ class BacktestEngine:
             if decision.action == ActionType.BUY and position is None:
                 # Open long
                 size = min(decision.size_usd, balance * 0.95) / current_price
-                fee = size * current_price * self.fee_rate
+                fee = self.fees.fee(size * current_price)
                 balance -= fee
                 position = Position(
                     symbol=symbol, side="long", size=size,
@@ -250,7 +270,7 @@ class BacktestEngine:
             elif decision.action == ActionType.SELL and position is None:
                 # Open short
                 size = min(decision.size_usd, balance * 0.95) / current_price
-                fee = size * current_price * self.fee_rate
+                fee = self.fees.fee(size * current_price)
                 balance -= fee
                 position = Position(
                     symbol=symbol, side="short", size=size,
@@ -266,7 +286,7 @@ class BacktestEngine:
             elif decision.action == ActionType.CLOSE and position is not None:
                 # Close position
                 pnl = self._calc_realized_pnl(position, current_price)
-                fee = position.size * current_price * self.fee_rate
+                fee = self.fees.fee(position.size * current_price)
                 balance += pnl - fee
                 trades.append(BacktestTrade(
                     timestamp=current_kline.timestamp, symbol=symbol,

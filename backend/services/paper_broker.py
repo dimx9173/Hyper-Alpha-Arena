@@ -37,35 +37,16 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
-# =====================================================================
-# 成本模型
-# =====================================================================
+from config.fees import FeeSchedule
+
 
 @dataclass
-class FeeModel:
-    """手續費與滑價模型。
+class FeeModel(FeeSchedule):
+    """Thin alias kept for backward compatibility.
 
-    預設值取自 Hyperliquid mainnet 的實際費率量級：
-    - maker 0.015% / taker 0.045%（一般用戶）
-    - 滑價 2bp（假設流動性充足的小幣）
+    New code should import ``FeeSchedule`` from ``config.fees`` directly.
+    Default behavior is unchanged (maker 1.5bp / taker 4.5bp / slip 2bp).
     """
-    maker_fee_bps: float = 1.5      # 0.015%
-    taker_fee_bps: float = 4.5      # 0.045%
-    slippage_bps: float = 2.0       # 單邊 2bp
-
-    def entry_price(self, mid: float, is_buy: bool) -> float:
-        """進場成交價（含滑價）。買入滑高，賣出滑低。"""
-        adj = self.slippage_bps / 10000.0
-        return mid * (1 + adj) if is_buy else mid * (1 - adj)
-
-    def exit_price(self, mid: float, is_buy: bool) -> float:
-        """平倉成交價（含滑價）。賣出滑低，買回滑高。"""
-        adj = self.slippage_bps / 10000.0
-        return mid * (1 - adj) if is_buy else mid * (1 + adj)
-
-    def fee(self, notional: float, is_maker: bool = False) -> float:
-        bps = self.maker_fee_bps if is_maker else self.taker_fee_bps
-        return abs(notional) * bps / 10000.0
 
 
 # =====================================================================
@@ -129,7 +110,7 @@ class PaperBroker:
     def __init__(
         self,
         initial_capital: float = 10000.0,
-        fee_model: Optional[FeeModel] = None,
+        fee_model: Optional[FeeSchedule] = None,
         max_positions: int = 3,
         cooldown_hours: float = 4.0,
         max_total_leverage: float = 2.0,
@@ -525,8 +506,9 @@ class PaperBroker:
     def load_from(cls, path: str) -> "PaperBroker":
         with open(path) as f:
             st = json.load(f)
+        fee_keys = set(FeeSchedule.__dataclass_fields__)
         b = cls(initial_capital=st["initial_capital"],
-                fee_model=FeeModel(**st["fee_model"]),
+                fee_model=FeeSchedule(**{k: v for k, v in st["fee_model"].items() if k in fee_keys}),
                 max_positions=st.get("max_positions", 3))
         b.cash = st["cash"]
         for sym, pd in st.get("positions", {}).items():
