@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 from config.fees import FeeSchedule
+from config.guardrails import MAX_TOTAL_LEVERAGE, MAX_SINGLE_COIN, MAX_CLUSTER, CLUSTER
 
 
 @dataclass
@@ -113,9 +114,9 @@ class PaperBroker:
         fee_model: Optional[FeeSchedule] = None,
         max_positions: int = 3,
         cooldown_hours: float = 4.0,
-        max_total_leverage: float = 2.0,
-        max_single_coin: float = 0.4,
-        max_cluster: float = 0.6,
+        max_total_leverage: float = MAX_TOTAL_LEVERAGE,
+        max_single_coin: float = MAX_SINGLE_COIN,
+        max_cluster: float = MAX_CLUSTER,
     ):
         self.initial_capital = float(initial_capital)
         self.cash = float(initial_capital)
@@ -130,8 +131,9 @@ class PaperBroker:
         self.trades: List[PaperTrade] = []
         self.equity_curve: List[Dict[str, Any]] = []
 
-        # 風控護欄（與 program_execution_service 的限制對齊）
-        self.CLUSTER = {"BTC", "ETH", "SOL", "HYPE", "BNB", "AVAX", "NEAR"}
+        # 風控護欄（與 program_execution_service 的限制對齊，
+        # 常數來源：config/guardrails.py）
+        self.CLUSTER = set(CLUSTER)
 
         # 同向加倉冷卻
         self._last_add_time: Dict[str, datetime] = {}

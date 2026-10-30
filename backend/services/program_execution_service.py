@@ -40,7 +40,7 @@ from database.models import (
 from program_trader.executor import execute_strategy
 from program_trader.models import MarketData, ActionType
 from program_trader.data_provider import DataProvider
-from config.settings import BINANCE_DAILY_QUOTA_LIMIT
+from config.guardrails import MAX_TOTAL_LEVERAGE, MAX_SINGLE_COIN, MAX_CLUSTER, CLUSTER
 
 logger = logging.getLogger(__name__)
 
@@ -1114,7 +1114,7 @@ class ProgramExecutionService:
                     _positions = data_provider.get_positions() if environment and client else {}
                     _total_notional = 0.0
                     _cluster_notional = 0.0
-                    _CLUSTER = {"BTC", "ETH", "SOL", "HYPE", "BNB", "AVAX", "NEAR"}
+                    _CLUSTER = set(CLUSTER)
                     try:
                         from services.hyperliquid_market_data import get_last_price_from_hyperliquid as _lp
                     except Exception:
@@ -1130,19 +1130,19 @@ class ProgramExecutionService:
                             continue
                     _new_margin = available_balance * float(getattr(decision, 'target_portion_of_balance', 0))
                     _new_notional = _new_margin * int(getattr(decision, 'leverage', 1) or 1)
-                    if _eq > 0 and (_total_notional + _new_notional) > _eq * 2:
+                    if _eq > 0 and (_total_notional + _new_notional) > _eq * MAX_TOTAL_LEVERAGE:
                         logger.warning(f"[ProgramExecution] portfolio guard: exposure cap, skip {decision.symbol}")
                         return self._skip_result("exposure_cap",
-                            f"total={_total_notional:.1f} + new={_new_notional:.1f} > cap={_eq * 2:.1f}")
-                    if _eq > 0 and _new_notional > _eq * 0.4:
+                            f"total={_total_notional:.1f} + new={_new_notional:.1f} > cap={_eq * MAX_TOTAL_LEVERAGE:.1f}")
+                    if _eq > 0 and _new_notional > _eq * MAX_SINGLE_COIN:
                         logger.warning(f"[ProgramExecution] portfolio guard: single-coin cap, skip {decision.symbol}")
                         return self._skip_result("single_coin_cap",
-                            f"new_notional={_new_notional:.1f} > cap={_eq * 0.4:.1f} "
+                            f"new_notional={_new_notional:.1f} > cap={_eq * MAX_SINGLE_COIN:.1f} "
                             f"(portion={getattr(decision, 'target_portion_of_balance', 0)} leverage={getattr(decision, 'leverage', 1)})")
-                    if decision.symbol in _CLUSTER and _eq > 0 and (_cluster_notional + _new_notional) > _eq * 0.6:
+                    if decision.symbol in _CLUSTER and _eq > 0 and (_cluster_notional + _new_notional) > _eq * MAX_CLUSTER:
                         logger.warning(f"[ProgramExecution] portfolio guard: cluster cap, skip {decision.symbol}")
                         return self._skip_result("cluster_cap",
-                            f"cluster={_cluster_notional:.1f} + new={_new_notional:.1f} > cap={_eq * 0.6:.1f}")
+                            f"cluster={_cluster_notional:.1f} + new={_new_notional:.1f} > cap={_eq * MAX_CLUSTER:.1f}")
                     from database.models import ProgramExecutionLog as _PEL2
                     from datetime import timedelta as _td2
                     _day = datetime.now(timezone.utc) - _td2(hours=24)

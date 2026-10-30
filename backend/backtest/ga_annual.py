@@ -15,6 +15,7 @@ from copy import deepcopy
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import time
 
+from config.guardrails import single_coin_violation
 logger = logging.getLogger(__name__)
 
 
@@ -479,6 +480,22 @@ def gate_violation(result: "EvalResult") -> float:
     # 上限壓到 0.5，避免像原本的 1.0 一樣遮蔽其他所有連續項的梯度。
     pf_strong_ok = result.pf is not None and float(result.pf) >= t.get("pf_strong", 2.0)
     win_ok = (float(result.win_rate) > t["win"]) or pf_strong_ok
+    # 實盤可部署性（與 gate 同權重，同進 max）：
+    # portion x leverage = 單幣名目（equity 倍數），超過實盤 single_coin_cap
+    #（config/guardrails.py MAX_SINGLE_COIN = 0.4，對應
+    # program_execution_service.py:1137 / paper_broker.py:213）即違規。
+    # 用相對超標量（0 = 可部署，1.0 = 超標 100%），與 PnL/DD 項同量綱。
+    # genome 缺失時（舊 seed log 的 _SeedResult 無此屬性）回退為 0，不誤殺。
+    _genome = getattr(result, "genome", None)
+    _portion = getattr(_genome, "portion", None)
+    _leverage = getattr(_genome, "leverage", None)
+    if _portion is None or _leverage is None:
+        deploy_violation = 0.0
+    else:
+        try:
+            deploy_violation = single_coin_violation(float(_portion), int(_leverage))
+        except (TypeError, ValueError):
+            deploy_violation = 0.0
     v = max(
         (t["pnl"] - float(result.pnl_365d)) / t["pnl"],
         (dd - t["dd"]) / t["dd"],
@@ -491,6 +508,7 @@ def gate_violation(result: "EvalResult") -> float:
         # 若用相對違規，731 筆只會得到 0.00137 違規（懲罰 0.27 分），
         # 等於讓 730 筆上限在 fitness 層形同虛設。
         0.0 if float(result.trades_365d) <= t["max_trades"] else 1.0,
+        deploy_violation,
     )
     return max(v, 0.0)
 
