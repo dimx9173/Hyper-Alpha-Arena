@@ -647,38 +647,31 @@ class HistoricalDataProvider:
         """
         from services.technical_indicators import calculate_indicators
 
-        # PRP-P0-2: full-window once + bisect slice
+        # 前視修正：快取鍵必須帶時間，否則舊時間算好的全窗序列會沿用到後面 trigger。
+        # 但 trigger 時間每個都不同，鍵帶時間等於永不命中——直接不缓存全窗，
+        # 每次用 get_klines 已按 current_time_ms 切好的當下資料現算。
+        # （PRP-P0-2 的全窗快取是此 bug 的根源：首算時間凍結了全序列。）
         import bisect as _bisect
         indicator_upper = indicator.upper()
-        ck = f"{symbol}_{period}_{indicator_upper}"
         ts_now = self.current_time_ms // 1000
-        hit = self._indicator_cache.get(ck)
-        if hit is None:
-            klines_full = self.get_klines(symbol, period, 5000)
-            if not klines_full:
-                self._log_query("get_indicator", {"symbol": symbol, "indicator": indicator, "period": period, "exchange": self.exchange}, {})
-                return {}
-            kline_data = [
-                {"timestamp": k.timestamp, "open": k.open, "high": k.high,
-                 "low": k.low, "close": k.close, "volume": k.volume}
-                for k in klines_full
-            ]
-            try:
-                calculated = calculate_indicators(kline_data, [indicator_upper])
-            except Exception as ex:
-                logger.warning(f"Failed to calculate {indicator} for {symbol}: {ex}")
-                self._log_query("get_indicator", {"symbol": symbol, "indicator": indicator, "period": period, "exchange": self.exchange}, {})
-                return {}
-            raw = calculated.get(indicator_upper)
-            ts_list = [k["timestamp"] for k in kline_data]
-            if isinstance(raw, list):
-                self._indicator_cache[ck] = (ts_list, raw)
-            elif isinstance(raw, dict):
-                self._indicator_cache[ck] = (ts_list, raw)
-            else:
-                self._indicator_cache[ck] = (ts_list, raw)
-            hit = self._indicator_cache.get(ck)
-        ts_list, raw = hit
+        klines_full = self.get_klines(symbol, period, 5000)
+        if not klines_full:
+            self._log_query("get_indicator", {"symbol": symbol, "indicator": indicator, "period": period, "exchange": self.exchange}, {})
+            return {}
+        kline_data = [
+            {"timestamp": k.timestamp, "open": k.open, "high": k.high,
+             "low": k.low, "close": k.close, "volume": k.volume}
+            for k in klines_full
+        ]
+        try:
+            calculated = calculate_indicators(kline_data, [indicator_upper])
+        except Exception as ex:
+            logger.warning(f"Failed to calculate {indicator} for {symbol}: {ex}")
+            self._log_query("get_indicator", {"symbol": symbol, "indicator": indicator, "period": period, "exchange": self.exchange}, {})
+            return {}
+        raw = calculated.get(indicator_upper)
+        ts_list = [k["timestamp"] for k in kline_data]
+        hit = (ts_list, raw)
         idx = _bisect.bisect_right(ts_list, ts_now) - 1
         if idx < 0:
             self._log_query("get_indicator", {"symbol": symbol, "indicator": indicator, "period": period, "exchange": self.exchange}, {})
