@@ -4,8 +4,10 @@ Fetch kline data from Hyperliquid API and persist to PostgreSQL.
 Populates crypto_klines table for GA backtest.
 """
 import sys, time, os
-sys.path.insert(0, '/home/brian/project/Hyper-Alpha-Arena/backend')
-os.chdir('/home/brian/project/Hyper-Alpha-Arena/backend')
+from pathlib import Path
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+os.chdir(_HERE)
 
 from datetime import datetime, timezone
 from sqlalchemy import create_engine, text
@@ -13,7 +15,7 @@ from sqlalchemy.orm import sessionmaker
 from services.hyperliquid_market_data import HyperliquidClient
 from database.models import CryptoKline
 
-DB_URL = "postgresql://alpha_user:alpha_pass@localhost:5432/alpha_arena"
+DB_URL = os.environ.get("DATABASE_URL", "postgresql://alpha_user:alpha_pass@/alpha_arena?host=/tmp")
 engine = create_engine(DB_URL)
 SessionLocal = sessionmaker(bind=engine)
 
@@ -39,11 +41,27 @@ def main():
                     SELECT COUNT(*) FROM crypto_klines 
                     WHERE exchange = :ex AND symbol = :sym AND period = :per
                 """), {"ex": EXCHANGE, "sym": symbol, "per": period}).scalar()
-                if existing > 100:
+                if existing > 100 and not (period == "1h" and existing < 8000):
                     print(f"  {period}: existing={existing} (skipping)", flush=True)
                     continue
-                print(f"  {period}: fetching...", end=" ", flush=True)
+                if period == "1h" and existing > 100:
+                    print(f"  {period}: existing={existing}, paging back to fill year...", end=" ", flush=True)
+                else:
+                    print(f"  {period}: fetching...", end=" ", flush=True)
                 klines = client._fetch_kline_native_range(symbol, period, SINCE_MS, NOW_MS, persist=False)
+                # HL candleSnapshot 單次上限 5000 根：1h 一年要 8760 根，一次抓不完。
+                # 若回來的第一根晚於 SINCE_MS，分段往前補，直到覆蓋或無更多資料。
+                for _ in range(4):
+                    if not klines or klines[0]["timestamp"] * 1000 <= SINCE_MS:
+                        break
+                    first_ms = klines[0]["timestamp"] * 1000
+                    more = client._fetch_kline_native_range(symbol, period, SINCE_MS, first_ms - 1, persist=False)
+                    if not more:
+                        break
+                    seen = {k["timestamp"] for k in klines}
+                    klines = [k for k in more if k["timestamp"] not in seen] + klines
+                    if len(more) < 100:
+                        break
                 if not klines:
                     print("(no data)")
                     continue

@@ -894,8 +894,9 @@ def evaluate_individual(genome_dict: Dict, symbols: List[str], exchange: str = "
     Uses relaxed thresholds for early generations (exploration phase),
     strict thresholds for later generations (exploitation phase).
     """
-    import sys
-    sys.path.insert(0, "/home/brian/project/Hyper-Alpha-Arena/backend")
+    from pathlib import Path as _Path
+    import sys as _sys
+    _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
     
     from backtest.ab_validators import annual_validator, exploration_validator
     from database.connection import SessionLocal
