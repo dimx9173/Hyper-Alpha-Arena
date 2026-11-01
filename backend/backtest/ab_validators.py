@@ -385,7 +385,8 @@ def annual_validator(
         db, code, symbols, 
         now_ms - backtest_days * 24 * 3600 * 1000, now_ms, 
         exchange=exchange,
-        trigger=900 if max_triggers is None else _compute_trigger_interval_sec(max_triggers, backtest_days)
+        trigger=900 if max_triggers is None else _compute_trigger_interval_sec(max_triggers, backtest_days),
+        max_triggers=max_triggers,
     )
     
     f365 = _extract_gate_fields(r365)
@@ -455,24 +456,39 @@ def annual_validator(
         },
     }
 
+# === EXPLORATION VALIDATOR thresholds (single source of truth) ===
+# 這組門檻原本只寫在 exploration_validator 的參數預設值裡，外部讀不到。
+# 結果 ga_annual.gate_violation 只能用嚴格期常數（trades=20）算違規量，
+# 而 GA 實際被 exploration_validator（trades=60）判生死：
+# 實測 12 幣 180 天 run 的冠軍 19 筆交易，fitness 只罰 0.05，
+# exploration gate 卻直接否決。fitness 與 gate 各自最佳化不同目標。
+# 提成模組常數後，兩邊共用同一份數字。
+EXPLORATION_PNL_365D_PCT = 10.0
+EXPLORATION_MAXDD_365D_PCT = 10.0
+EXPLORATION_PF = 1.2
+EXPLORATION_PF_STRONG = 1.6
+EXPLORATION_SHARPE = 0.3
+EXPLORATION_WIN_PCT = 35.0
+EXPLORATION_TRADES = 60
+
 
 def exploration_validator(
     db,
     code: str,
-    threshold_365d_pnl_pct: float = 10.0,  # Relaxed: 10% instead of 20%
+    threshold_365d_pnl_pct: float = EXPLORATION_PNL_365D_PCT,
     # 2026-10-07: 12% → 10%。實測 leverage 1→2 讓 PnL 22.53%→49.06%（約 2.18 倍，
     # 名目倉位灌水），MaxDD 只從 4.72% 升到 9.20%，靠舊的 12% 探索門檻通過。
     # 嚴格門檻是 8% 會擋下，但探索期不該放寬到讓槓桿灌水過關。
-    threshold_maxdd_pct: float = 10.0,     # Relaxed: 10% instead of 8%
-    threshold_pf: float = 1.2,             # Relaxed: 1.2 instead of 1.5
-    threshold_pf_strong: float = 1.6,      # Relaxed: 1.6 instead of 2.0
-    threshold_sharpe: float = 0.3,          # Relaxed: 0.3 instead of 0.5
-    threshold_win_pct: float = 35.0,        # 與嚴格版相同（勝率已非重點）
+    threshold_maxdd_pct: float = EXPLORATION_MAXDD_365D_PCT,
+    threshold_pf: float = EXPLORATION_PF,
+    threshold_pf_strong: float = EXPLORATION_PF_STRONG,
+    threshold_sharpe: float = EXPLORATION_SHARPE,
+    threshold_win_pct: float = EXPLORATION_WIN_PCT,   # 與嚴格版相同（勝率已非重點）
     # 2026-10-07: 20 → 60。原意是「探索期寬鬆」，但 20 筆太少了 ——
     # 鄰域穩健性測試證明 35 筆的策略擾動後中位 PnL 是 −17.55%。
     # 下界 20 等於允許 GA 用不可估計的樣本量堆 PnL。與 fitness 的
     # TRADE_COUNT_MIN=60 對齊。
-    threshold_trades: int = 60,             # 對齊 fitness TRADE_COUNT_MIN
+    threshold_trades: int = EXPLORATION_TRADES,       # 對齊 fitness TRADE_COUNT_MIN
     symbols: Optional[List[str]] = None,
     exchange: str = "hyperliquid",
     fast_fail: bool = True,

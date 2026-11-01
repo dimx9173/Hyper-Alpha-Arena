@@ -437,13 +437,35 @@ def set_exploration_gens(n: int) -> None:
     EXPLORATION_GENS_OVERRIDE = int(n) if n and int(n) > 0 else 0
 
 
-def _gate_thresholds() -> Dict[str, float]:
-    """從 ab_validators 讀取 gate 門檻，避免兩處常數漂移。"""
+def _gate_thresholds(phase: str = "strict") -> Dict[str, float]:
+    """從 ab_validators 讀取 gate 門檻，避免兩處常數漂移。
+
+    phase="strict"       -> annual_validator 的嚴格期門檻
+    phase="exploration"  -> exploration_validator 的放寬期門檻
+
+    fitness 必須用「當前實際在判生死的那組」門檻，否則兩者最佳化不同目標：
+    探索期用嚴格期門檻算違規量時，trades 門檻是 20 而非 60，
+    19 筆交易的個體只被罰 0.05 分，卻被 exploration gate 直接否決。
+    """
     try:
         from backtest.ab_validators import (
             PNL_365D_PCT, MAXDD_365D_PCT, MIN_PF, MIN_SHARPE,
             MIN_WIN_PCT, MIN_TRADES_365D, MAX_TRADES_PER_YEAR, MIN_PF_STRONG,
+            EXPLORATION_PNL_365D_PCT, EXPLORATION_MAXDD_365D_PCT,
+            EXPLORATION_PF, EXPLORATION_SHARPE, EXPLORATION_WIN_PCT,
+            EXPLORATION_PF_STRONG, EXPLORATION_TRADES,
         )
+        if phase == "exploration":
+            return {
+                "pnl": float(EXPLORATION_PNL_365D_PCT),
+                "dd": float(EXPLORATION_MAXDD_365D_PCT),
+                "pf": float(EXPLORATION_PF),
+                "sharpe": float(EXPLORATION_SHARPE),
+                "win": float(EXPLORATION_WIN_PCT),
+                "trades": float(EXPLORATION_TRADES),
+                "max_trades": float(MAX_TRADES_PER_YEAR),
+                "pf_strong": float(EXPLORATION_PF_STRONG),
+            }
         return {
             "pnl": float(PNL_365D_PCT), "dd": float(MAXDD_365D_PCT),
             "pf": float(MIN_PF), "sharpe": float(MIN_SHARPE),
@@ -452,18 +474,23 @@ def _gate_thresholds() -> Dict[str, float]:
             "pf_strong": float(MIN_PF_STRONG),
         }
     except Exception:
+        if phase == "exploration":
+            return {"pnl": 10.0, "dd": 10.0, "pf": 1.2, "sharpe": 0.3,
+                    "win": 35.0, "trades": 60.0, "max_trades": 730.0,
+                    "pf_strong": 1.6}
         return {"pnl": 20.0, "dd": 8.0, "pf": 1.5, "sharpe": 0.5,
                 "win": 35.0, "trades": 20.0, "max_trades": 730.0,
                 "pf_strong": 2.0}
 
 
-def gate_violation(result: "EvalResult") -> float:
-    """相對違規量：0 = 完全通過嚴格 gate；1 = 至少一項差距達門檻的 100%。
+def gate_violation(result: "EvalResult", phase: str = "strict") -> float:
+    """相對違規量：0 = 完全通過該階段 gate；1 = 至少一項差距達門檻的 100%。
 
-    必須與 ab_validators.annual_validator 的 cond 判斷保持一致，
+    必須與 ab_validators 對應 validator 的 cond 判斷保持一致，
     否則 fitness 與 gate 會各自最佳化不同目標。
+    phase 決定用哪一組門檻（strict / exploration）。
     """
-    t = _gate_thresholds()
+    t = _gate_thresholds(phase)
     dd = float(result.maxdd_365d if result.maxdd_365d is not None else 100.0)
     # 2026-09-27 修正：pf_ok 原本是 0/1 二元項。
     # 實測 30 代 smoke：族群 600 個個體的 violation 中位數正好 1.000，
@@ -574,10 +601,13 @@ def calculate_exploration_fitness(result: EvalResult) -> float:
     # PF 貢獻 (0 ~ 0.1)：與嚴格版共用 pf_score，消除 if pf>1.0 階梯與 None 語義相反
     fitness += pf_score(result.pf) * 0.1
 
-    # 連續 gate 懲罰（2026-09-27 新增，權重為嚴格期一半）：
-    # 沒有這一項時，族群會漂向 1~4 筆交易的個體（低 DD、高 PF）而全部無法過 gate。
-    # 懲罰量取自與 strict 相同的 gate_violation，確保兩期目標一致、換期不跳變。
-    fitness -= EXPLORATION_GATE_PENALTY_W * min(gate_violation(result), GATE_VIOLATION_CAP)
+    # 2026-11-01 修正：改用 exploration 門檻算違規量。
+    # 原本用嚴格期門檻（trades=20），而這個 fitness 只在探索期使用，
+    # 實際判生死的是 exploration_validator（trades=60）。結果 19 筆交易的
+    # 冠軍在 fitness 只被罰 0.05，卻被 gate 直接否決 —— 兩個目標互相打架。
+    fitness -= EXPLORATION_GATE_PENALTY_W * min(
+        gate_violation(result, "exploration"), GATE_VIOLATION_CAP
+    )
 
     return fitness
 
@@ -941,7 +971,7 @@ def evaluate_individual(genome_dict: Dict, symbols: List[str], exchange: str = "
         for w_end, w_days, w_weight in windows:
             wg, winfo = validate(
                 db, code, symbols=symbols, exchange=exchange,
-                fast_fail=True, max_triggers=50000,
+                fast_fail=True, max_triggers=8000,
                 backtest_days=w_days, end_time_ms=w_end
             )
             per_window.append((w_end, w_days, float(w_weight), wg, winfo))
