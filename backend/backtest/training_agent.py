@@ -106,11 +106,23 @@ Risk params: tp_pct [0.04,0.12], sl_pct [0.02,0.08], portion [0.15,0.5], leverag
 logic must be exactly "all_pass" (declared filters all pass together).
 
 Goal: maximize fitness on the same backtest windows as the baseline.
+Fitness reality (work within it, do not fight it):
+- Trade sweet spot is 60-150 per year. Below 60 is penalized linearly
+  (sample too small); above 150 is penalized quadratically (cost erosion).
+  A very low trade count only survives when MaxDD is tiny, so never raise
+  trade count unless MaxDD stays under 8%.
+- MaxDD above 8% is penalized heavily. Keep portion x leverage small enough
+  that an adverse move stays inside budget.
+- Each added filter ANDs another gate and usually removes trades. Prefer
+  tuning the current structure over adding filters.
 Hard rules:
 1. Output ONE valid JSON object only — no explanation, no markdown outside the JSON.
 2. Every param within the ranges above.
 3. Between 1 and 4 filters (max 4).
-4. Change something meaningful vs. the baseline (structure or tuning)."""
+4. Change something meaningful vs. the baseline (structure or tuning).
+5. Keep the trade count within +/-50% of the baseline unless you also cut
+   portion and leverage to pay for the extra turnover.
+"""
 
 USER_PROMPT_TEMPLATE = """Baseline spec (fitness {fitness}, gate={gate}, pnl={pnl}%, \
 maxdd={maxdd}%, sharpe={sharpe}, pf={pf}, trades={trades}):
