@@ -763,7 +763,8 @@ DEFAULT_SYMBOLS = [
 ]
 
 
-def render_strategy(genome: Genome, symbols: Optional[List[str]] = None) -> str:
+def render_strategy(genome: Genome, symbols: Optional[List[str]] = None,
+                    kline_period: str = "1h") -> str:
     """將基因組渲染為策略代碼
 
     Args:
@@ -771,6 +772,11 @@ def render_strategy(genome: Genome, symbols: Optional[List[str]] = None) -> str:
         symbols: 策略要掃描的標的清單。None 時用 DEFAULT_SYMBOLS。
                  **必須與回測引擎的 symbols 一致**，否則策略會對引擎
                  沒載入資料的標的發出請求，造成無限重試（見 DEFAULT_SYMBOLS 註解）。
+        kline_period: 策略讀取的 K 線週期。HL 的 1h 歷史只有約半年，
+                 2h/4h/1d 有整年；整年視窗的 refit 用「2h」跑，
+                 半年視窗保持「1h」。注意：kline 數量閾值（ema_slow+30 等）
+                 是按根數算的，同樣的 EMA 週期在 2h 上覆蓋的時間更長，
+                 訊號頻率會比 1h 更低，這是換週期的預期行為不是 bug。
     """
     syms = list(symbols) if symbols else list(DEFAULT_SYMBOLS)
     syms_literal = ", ".join(f'"{s}"' for s in syms)
@@ -800,7 +806,7 @@ def render_strategy(genome: Genome, symbols: Optional[List[str]] = None) -> str:
     code_parts.append('            price = data.get_price(symbol)')
     code_parts.append('            if price == 0:')
     code_parts.append('                continue')
-    code_parts.append('            klines = data.get_klines(symbol, "1h", ' + str(genome.ema_slow + 30) + ')')
+    code_parts.append('            klines = data.get_klines(symbol, "{P}", ' + str(genome.ema_slow + 30) + ')')
     code_parts.append('            if len(klines) < ' + str(genome.ema_slow + 10) + ':')
     code_parts.append('                continue')
     code_parts.append('            closes = [k.close for k in klines]')
@@ -826,7 +832,7 @@ def render_strategy(genome: Genome, symbols: Optional[List[str]] = None) -> str:
         # 新語義：動能帶狀濾網，與突破進場相容，並讓兩個門檻都有作用。
         #   - RSI <= rsi_buy_thr  -> 動能不足，跳過
         #   - RSI >= rsi_sell_thr -> 過熱，不追高
-        code_parts.append('            rsi_info = data.get_indicator(symbol, "RSI14", "1h")')
+        code_parts.append('            rsi_info = data.get_indicator(symbol, "RSI14", "{P}")')
         code_parts.append('            rsi = rsi_info.get("value", 50) if isinstance(rsi_info, dict) else 50')
         code_parts.append('            if rsi is None:')
         code_parts.append('                rsi = 50')
@@ -869,7 +875,7 @@ def render_strategy(genome: Genome, symbols: Optional[List[str]] = None) -> str:
         sfx = '' if swing == 5 else '_' + str(swing)
 
         code_parts.append('            # --- ICT/SMC 結構確認 ---')
-        code_parts.append('            ote_info = data.get_indicator(symbol, "ICT_OTE' + sfx + '", "1h")')
+        code_parts.append('            ote_info = data.get_indicator(symbol, "ICT_OTE' + sfx + '", "{P}")')
         code_parts.append('            if not isinstance(ote_info, dict):')
         code_parts.append('                ote_info = {}')
         code_parts.append('            ote_score = ote_info.get("value", 0.0) or 0.0')
@@ -890,14 +896,14 @@ def render_strategy(genome: Genome, symbols: Optional[List[str]] = None) -> str:
 
         # 條件 3：結構方向必須為多
         if genome.ict_require_bull_structure:
-            code_parts.append('            st_info = data.get_indicator(symbol, "ICT_STRUCTURE' + sfx + '", "1h")')
+            code_parts.append('            st_info = data.get_indicator(symbol, "ICT_STRUCTURE' + sfx + '", "{P}")')
             code_parts.append('            st_dir = st_info.get("direction") if isinstance(st_info, dict) else None')
             code_parts.append('            if st_dir != "up":')
             code_parts.append('                ict_pass = False')
 
         # 條件 4：必須在 discount 區
         if genome.ict_require_discount:
-            code_parts.append('            pd_info = data.get_indicator(symbol, "ICT_PREMIUM_DISCOUNT", "1h")')
+            code_parts.append('            pd_info = data.get_indicator(symbol, "ICT_PREMIUM_DISCOUNT", "{P}")')
             # ICT 完整 payload 沒有直接的 zone 欄位，改用 OTE 內的資訊：
             # score 達標且非 premium 語義 —— 用 OTE 的 block 命中狀態近似。
             # 更精確的做法是讀 premium_discount，但那是完整 payload 的一部分，
@@ -912,13 +918,16 @@ def render_strategy(genome: Genome, symbols: Optional[List[str]] = None) -> str:
     code_parts.append('            return Decision(operation="buy", symbol=symbol, reason="ema-donch-ict-ga", target_portion_of_balance=' + str(round(genome.portion, 2)) + ', leverage=' + str(genome.leverage) + ', max_price=price*1.004, take_profit_price=price*' + str(round(1 + genome.tp_pct, 2)) + ', stop_loss_price=price*' + str(round(1 - genome.sl_pct, 2)) + ', sl_execution="market")')
     code_parts.append('        return Decision(operation="hold", symbol="BTC", reason="no signal")')
     
-    return '\n'.join(code_parts)
+    code = "\n".join(code_parts)
+    return code.replace("{P}", kline_period)
+
+
 
 
 
 # ========== 單個體評估（供並行調用） ==========
 
-def evaluate_individual(genome_dict: Dict, symbols: List[str], exchange: str = "hyperliquid", generation: int = 0, total_generations: int = 100, backtest_days: int = 365, end_time_ms: Optional[int] = None, windows: Optional[List[Tuple[int, int, float]]] = None) -> Dict:
+def evaluate_individual(genome_dict: Dict, symbols: List[str], exchange: str = "hyperliquid", generation: int = 0, total_generations: int = 100, backtest_days: int = 365, end_time_ms: Optional[int] = None, windows: Optional[List[Tuple[int, int, float]]] = None, kline_period: str = "1h") -> Dict:
     """在子進程中評估單個體 - 必須是頂層函數以支持 pickling
     
     Uses relaxed thresholds for early generations (exploration phase),
@@ -932,7 +941,7 @@ def evaluate_individual(genome_dict: Dict, symbols: List[str], exchange: str = "
     from database.connection import SessionLocal
     
     genome = Genome.from_dict(genome_dict)
-    code = render_strategy(genome, symbols=symbols)
+    code = render_strategy(genome, symbols=symbols, kline_period=kline_period)
     
     # Use relaxed validator for early generations (first 50%)
     # Transition to strict validator for later generations

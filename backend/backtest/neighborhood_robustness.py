@@ -98,10 +98,11 @@ def perturb(genome: Dict[str, Any], rate: float, rng: random.Random) -> Dict[str
 
 
 def evaluate(genome: Dict[str, Any], symbols: List[str], days: int,
-             end_ms: int, max_triggers: Optional[int]) -> Optional[Dict[str, Any]]:
+             end_ms: int, max_triggers: Optional[int],
+             kline_period: str = "1h") -> Optional[Dict[str, Any]]:
     db = SessionLocal()
     try:
-        code = render_strategy(Genome(**genome), symbols=symbols)
+        code = render_strategy(Genome(**genome), symbols=symbols, kline_period=kline_period)
         ok, info = exploration_validator(
             db, code, symbols=symbols, exchange="hyperliquid",
             fast_fail=True, max_triggers=max_triggers,
@@ -155,6 +156,7 @@ def main() -> int:
     ap.add_argument("--backtest-days", type=int, default=180)
     ap.add_argument("--end-time-ms", type=int, default=None)
     ap.add_argument("--max-triggers", type=int, default=8000)
+    ap.add_argument("--kline-period", type=str, default="1h")
     ap.add_argument("--seed", type=int, default=1234)
     args = ap.parse_args()
 
@@ -169,7 +171,7 @@ def main() -> int:
     print()
 
     t0 = time.time()
-    base = evaluate(genome, symbols, args.backtest_days, args.end_time_ms, args.max_triggers)
+    base = evaluate(genome, symbols, args.backtest_days, args.end_time_ms, args.max_triggers, args.kline_period)
     if base is None:
         print("基準評估失敗，中止。", file=sys.stderr)
         return 1
@@ -185,7 +187,7 @@ def main() -> int:
         print(f"擾動 ±{rate*100:.0f}% ...")
         for i in range(args.neighbors):
             nb = perturb(genome, rate, rng)
-            res = evaluate(nb, symbols, args.backtest_days, args.end_time_ms, args.max_triggers)
+            res = evaluate(nb, symbols, args.backtest_days, args.end_time_ms, args.max_triggers, args.kline_period)
             if res is not None:
                 samples.append(res)
             if (i + 1) % 5 == 0:

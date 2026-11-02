@@ -150,6 +150,8 @@ def main():
                         help="fixed number of leading exploration generations; "
                              "default = max(3, int(generations * 0.5))")
     parser.add_argument("--backtest-days", type=int, default=365, help="backtest window; >365 reports average annual metrics")
+    parser.add_argument("--kline-period", type=str, default="1h",
+                        help="K 線週期。HL 的 1h 只有約半年整，整年 refit 用 2h。")
     args = parser.parse_args()
 
     # 決定性：固定 random 種子。
@@ -277,7 +279,7 @@ def main():
         eval_futures = []
         with ProcessPoolExecutor(max_workers=args.workers) as executor:
             for ind in population:
-                future = executor.submit(evaluate_individual, ind.to_dict(), symbols, args.exchange, gen, args.generations, args.backtest_days, end_time_ms, windows)
+                future = executor.submit(evaluate_individual, ind.to_dict(), symbols, args.exchange, gen, args.generations, args.backtest_days, end_time_ms, windows, args.kline_period)
                 eval_futures.append(future)
 
             eval_results = []
@@ -360,7 +362,7 @@ def main():
             no_improve_count = 0
             # Write best code immediately
             try:
-                best_code_path.write_text(render_strategy(best_genome), encoding="utf-8")
+                best_code_path.write_text(render_strategy(best_genome, kline_period=args.kline_period), encoding="utf-8")
             except Exception:
                 pass
             # Store best individual metrics

@@ -94,7 +94,7 @@ class HistoricalDataProvider:
         for symbol in self.symbols:
             # Preload common periods
             # Hyperliquid 無 1m（candleSnapshot 不支援），改以 5m 承接價格/指標，跳過 1m 以避免每幣次數 fetch 空轉/報錯
-            periods = ["5m", "15m", "1h", "4h", "1d"] if self.exchange == "hyperliquid" else (["1h"] if self.exchange == "binance" else ["1m", "5m", "15m", "1h", "4h", "1d"])
+            periods = ["2h", "5m", "15m", "1h", "4h", "1d"] if self.exchange == "hyperliquid" else (["1h"] if self.exchange == "binance" else ["1m", "5m", "15m", "1h", "4h", "1d"])
             for period in periods:
                 self._load_klines_to_cache(symbol, period)
 
@@ -177,8 +177,11 @@ class HistoricalDataProvider:
         timestamp_sec = timestamp_ms // 1000
 
         # Try cached klines first (most reliable for backtest)
-        # Order by granularity: 1h, 15m, 5m, 4h, 1d
-        for period in ["1h", "15m", "5m", "4h", "1d"]:
+        # Order: finest granularity first; include 2h (year-round in HL).
+        # Only periods present in _kline_cache qualify — preload covers
+        # 2h/5m/15m/1h/4h/1d on HL, so a non-preloaded request never silently
+        # hits DB at coarser granularity than the strategy asked for.
+        for period in ["5m", "15m", "1h", "2h", "4h", "1d"]:
             ck = f"{symbol}_{period}"
             if ck in self._kline_cache and self._kline_cache[ck]:
                 klines = self._kline_cache[ck]
@@ -194,15 +197,14 @@ class HistoricalDataProvider:
                 idx = lo - 1
                 if idx >= 0:
                     return klines[idx]["close"]
-                # 沒有任何 bar 的時間 <= 請求時間：代表請求時間早於這段快取。
-                logger.warning(
-                    "no closed bar at or before ts=%s for %s/%s "
-                    "(cache spans %s..%s) — treating price as unavailable "
-                    "instead of leaking a future price",
+                # 沒有任何 bar 的時間 <= 請求時間：這個週期的快取起始晚於請求時間，
+                # 換下一個週期（更粗的週期通常有更早的資料），不要 break。
+                # 5m 只有 17 天的歷史，5m 缺最舊的時間戳不代表 2h/1d 也缺。
+                logger.debug(
+                    "no closed bar before ts=%s for %s/%s, trying next period",
                     timestamp_sec, symbol, period,
-                    klines[0]["timestamp"], klines[-1]["timestamp"],
                 )
-                break
+                continue
 
         # Final fallback: DB query for kline (any period)
         try:
