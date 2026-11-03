@@ -5,9 +5,9 @@
   cd backend
   export DATABASE_URL="postgresql://alpha_user:alpha_pass@/alpha_arena?host=/tmp"
   .venv/bin/python backtest/run_training_contrast.py \
-    --baseline /tmp/best_r2_genome.json --rounds 10 --backtest-days 180 \
+    --baseline /tmp/best_r2_genome.json --rounds 10 --backtest-days 90 \
     --end-time-ms 1788000000000 --kline-period 1h \
-    --symbols BTC,ETH,SOL,HYPE,DOGE,SUI --log-file /tmp/training_contrast.jsonl
+    --symbols BTC --log-file /tmp/training_contrast.jsonl
 """
 import argparse
 import json
@@ -20,10 +20,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--baseline", required=True)
     ap.add_argument("--rounds", type=int, default=10)
-    ap.add_argument("--backtest-days", type=int, default=180)
+    ap.add_argument("--backtest-days", type=int, default=90)
     ap.add_argument("--end-time-ms", type=int, default=None)
     ap.add_argument("--kline-period", default="1h")
-    ap.add_argument("--symbols", default="BTC,ETH,SOL,HYPE,DOGE,SUI")
+    ap.add_argument("--symbols", default="BTC")
     ap.add_argument("--log-file", default="/tmp/training_contrast.jsonl")
     args = ap.parse_args()
 
