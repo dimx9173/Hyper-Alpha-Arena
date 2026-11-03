@@ -4,7 +4,7 @@
 --------
 - JEV（SystemOne）是核驗器，不是生成器：吃結構化 state + 五個 typed 問，
   回 typed choice + probabilities + confidence，不吃自由文字。
-- trade agent 輸出的是 Dropout Decision（生成）。本模組把 Decision + MarketData
+- trade agent 輸出的是 Decision（生成）。本模組把 Decision + MarketData
   翻成 JEV state（build_jev_state，通用：任何給出 symbol/operation/portion/
   leverage/price 的來源都能用），再交給 evaluate_gate 審。
 - 呼叫形狀照抄 QuantDinger app/services/ai_decision_filter.py：
@@ -14,6 +14,11 @@
   >= min_confidence）→ reject。
 - 無 JEV_API_KEY 時 fail open（回 True, "jev_not_configured"），與 QuantDinger
   一致；每次評估最多一次 HTTP 呼叫，timeout 可調。
+- 兩種模式（JEV_GATE_MODE）：
+  - "jes"（預設，真 SystemOne）：POST {base}/systemone，吃 typed 五問。
+  - "llm"：base_url 指向普通 OpenAI 相容 gateway（例如 auto-free），
+    把 state 文字翻成五個二選一 prompt 平行問模型，解析 verdict。
+    適用於「模型不支援 SystemOne API」但仍能答題的情況。
 - 本檔案是新增檔案，零修改既有檔案。
 """
 
@@ -136,6 +141,12 @@ def load_jev_config(env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     Key 放 repo 根目錄 `.env`（跟 DATABASE_URL / HYPERLIQUID_ENCRYPTION_KEY
     同一檔）；backend/main.py 的 load_dotenv() 會載入，shell 版用
     `set -a && . .env && set +a`。
+
+    兩種模式（JEV_GATE_MODE）：
+    - "jes"（預設，真 SystemOne）：POST {base}/systemone，吃 typed 五問。
+    - "llm"：base_url 指向普通 OpenAI 相容 gateway（例如 auto-free），
+      把 state 文字翻成五個二選一 prompt 平行問模型，解析 verdict。
+      適用於「模型不支援 SystemOne API」但仍能答題的情況。
     JEV_API_KEY 缺席 → configured=False → evaluate_gate fail open。
     """
     source = env if env is not None else os.environ
@@ -146,6 +157,7 @@ def load_jev_config(env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         "base_url": (source.get("JEV_BASE_URL") or
                      "https://api.typesafe.ai/v1").strip(),
         "model": (source.get("JEV_MODEL") or "jev-latest").strip(),
+        "gate_mode": (source.get("JEV_GATE_MODE") or "jes").strip().lower(),
         "timeout_seconds": float(source.get("JEV_TIMEOUT_SECONDS") or 8),
         "min_confidence": float(source.get("JEV_MIN_CONFIDENCE") or 0.55),
     }
@@ -285,6 +297,11 @@ def evaluate_gate(
     if not config.get("configured") or not config.get("api_key"):
         return True, "jev_not_configured", None, []
 
+    mode = config.get("gate_mode", "jes")
+    if mode == "llm":
+        return _evaluate_gate_llm(state, config)
+
+    # JES (SystemOne) path
     url = config["base_url"].strip().rstrip("/")
     url = url if url.endswith("/systemone") else f"{url}/systemone"
 
@@ -330,9 +347,107 @@ def evaluate_gate(
     for name in ("risk_check", "execution_quality"):
         conf = results[name][2]
         if conf is None or conf < min_conf:
-            # QuantDinger 同語義：低於門檻視為足以判斷，不 fail open 該單，
-            # 直接擋 — 這裡記錄後繼續走（fail closed on low confidence）
             return (False, f"jev_rejected:low_confidence_{name}", conf, checks)
+
+    risk_choice, _, risk_conf = results["risk_check"]
+    exec_choice, _, exec_conf = results["execution_quality"]
+    signal_choice, _, signal_conf = results["signal_alignment"]
+    regime_choice, _, regime_conf = results["market_regime"]
+
+    directional_block = (
+        signal_choice == "conflict"
+        and regime_choice == "adverse"
+        and float(signal_conf or 0) >= min_conf
+        and float(regime_conf or 0) >= min_conf
+    )
+    allowed = (
+        risk_choice != "block"
+        and exec_choice != "block"
+        and not directional_block
+    )
+    if allowed:
+        reason = "jev_entry_approved"
+    elif risk_choice == "block":
+        reason = "jev_entry_rejected:risk_block"
+    elif exec_choice == "block":
+        reason = "jev_entry_rejected:execution_block"
+    elif directional_block:
+        reason = "jev_entry_rejected:signal_conflict"
+    else:
+        reason = "jev_entry_rejected"
+    if risk_choice == "block":
+        confidence = risk_conf
+    elif exec_choice == "block":
+        confidence = exec_conf
+    elif directional_block:
+        confidence = min(float(signal_conf or 0), float(regime_conf or 0))
+    else:
+        confidence = min(float(risk_conf or 0), float(exec_conf or 0))
+    return allowed, reason, confidence, checks
+
+
+def _evaluate_gate_llm(
+    state: Dict[str, Any],
+    config: Dict[str, Any],
+) -> Tuple[bool, str, Optional[float], List[Dict[str, Any]]]:
+    """LLM fallback：把 state 文字送給普通 OpenAI 相容 endpoint，
+    五問平行問，解析 verdict。"""
+    import requests
+    text = state_text(state)
+    url = config["base_url"].strip().rstrip("/")
+    if not url.endswith("/chat/completions"):
+        url = f"{url}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {config.get('api_key', '')}",
+        "Content-Type": "application/json",
+    }
+    model = config.get("model") or "auto-free"
+    timeout = max(1.0, min(float(config.get("timeout_seconds") or 8), 30.0))
+
+    results: Dict[str, Tuple[str, Dict[str, float], Optional[float]]] = {}
+    checks: List[Dict[str, Any]] = []
+    min_conf = max(0.0, min(float(config.get("min_confidence") or 0.55), 1.0))
+
+    for name, q in JEV_QUESTIONS.items():
+        opts = "/".join(q["criteria"].keys())
+        prompt = f"""State: {text}
+
+Question: {q['instructions']}
+Options: {opts}
+Reply with EXACTLY one of the options, no other text."""
+
+        try:
+            r = requests.post(
+                url,
+                headers=headers,
+                json={"model": model, "messages": [
+                    {"role": "system", "content": "You are a pre-trade risk gate. Output one option only."},
+                    {"role": "user", "content": prompt}
+                ], "max_tokens": 20, "temperature": 0.0},
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            choice = r.json()["choices"][0]["message"]["content"].strip().lower()
+        except Exception:
+            choice = "insufficient"
+
+        if choice not in q["criteria"]:
+            choice = "insufficient"
+        probs = {choice: 1.0}
+        conf = 1.0 if choice != "insufficient" else 0.0
+        results[name] = (choice, probs, conf)
+        checks.append({
+            "name": name,
+            "result": choice,
+            "confidence": conf,
+            "probabilities": probs,
+        })
+
+    # reuse JES decision logic
+    for nm in ("risk_check", "execution_quality"):
+        conf = results[nm][2]
+        if conf is None or conf < min_conf:
+            return (False, f"jev_rejected:low_confidence_{nm}", conf, checks)
 
     risk_choice, _, risk_conf = results["risk_check"]
     exec_choice, _, exec_conf = results["execution_quality"]
