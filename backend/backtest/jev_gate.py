@@ -131,8 +131,11 @@ ENTRY_ACTIONS = {"open_long", "open_short", "add_long", "add_short", "buy", "sel
 # ========== config ==========
 
 def load_jev_config(env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    """JEV 設定：環境變數優先，可傳自訂 env dict 測試。
+    """JEV 設定：從環境變數讀，可傳自訂 env dict 測試。
 
+    Key 放 repo 根目錄 `.env`（跟 DATABASE_URL / HYPERLIQUID_ENCRYPTION_KEY
+    同一檔）；backend/main.py 的 load_dotenv() 會載入，shell 版用
+    `set -a && . .env && set +a`。
     JEV_API_KEY 缺席 → configured=False → evaluate_gate fail open。
     """
     source = env if env is not None else os.environ
