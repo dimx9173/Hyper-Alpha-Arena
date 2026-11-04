@@ -93,6 +93,10 @@ def calculate_indicators(kline_data: List[Dict[str, Any]], indicators: List[str]
                         logger.warning(f"Unknown indicator: {indicator}")
                 elif indicator == 'OBV':
                     results['OBV'] = _calculate_obv(df)
+                elif indicator.startswith('ICT'):
+                    results[indicator] = _calculate_ict(df, indicator)
+                else:
+                    logger.warning(f"Unknown indicator: {indicator}")
 
             except Exception as e:
                 logger.error(f"Error calculating {indicator}: {e}")
