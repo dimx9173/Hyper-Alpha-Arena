@@ -549,8 +549,19 @@ def evaluate_strategy_code(
     trades = int(f365.get("trades", 0) or 0)
     win = float(f365.get("win", 0) or 0)
 
+    # 從 strategy_code 解析 portion/leverage，用於 gate_violation 的 deploy 項。
+    # 與 EvalResult 同名同義（genome.portion / genome.leverage），讓 fitness
+    # 與 spec 路徑（evaluate_spec_individual）逐位一致。
+    code_portion, code_leverage = _extract_risk_from_code(strategy_code)
+
+    class DummyGenome:
+        def __init__(self):
+            self.portion = code_portion
+            self.leverage = code_leverage
+
     class DummyResult:
         def __init__(self):
+            self.genome = DummyGenome()
             self.pnl_365d = pnl
             self.maxdd_365d = dd
             self.sharpe_365d = sharpe
@@ -577,4 +588,36 @@ def evaluate_strategy_code(
         "spec_id": None,
         "f365": f365,
         "info": info,
+        "risk": {"portion": code_portion, "leverage": code_leverage},
     }
+
+
+_RISK_PATTERNS = [
+    (r"target_portion_of_balance\s*=\s*([\d.]+)", "portion"),
+    (r"portion\s*=\s*([\d.]+)", "portion"),
+    (r"leverage\s*=\s*(\d+)", "leverage"),
+]
+
+
+def _extract_risk_from_code(code: str) -> tuple:
+    """從 strategy_code 解析 portion/leverage，供 gate_violation deploy 項。
+
+    預設 portion=0.35 / leverage=2（與 render_strategy_from_spec 預設一致）。
+    取 code 中最大值（多幣 loop 或多個 Decision 取最大倉位）。
+    解析失敗時 fail-open 回預設，不靜默回 0。
+    """
+    portion = 0.35
+    leverage = 2
+    try:
+        import re as _re
+        portions = [float(m.group(1)) for pat, kind in _RISK_PATTERNS if kind == "portion"
+                    for m in _re.finditer(pat, code)]
+        leverages = [int(m.group(1)) for pat, kind in _RISK_PATTERNS if kind == "leverage"
+                     for m in _re.finditer(pat, code)]
+        if portions:
+            portion = max(p for p in portions if 0 < p <= 1.0) if any(0 < p <= 1.0 for p in portions) else portion
+        if leverages:
+            leverage = max(l for l in leverages if 1 <= l <= 50) if any(1 <= l <= 50 for l in leverages) else leverage
+    except Exception:
+        pass
+    return portion, leverage
