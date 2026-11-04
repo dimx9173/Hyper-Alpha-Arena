@@ -627,6 +627,7 @@ def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
         fitness = float(metrics.get("fitness", -1e9) or -1e9)
         best_fitness = float(best_metrics.get("fitness", -1e9) or -1e9)
         accepted = fitness > best_fitness
+        code = metrics.get("strategy_code") or ""
         history.append({
             "round": round_no,
             "spec_id": metrics.get("spec_id"),
@@ -634,6 +635,13 @@ def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
             "accepted": accepted,
             "error": metrics.get("error"),
             "request": request_text,
+            # 診斷：讓事後能看出每輪到底產出什麼、為什麼 fitness 相同
+            "strategy_code_len": len(code),
+            "strategy_code_head": (code[:200] if code else ""),
+            "risk": metrics.get("risk"),
+            "metrics": {k: metrics.get(k) for k in
+                        ("gate_annual", "pnl_365d", "maxdd_365d", "sharpe_365d",
+                         "pf", "trades_365d", "win_rate")},
         })
         if accepted:
             # For next round, we need a spec dict to feed build_prompt_hyper

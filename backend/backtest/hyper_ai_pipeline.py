@@ -89,7 +89,11 @@ def run_prompt_ai_offline(
         llm_config=llm_config,
     )
     done = _run_stream_to_completion(gen)
-    prompt_text = done.get("prompt_result", "")
+    prompt_text = done.get("prompt_result") or ""
+    if not prompt_text.strip():
+        # Prompt AI 有時只回散文不包 ```prompt fence，導致 prompt_result=None。
+        # 此時用 LLM 的完整回覆當作 spec：它包含策略描述，Program AI 能直接用。
+        prompt_text = (done.get("content") or "").strip()
     return prompt_text, done
 
 
