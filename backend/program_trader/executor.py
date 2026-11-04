@@ -44,6 +44,7 @@ class ExecutionTimeoutError(Exception):
 SAFE_BUILTINS = {
     # Required for class definition
     "__build_class__": __builtins__["__build_class__"] if isinstance(__builtins__, dict) else getattr(__builtins__, "__build_class__"),
+    "__import__": __builtins__["__import__"] if isinstance(__builtins__, dict) else getattr(__builtins__, "__import__"),
     "__name__": "__main__",
     # Basic types and functions
     "abs": abs,

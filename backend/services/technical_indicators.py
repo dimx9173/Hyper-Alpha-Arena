@@ -44,10 +44,14 @@ def calculate_indicators(kline_data: List[Dict[str, Any]], indicators: List[str]
 
         for indicator in indicators:
             try:
-                if indicator == 'EMA20':
+                if indicator == 'EMA12':
+                    results['EMA12'] = _calculate_ema(df, 12)
+                elif indicator == 'EMA20':
                     results['EMA20'] = _calculate_ema(df, 20)
                 elif indicator == 'EMA50':
                     results['EMA50'] = _calculate_ema(df, 50)
+                elif indicator == 'EMA55':
+                    results['EMA55'] = _calculate_ema(df, 55)
                 elif indicator == 'EMA100':
                     results['EMA100'] = _calculate_ema(df, 100)
                 elif indicator == 'MA5':
@@ -66,6 +70,9 @@ def calculate_indicators(kline_data: List[Dict[str, Any]], indicators: List[str]
                     results['BOLL'] = _calculate_bollinger_bands(df)
                 elif indicator == 'ATR14':
                     results['ATR14'] = _calculate_atr(df, 14)
+                elif indicator.startswith('DONCHIAN'):
+                    period = int(indicator.replace('DONCHIAN', '')) if indicator != 'DONCHIAN' else 55
+                    results[indicator] = _calculate_donchian(df, period)
                 elif indicator == 'VWAP':
                     results['VWAP'] = _calculate_vwap(df)
                 elif indicator == 'STOCH':
@@ -269,8 +276,24 @@ def _calculate_bollinger_bands(df: pd.DataFrame, period: int = 20, std: float = 
         return None
 
 
+
+def _calculate_donchian(df: pd.DataFrame, period: int = 55) -> Dict[str, List[float]]:
+    """計算唐奇安通道"""
+    upper = ta.donchian(df['high'], df['low'], lower_length=period, upper_length=period)
+    if upper is None:
+        return {'upper': [], 'middle': [], 'lower': []}
+    # pandas_ta returns columns: DCL_period_period, DCM_period_period, DCU_period_period
+    dc_lower = upper[f'DCL_{period}_{period}']
+    dc_middle = upper[f'DCM_{period}_{period}']
+    dc_upper = upper[f'DCU_{period}_{period}']
+    return {
+        'upper': dc_upper.fillna(0).tolist(),
+        'middle': dc_middle.fillna(0).tolist(),
+        'lower': dc_lower.fillna(0).tolist(),
+    }
+
+
 def _calculate_atr(df: pd.DataFrame, period: int) -> List[float]:
-    """计算平均真实波幅"""
     atr = ta.atr(df['high'], df['low'], df['close'], length=period)
     if atr is None:
         return []
