@@ -1266,6 +1266,10 @@ class AccountProgramBinding(Base):
         TIMESTAMP, server_default=func.current_timestamp(), onupdate=func.current_timestamp()
     )
 
+    # Performance gate
+    gate_status = Column(String(20), nullable=False, default="pending", server_default="pending")
+    last_gate_check_at = Column(TIMESTAMP, nullable=True)
+
     # Relationships
     account = relationship("Account")
     program = relationship("TradingProgram", back_populates="bindings")

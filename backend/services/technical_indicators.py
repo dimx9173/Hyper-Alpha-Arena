@@ -209,8 +209,9 @@ def _calculate_macd(df: pd.DataFrame) -> Dict[str, List[float]]:
 def _calculate_rsi(df: pd.DataFrame, period: int) -> List[float]:
     """计算相对强弱指数"""
     rsi = ta.rsi(df['close'], length=period)
+    if rsi is None:
+        return []
     return rsi.fillna(50).tolist()  # RSI默认值设为50
-
 
 def _calculate_bollinger_bands(df: pd.DataFrame, period: int = 20, std: float = 2) -> Dict[str, List[float]]:
     """计算布林带"""

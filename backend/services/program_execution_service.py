@@ -40,8 +40,9 @@ from database.models import (
 from program_trader.executor import execute_strategy
 from program_trader.models import MarketData, ActionType
 from program_trader.data_provider import DataProvider
-from config.settings import BINANCE_DAILY_QUOTA_LIMIT
 from config.guardrails import MAX_TOTAL_LEVERAGE, MAX_SINGLE_COIN, MAX_CLUSTER, CLUSTER
+from config.settings import BINANCE_DAILY_QUOTA_LIMIT
+from backtest.ab_validators import exploration_validator
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,91 @@ class ProgramExecutionService:
         self._cache_refresh_interval = 60  # Refresh cache every 60 seconds
         self._daily_quota_limit = BINANCE_DAILY_QUOTA_LIMIT
         logger.info("[ProgramExecution] Service initialized")
+
+    GATE_RECHECK_HOURS = 24
+
+    def _check_performance_gate(self, db, binding: AccountProgramBinding) -> bool:
+        """Run performance gate validator for the bound program.
+
+        - If gate_status == 'fail', binding is stopped (scheduled_trigger_enabled=False).
+        - If last_gate_check_at > 24h, re-run exploration_validator.
+        - Caches result on binding; 'fail' persists until program is replaced.
+        Returns True if gate passes (or pending/unknown), False if gate fails.
+        """
+        from datetime import timedelta
+        now = datetime.now(timezone.utc)
+
+        # Fast path: already failed gate -> stop binding
+        if binding.gate_status == "fail":
+            logger.warning(
+                f"[ProgramExecution] Binding {binding.id} gate_status=fail, "
+                "deactivating scheduled trigger"
+            )
+            binding.scheduled_trigger_enabled = False
+            db.commit()
+            return False
+
+        # Skip revalidation if cached within 24h
+        if binding.gate_status == "pass" and binding.last_gate_check_at:
+            age = now - _as_utc(binding.last_gate_check_at)
+            if age < timedelta(hours=self.GATE_RECHECK_HOURS):
+                return True
+
+        # Run exploration validator (relaxed thresholds for new/active programs)
+        try:
+            program = db.query(TradingProgram).filter(TradingProgram.id == binding.program_id).first()
+            if not program or not program.code:
+                logger.warning(f"[ProgramExecution] Binding {binding.id}: program not found or no code")
+                binding.gate_status = "fail"
+                binding.last_gate_check_at = now
+                db.commit()
+                return False
+            logger.info(f"[ProgramExecution] Binding {binding.id}: running exploration_validator...")
+            # Only validate on the symbol this binding actually trades
+            # (binding has signal_pool_ids which can be used to infer symbols, or fall back to BTC)
+            symbols = ["BTC"]
+            if binding.signal_pool_ids:
+                try:
+                    from database.models import SignalPool
+                    pool_ids = json.loads(binding.signal_pool_ids)
+                    if pool_ids:
+                        pool = db.query(SignalPool).filter(SignalPool.id == pool_ids[0]).first()
+                        if pool and pool.symbols:
+                            ps = pool.symbols
+                            if isinstance(ps, str):
+                                ps = json.loads(ps)
+                            if ps:
+                                symbols = ps
+                except Exception:
+                    pass
+
+            passed, details = exploration_validator(
+                db, program.code, max_triggers=8000, backtest_days=365,
+                symbols=symbols
+            )
+
+            if passed:
+                binding.gate_status = "pass"
+                logger.info(f"[ProgramExecution] Binding {binding.id}: gate PASSED")
+            else:
+                binding.gate_status = "fail"
+                binding.scheduled_trigger_enabled = False
+                logger.warning(
+                    f"[ProgramExecution] Binding {binding.id}: gate FAILED, "
+                    f"stopping binding. Details: {details}"
+                )
+
+            binding.last_gate_check_at = now
+            db.commit()
+            return passed
+
+        except Exception as e:
+            logger.error(f"[ProgramExecution] Binding {binding.id}: gate check error: {e}")
+            # On error, keep previous status but don't recheck for 24h
+            binding.last_gate_check_at = now
+            db.commit()
+            return binding.gate_status == "pass"
+
 
     def _is_premium_user(self, db) -> bool:
         """Check if current logged-in user is a premium member"""
@@ -266,6 +352,10 @@ class ProgramExecutionService:
 
             if not binding:
                 logger.warning(f"[ProgramExecution] Binding {binding_id} not found or inactive")
+                return
+
+            # Performance gate: stop binding if validator fails (cached 24h)
+            if not self._check_performance_gate(db, binding):
                 return
 
             # Build minimal pool/trigger context for scheduled execution
