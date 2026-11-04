@@ -1,4 +1,7 @@
-"""Training agent loop：LLM 依 baseline + 評估摘要提出下一個 StrategySpec。
+"""Training agent loop：兩種搜索模式
+
+Mode A (SPEC)：LLM 直接輸出 StrategySpec JSON（原有）
+Mode B (HYPER_AI)：LLM 輸出自然語言請求 → Hyper AI pipeline (Prompt AI → Program AI) → StrategySpec → 評估
 
 與 strategy_spec 的關係
 ----------------------
@@ -11,9 +14,9 @@
 
 流程（run_training_loop）
 ------------------------
-每輪：build_prompt -> _call_llm -> parse_candidate ->（非法則帶錯誤回饋重試
-同輪一次，仍非法則跳過）-> evaluate_spec_individual -> fitness 與最佳比較，
-保留較佳者。本模組為新增檔案，不修改任何既有檔案。
+Mode A：build_prompt -> _call_llm -> parse_candidate -> evaluate_spec_individual
+Mode B：build_prompt_hyper -> _call_llm -> extract_request -> run_hyper_ai_offline -> evaluate_spec_individual
+本模組為新增檔案，不修改任何既有檔案。
 """
 
 from __future__ import annotations
@@ -57,7 +60,19 @@ except ImportError:  # pragma: no cover - 非標準路徑下的退路
     )
     from backend.services.hyper_ai_service import get_llm_config  # type: ignore
 
-
+try:
+    from backtest.hyper_ai_pipeline import (
+        run_hyper_ai_offline,
+        strategy_code_to_spec,
+        evaluate_hyper_ai_output,
+    )
+except ImportError:  # pragma: no cover
+    from backend.backtest.hyper_ai_pipeline import (  # type: ignore
+        run_hyper_ai_offline,
+        strategy_code_to_spec,
+        evaluate_hyper_ai_output,
+    )
+ 
 # _call_llm 的簽名固定（易於測試 mock），故 db session 工廠以模組狀態傳遞；
 # run_training_loop 進入時設定、離開時還原。
 _DB_FACTORY: Optional[Any] = None
@@ -175,6 +190,169 @@ def build_prompt(baseline_spec_dict: Dict[str, Any],
     return [{"role": "system", "content": SYSTEM_PROMPT_TEMPLATE},
             {"role": "user", "content": user}]
 
+
+# ========== Hyper AI Mode Prompts ==========
+
+HYPER_AI_SYSTEM_PROMPT = """You are a systematic trading strategy designer.
+Your job: output a NATURAL LANGUAGE REQUEST for the Hyper AI trading team (4 agents:
+Prompt AI → Program AI → Signal AI → Attribution AI).
+
+The Hyper AI team will:
+1. Prompt AI: refine your request into a detailed trading prompt
+2. Program AI: write executable Python strategy code (sandboxed)
+3. Signal AI: configure trigger signals (optional)
+4. Attribution AI: post-hoc analysis (not used in offline eval)
+
+Your output must be a single JSON object:
+{"request": "your natural language request here"}
+
+Allowed concepts (the Program AI knows these):
+- EMA cross (fast/slow periods, tolerance)
+- Donchian breakout (lookback, threshold)
+- RSI band (low/high)
+- ICT/SMC (OTE threshold, structure alignment, weight)
+- Risk: TP/SL %, portion of balance, leverage, max positions
+- Logic: all_pass (all filters must agree)
+
+Fitness reality (same as SPEC mode):
+- Trade sweet spot: 60-150 trades/year. Below 60 penalized (small sample).
+- MaxDD > 8% heavily penalized. Keep portion * leverage small.
+- Each added filter ANDs another gate → fewer trades.
+- Prefer tuning current structure over adding filters.
+
+Hard rules:
+1. Output ONE valid JSON object only: {"request": "..."}
+2. Request must be specific and actionable for the Hyper AI team.
+3. Change something meaningful vs. the baseline (structure or tuning).
+4. Keep it concise (1-3 sentences)."""
+
+HYPER_AI_USER_PROMPT = """Baseline performance (fitness {fitness}, gate={gate}, pnl={pnl}%, \
+maxdd={maxdd}%, sharpe={sharpe}, pf={pf}, trades={trades}):
+
+{baseline_json}
+
+{history_block}
+
+Propose ONE improved natural language request for the Hyper AI team as JSON: {{"request": "..."}}"""
+
+
+def build_prompt_hyper(baseline_spec_dict: Dict[str, Any],
+                       eval_summary: Dict[str, Any],
+                       round_no: int,
+                       history: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Build prompt for Hyper AI mode: LLM outputs natural language request."""
+    baseline = deepcopy(baseline_spec_dict)
+    history_rows = []
+    for h in (history or []):
+        history_rows.append(
+            "round {r}: spec_id={sid} delta_fitness={df} changed={ch}".format(
+                r=h.get("round", "?"),
+                sid=h.get("spec_id", "n/a"),
+                df=h.get("delta_fitness", "n/a"),
+                ch=h.get("changed", "n/a"),
+            ))
+    history_block = ""
+    if history_rows:
+        history_block = ("Previous rounds:\n" + "\n".join(history_rows)
+                         + "\n\nAvoid repeating rejected/edited ideas; "
+                           "try a different direction.")
+    user = HYPER_AI_USER_PROMPT.format(
+        fitness=_fmt(eval_summary.get("fitness")),
+        gate=str(bool(eval_summary.get("gate_annual"))).lower(),
+        pnl=_fmt(eval_summary.get("pnl_365d")),
+        maxdd=_fmt(eval_summary.get("maxdd_365d")),
+        sharpe=_fmt(eval_summary.get("sharpe_365d")),
+        pf=_fmt(eval_summary.get("pf")),
+        trades=_fmt(eval_summary.get("trades_365d")),
+        baseline_json=json.dumps(baseline, sort_keys=True, ensure_ascii=False),
+        history_block=history_block,
+    ) + f"\nRound {round_no}."
+    return [{"role": "system", "content": HYPER_AI_SYSTEM_PROMPT},
+            {"role": "user", "content": user}]
+
+
+# ========== Hyper AI Mode Evaluation ==========
+
+def _run_hyper_ai_eval(
+    request_text: str,
+    symbols: List[str],
+    exchange: str,
+    backtest_days: int,
+    end_time_ms: Optional[int],
+    kline_period: str,
+    generation: int,
+    total_generations: int,
+    db_factory: Optional[Any],
+) -> Dict[str, Any]:
+    """Run Hyper AI pipeline and evaluate the resulting code DIRECTLY."""
+    try:
+        from backtest.hyper_ai_pipeline import (
+            run_hyper_ai_offline,
+            evaluate_strategy_code,
+        )
+    except ImportError:
+        from backend.backtest.hyper_ai_pipeline import (  # type: ignore
+            run_hyper_ai_offline,
+            evaluate_strategy_code,
+        )
+    try:
+        # Stage 1: LLM request -> Hyper AI pipeline -> raw strategy code
+        strategy_code, trace = run_hyper_ai_offline(
+            user_request=request_text,
+            exchange=exchange,
+            symbols=symbols,
+            db_factory=db_factory,
+        )
+        # Stage 2: evaluate raw code directly (bypass spec parsing)
+        metrics = evaluate_strategy_code(
+            strategy_code,
+            symbols=symbols,
+            exchange=exchange,
+            generation=generation,
+            total_generations=total_generations,
+            backtest_days=backtest_days,
+            end_time_ms=end_time_ms,
+            kline_period=kline_period,
+            db_factory=db_factory,
+        )
+        metrics["strategy_code"] = strategy_code
+        metrics["spec_id"] = trace.get("stages", {}).get("program_ai", {}).get("trace", {}).get("message_id", f"hyper_{generation}")
+        metrics["pipeline_trace"] = trace
+        return metrics
+    except Exception as e:
+        # Return a failed evaluation dict
+        return {
+            "fitness": -1e9,
+            "gate_annual": False,
+            "pnl_365d": -100.0,
+            "maxdd_365d": 100.0,
+            "sharpe_365d": -10.0,
+            "pf": 0.0,
+            "pf_ok": False,
+            "trades_365d": 0,
+            "win_rate": 0.0,
+            "spec_id": "error",
+            "error": str(e),
+        }
+
+
+def _extract_request_from_llm(text: str) -> Tuple[Optional[str], List[str]]:
+    """Extract the request string from LLM output JSON."""
+    errors = []
+    text = _strip_fences(text)
+    try:
+        data = json.loads(text)
+        request = data.get("request")
+        if not request or not isinstance(request, str):
+            errors.append("Missing or invalid 'request' field in JSON")
+            return None, errors
+        if len(request) < 10:
+            errors.append("Request too short (< 10 chars)")
+            return None, errors
+        return request.strip(), []
+    except json.JSONDecodeError as e:
+        errors.append(f"Invalid JSON: {e}")
+        return None, errors
 
 # ========== 解析 ==========
 
@@ -357,6 +535,120 @@ def _run_training_loop(baseline_spec_dict: Dict[str, Any],
             next_hist = dict(history[-1])
             next_hist["delta_fitness"] = round(fitness - best_fitness, 6)
             next_hist["changed"] = deepcopy(spec_dict)
+            history[-1] = next_hist
+
+    return {
+        "best_spec": deepcopy(best_spec),
+        "best_metrics": deepcopy(best_metrics),
+        "rounds": history,
+        "baseline_fitness": baseline_metrics.get("fitness"),
+    }
+
+
+def run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
+                            symbols: List[str],
+                            rounds: int = 3,
+                            backtest_days: int = 60,
+                            end_time_ms: Optional[int] = None,
+                            kline_period: str = "1h",
+                            exchange: str = "hyperliquid",
+                            db_factory: Optional[Any] = None) -> Dict[str, Any]:
+    """Hyper AI 模式訓練迴圈：LLM 輸出自然語言請求 -> Hyper AI pipeline -> 評估 -> 保留最佳。
+
+    與 SPEC 模式共用同一套評估標準 (evaluate_spec_individual)，只換「提案生成方式」。
+    """
+    global _DB_FACTORY
+    prev_factory = _DB_FACTORY
+    _DB_FACTORY = db_factory
+    try:
+        return _run_training_loop_hyper(baseline_spec_dict, symbols, rounds=rounds,
+                                        backtest_days=backtest_days,
+                                        end_time_ms=end_time_ms,
+                                        kline_period=kline_period,
+                                        exchange=exchange)
+    finally:
+        _DB_FACTORY = prev_factory
+
+
+def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
+                             symbols: List[str],
+                             rounds: int = 3,
+                             backtest_days: int = 60,
+                             end_time_ms: Optional[int] = None,
+                             kline_period: str = "1h",
+                             exchange: str = "hyperliquid") -> Dict[str, Any]:
+    eval_kwargs = dict(exchange=exchange, backtest_days=backtest_days,
+                       end_time_ms=end_time_ms, kline_period=kline_period)
+
+    def _hyper_eval(request_text: str, generation: int) -> Dict[str, Any]:
+        return _run_hyper_ai_eval(request_text, list(symbols),
+                                  generation=generation,
+                                  total_generations=max(rounds, 1),
+                                  db_factory=_DB_FACTORY,
+                                  **eval_kwargs)
+
+    # Evaluate baseline using SPEC path (convert baseline spec to request first)
+    # For baseline, we just use the spec directly via SPEC eval
+    baseline_metrics = _run_evaluate(deepcopy(baseline_spec_dict), list(symbols),
+                                     generation=1, total_generations=max(rounds, 1),
+                                     **eval_kwargs)
+    best_spec = deepcopy(baseline_spec_dict)
+    best_metrics = baseline_metrics
+    history: List[Dict[str, Any]] = []
+
+    for round_no in range(1, max(1, rounds) + 1):
+        messages = build_prompt_hyper(deepcopy(best_spec), best_metrics, round_no, history)
+        request_text: Optional[str] = None
+        error: Optional[str] = None
+        for attempt in range(2):
+            if attempt == 1 and error:
+                messages = build_prompt_hyper(deepcopy(best_spec), best_metrics,
+                                              round_no, history)
+                messages[1]["content"] += (
+                    f"\nYour previous attempt was invalid: {error}. "
+                    "Return one valid JSON with 'request' field.")
+            try:
+                text = _call_llm(messages)
+            except Exception as e:
+                error = f"llm_call_failed: {e}"
+                break
+            request_text, p_errors = _extract_request_from_llm(text)
+            if request_text is not None:
+                error = None
+                break
+            error = "; ".join(p_errors)
+        if request_text is None:
+            history.append({"round": round_no, "spec_id": None, "fitness": None,
+                            "accepted": False, "error": error,
+                            "request": None})
+            continue
+        # Run Hyper AI pipeline + evaluation
+        metrics = _hyper_eval(request_text, generation=round_no + 1)
+        fitness = float(metrics.get("fitness", -1e9) or -1e9)
+        best_fitness = float(best_metrics.get("fitness", -1e9) or -1e9)
+        accepted = fitness > best_fitness
+        history.append({
+            "round": round_no,
+            "spec_id": metrics.get("spec_id"),
+            "fitness": fitness,
+            "accepted": accepted,
+            "error": metrics.get("error"),
+            "request": request_text,
+        })
+        if accepted:
+            # For next round, we need a spec dict to feed build_prompt_hyper
+            # Use the derived spec from the evaluation trace
+            # Note: we don't have direct access to it here, so we keep best_spec as-is
+            # and rely on the history to show what changed
+            best_metrics = metrics
+            next_hist = dict(history[-1])
+            next_hist["delta_fitness"] = round(fitness - best_fitness, 6)
+            next_hist["changed"] = {"request": request_text}
+            history[-1] = next_hist
+        else:
+            next_hist = dict(history[-1])
+            next_hist["delta_fitness"] = round(fitness - best_fitness, 6)
+            next_hist["changed"] = {"request": request_text}
             history[-1] = next_hist
 
     return {

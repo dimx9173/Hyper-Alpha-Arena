@@ -77,12 +77,22 @@ def calculate_indicators(kline_data: List[Dict[str, Any]], indicators: List[str]
                     results['VWAP'] = _calculate_vwap(df)
                 elif indicator == 'STOCH':
                     results['STOCH'] = _calculate_stochastic(df)
+                elif indicator.startswith('EMA'):
+                    # Generic EMA: EMA12, EMA15, EMA45, EMA200, etc.
+                    try:
+                        period = int(indicator[3:])
+                        results[indicator] = _calculate_ema(df, period)
+                    except ValueError:
+                        logger.warning(f"Unknown indicator: {indicator}")
+                elif indicator.startswith('MA'):
+                    # Generic MA: MA5, MA10, MA20, MA200, etc.
+                    try:
+                        period = int(indicator[2:])
+                        results[indicator] = _calculate_sma(df, period)
+                    except ValueError:
+                        logger.warning(f"Unknown indicator: {indicator}")
                 elif indicator == 'OBV':
                     results['OBV'] = _calculate_obv(df)
-                elif indicator.startswith('ICT'):
-                    results[indicator] = _calculate_ict(df, indicator)
-                else:
-                    logger.warning(f"Unknown indicator: {indicator}")
 
             except Exception as e:
                 logger.error(f"Error calculating {indicator}: {e}")
