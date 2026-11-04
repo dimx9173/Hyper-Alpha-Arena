@@ -230,8 +230,6 @@ def build_jev_state(decision: Any, market_snapshot: Any) -> Dict[str, Any]:
                     "size": getattr(pos, "size", None),
                     "entry_price": getattr(pos, "entry_price", None),
                 }
-            equity = float(getattr(ms, "total_equity", 0.0) or 0.0)
-            used_margin = float(getattr(ms, "used_margin", 0.0) or 0.0)
             for getter, key in (
                 ("get_market_data", "market"),
                 ("get_regime", "regime"),
@@ -242,10 +240,24 @@ def build_jev_state(decision: Any, market_snapshot: Any) -> Dict[str, Any]:
                     if fn is not None:
                         if getter == "get_market_data":
                             market_evidence[key] = fn(symbol) if symbol else {}
+                        elif getter == "get_regime":
+                            regime = fn(symbol, "1h")
+                            # Serialize RegimeInfo to dict
+                            market_evidence[key] = {
+                                "regime": getattr(regime, "regime", None),
+                                "conf": getattr(regime, "conf", None),
+                                "direction": getattr(regime, "direction", None),
+                                "reason": getattr(regime, "reason", None),
+                                "indicators": getattr(regime, "indicators", None) or {},
+                            }
                         else:
                             market_evidence[key] = fn(symbol, "1h")
                 except Exception:
                     pass
+
+            # Extract equity and used_margin from MarketData object attributes
+            equity = float(getattr(ms, "total_equity", 0.0) or 0.0)
+            used_margin = float(getattr(ms, "used_margin", 0.0) or 0.0)
 
     exposure = {
         "equity": equity,
@@ -279,7 +291,74 @@ def state_text(state: Dict[str, Any]) -> str:
     return json.dumps(state, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def state_text_llm(state: Dict[str, Any]) -> str:
+    """LLM-friendly formatted state text for _evaluate_gate_llm.
+    Converts compact JSON into a readable narrative so the LLM can
+    reason about risk/execution questions properly.
+    """
+    lines = []
+    lines.append(f"Source: {state.get('source_type', 'unknown')}")
+    lines.append(f"Symbol: {state.get('symbol', '?')}")
+    lines.append(f"Action: {state.get('action', '?')}")
+    lines.append(f"Market: {state.get('market_type', '?')}")
+    lines.append(f"Order Type: {state.get('order_type', '?')}")
+    lines.append(f"Leverage: {state.get('leverage', '?')}x")
+    lines.append(f"Strategy: {state.get('strategy_type', '?')}")
+    lines.append(f"Signal Reason: {state.get('signal_reason', '?')}")
+
+    # Order details
+    qty = state.get('quantity', 0)
+    notional = state.get('notional', 0)
+    ref_price = state.get('reference_price', 0)
+    if qty > 0 and ref_price > 0:
+        lines.append(f"Order: qty={qty:.6f} @ {ref_price:.2f} (notional ${notional:,.2f})")
+
+    # Context
+    ctx = state.get('context', {})
+    me = ctx.get('market_evidence', {})
+    if me.get('market'):
+        m = me['market']
+        lines.append(f"Market: price=${m.get('price', '?')}, 24h chg={m.get('percentage24h', '?')}%, vol=${m.get('volume24h', '?'):,.0f}, OI=${m.get('open_interest', '?'):,.0f}, funding={m.get('funding_rate', '?')}")
+    if me.get('regime'):
+        r = me['regime']
+        if isinstance(r, dict):
+            lines.append(f"Regime: {r.get('regime', '?')} (conf={r.get('conf', '?'):.2f}, dir={r.get('direction', '?')}) - {r.get('reason', '')[:80]}")
+        else:
+            r_regime = getattr(r, 'regime', '?')
+            r_conf = getattr(r, 'conf', None)
+            r_dir = getattr(r, 'direction', '?')
+            r_reason = getattr(r, 'reason', '')
+            conf_str = f"{r_conf:.2f}" if isinstance(r_conf, (int, float)) else str(r_conf)
+            lines.append(f"Regime: {r_regime} (conf={conf_str}, dir={r_dir}) - {str(r_reason)[:80]}")
+
+    # Exposure - critical for risk_check
+    exp = ctx.get('exposure', {})
+    equity = exp.get('equity', 0)
+    used = exp.get('used_margin', 0)
+    open_pos = exp.get('open_positions', 0)
+    margin_avail = equity - used
+    margin_pct = (margin_avail / equity * 100) if equity > 0 else 0
+    lines.append(f"Portfolio: equity=${equity:,.2f}, used_margin=${used:,.2f}, available=${margin_avail:,.2f} ({margin_pct:.1f}%), open_positions={open_pos}")
+    if exp.get('positions'):
+        for sym, pos in exp['positions'].items():
+            lines.append(f"  {sym}: {pos.get('side', '?')} {pos.get('size', '?')} @ {pos.get('entry_price', '?')}")
+
+    return "\n".join(lines)
+
+
+def _answer(answers: Any, key: str) -> Dict[str, Any]:
+    if isinstance(answers, dict):
+        value = answers.get(key)
+        if isinstance(value, dict):
+            return value
+        nested = answers.get("answers")
+        if isinstance(nested, dict) and isinstance(nested.get(key), dict):
+            return nested[key]
+    return {}
+
+
 # ========== gate ==========
+
 
 def evaluate_gate(
     state: Dict[str, Any],
@@ -393,7 +472,7 @@ def _evaluate_gate_llm(
     """LLM fallback：把 state 文字送給普通 OpenAI 相容 endpoint，
     五問平行問，解析 verdict。"""
     import requests
-    text = state_text(state)
+    text = state_text_llm(state)
     url = config["base_url"].strip().rstrip("/")
     if not url.endswith("/chat/completions"):
         url = f"{url}/chat/completions"
