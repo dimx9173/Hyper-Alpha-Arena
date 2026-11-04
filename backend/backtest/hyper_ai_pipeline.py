@@ -109,74 +109,78 @@ def run_program_ai_offline(
     if not llm_config.get("configured"):
         raise RuntimeError("LLM not configured")
 
-    # Sandbox 相容格式：必須輸出 Strategy + Decision + data.get_price/get_indicator/get_klines
-    # 與 render_strategy_from_spec 完全一致（byte-identical block 形狀）
-    task = f"""Generate a trading strategy program based on this prompt:
+    # Sandbox 相容格式：只給「骨架 + API 清單」，不給可抄的完整範例邏輯。
+    # 先前版本附了完整 EMA12/55+Donchian+RSI 範例，Program AI 直接原樣照抄，
+    # 導致 5 輪訓練全部產出同一份代碼（fitness 幾乎不變）。
+    task = f"""Write a NEW Python trading strategy for this specification:
+
+--- SPECIFICATION START ---
 {prompt_text}
+--- SPECIFICATION END ---
 
 Exchange: {exchange}
 Symbols: {symbols or ['BTC']}
+Kline period: 1h
 
-CRITICAL OUTPUT FORMAT (must be sandbox-compatible):
-Your code MUST follow this EXACT structure:
+The specification above is the ONLY source of trading logic. Implement exactly
+what it says. Do NOT copy any example conditions.
+
+## REQUIRED CLASS SHAPE
 
 ```python
 class Strategy:
     def should_trade(self, data):
-        symbol = data.trigger_symbol or "BTC"
-        price = data.get_price(symbol)
-        if price <= 0:
-            return Decision(operation="hold", symbol=symbol, reason="no price")
-
-        # Use get_indicator with EXACT keys: "EMA12"/"EMA55", "DONCHIAN55", "RSI14"
-        ema_fast = data.get_indicator(symbol, "EMA12", "1h").get("value", 0)
-        ema_slow = data.get_indicator(symbol, "EMA55", "1h").get("value", 0)
-        donchian = data.get_indicator(symbol, "DONCHIAN55", "1h")
-        donchian_high = donchian.get("upper", 0)
-        rsi = data.get_indicator(symbol, "RSI14", "1h").get("value", 50)
-
-        # Trading logic here (adjust periods/thresholds per the prompt)
-        long_cond = (ema_fast > ema_slow and price > donchian_high * 0.99 and 30 <= rsi <= 70)
-
-        positions = data.positions or {{}}
-        has_position = symbol in positions and abs(positions[symbol].size) > 0
-
-        if long_cond and not has_position:
-            return Decision(
-                operation="buy",
-                symbol=symbol,
-                target_portion_of_balance=0.35,
-                leverage=2,
-                max_price=price * 1.001,
-                reason="your reason here",
-                trading_strategy="your description here",
-            )
-
-        if has_position:
-            pos = positions[symbol]
-            if pos.side == "long":
-                if ema_fast < ema_slow:  # exit condition
-                    return Decision(
-                        operation="close",
-                        symbol=symbol,
-                        target_portion_of_balance=1.0,
-                        leverage=pos.leverage,
-                        min_price=price * 0.999,
-                        reason="exit reason",
-                    )
-
-        return Decision(operation="hold", symbol=symbol, reason="no signal")
+        # your logic
 ```
 
-Requirements:
-- Class name MUST be exactly `Strategy` (not MultiIndicatorStrategy, not EMACrossStrategy)
-- Method MUST be `should_trade(self, data)`
-- MUST return Decision objects with operation="buy"/"sell"/"close"/"hold"
-- MUST use data.get_price(symbol), data.get_indicator(symbol, "EMA12"/"EMA55"/"DONCHIAN55"/"RSI14", "1h"), data.positions
-- MUST use Decision(operation=..., symbol=..., target_portion_of_balance=..., leverage=..., max_price/min_price=..., reason=..., trading_strategy=...)
-- Do NOT use data.get_market_data, data.get_klines, data.get_flow, data.get_regime, or any other API
-- Adjust EMA periods (12/55), Donchian lookback (55), threshold (0.99), RSI band (30/70), portion (0.35), leverage (2) per the prompt
-- Output the code in a single ```python fence. No other text inside the fence.
+Class name MUST be exactly `Strategy`. Method MUST be exactly `should_trade(self, data)`.
+
+## AVAILABLE API (this is the complete list — do not use anything else)
+
+data.trigger_symbol                    -> str, symbol that fired the trigger
+data.get_price(symbol)                 -> float, current price (0 if unavailable)
+data.positions                         -> dict[str, Position]; Position has .size and .side ("long"/"short") and .leverage
+data.get_indicator(symbol, name, tf)   -> dict
+
+Supported `name` values for get_indicator:
+  "EMA<N>"      any integer N, e.g. "EMA9", "EMA12", "EMA21", "EMA55", "EMA200"
+                -> {{"value": float}}
+  "MA<N>"       any integer N, e.g. "MA20", "MA50"
+                -> {{"value": float}}
+  "RSI14", "RSI7"                  -> {{"value": float}}
+  "MACD"                           -> {{"macd": float, "signal": float, "histogram": float}}
+  "BOLL"                           -> {{"upper": float, "middle": float, "lower": float}}
+  "ATR14"                          -> {{"value": float}}
+  "DONCHIAN<N>" any integer N      -> {{"upper": float, "middle": float, "lower": float}}
+  "ICT"                            -> ICT payload dict
+  "ICT_OTE"                        -> {{"score": float, "direction": str, ...}}
+  "STOCH"                          -> {{"k": float, "d": float}}
+  "VWAP" / "OBV"                   -> {{"value": float}}
+
+`tf` is the kline period, always pass "1h" here.
+
+## DECISION OBJECT (return exactly one per call)
+
+Decision(operation="hold", symbol=symbol, reason="...")
+Decision(operation="buy",  symbol=symbol, target_portion_of_balance=<0.01-1.0>,
+         leverage=<1-50>, max_price=<float>, reason="...", trading_strategy="...")
+Decision(operation="sell", symbol=symbol, target_portion_of_balance=<0.01-1.0>,
+         leverage=<1-50>, min_price=<float>, reason="...", trading_strategy="...")
+Decision(operation="close", symbol=symbol, target_portion_of_balance=<0.01-1.0>,
+         leverage=<existing>, min_price=<float for closing long>,
+         reason="...")
+
+## HARD RULES
+
+1. Output exactly ONE ```python fenced block. No prose inside the fence.
+2. Never read an indicator you did not need; every get_indicator call costs time.
+3. Guard missing indicator values: `.get("value", 0)` or `or 0`, never assume a key exists.
+4. If you hold a position on the symbol, you must have an exit path (close on the
+   inverse condition). Never leave a position with no exit rule.
+5. Do NOT use data.get_market_data, data.get_klines, data.get_flow,
+   data.get_regime, data.get_factor, or any API not listed above.
+6. Do NOT return the sample trading logic from this message — it contains none.
+   Your conditions must come from the SPECIFICATION block only.
 """
     gen = generate_program_with_ai_stream(
         db=db,
@@ -201,17 +205,27 @@ def _extract_strategy_code(content: str) -> str:
     """從 LLM 內容抽出 sandbox 相容的 Strategy 類別。
 
     優先順序：
-    1. 含 "class Strategy" 且含 "def should_trade" 的 fence
-    2. 最後一個含 "def should_trade" 的 fence
-    3. 最後一個 python fence
-    4. 原文（讓 backtest 報錯，不靜默替換）
+    1. 含 "class Strategy" 且**有實質邏輯**（get_indicator 或 get_price 呼叫）的
+       最後一個 fence —— Program AI 常先把我們給的空白骨架回貼一次，再給實作。
+    2. 任一含 "class Strategy" 的 fence（取最後一個）
+    3. 最後一個含 "def should_trade" 的 fence
+    4. 最後一個 python fence
+    5. 原文（讓 backtest 報錯，不靜默替換）
     """
     blocks = [m.group(1) for m in _PY_FENCE_RE.finditer(content)]
     if not blocks:
         return content
-    for b in blocks:
+    # 1. 有實質邏輯的實作（骨架 block 只有註解與 return hold）
+    for b in reversed(blocks):
+        if "class Strategy" in b and "def should_trade" in b and (
+            "get_indicator(" in b or "get_price(" in b
+        ):
+            return b
+    # 2. 任何 class Strategy block
+    for b in reversed(blocks):
         if "class Strategy" in b and "def should_trade" in b:
             return b
+    # 3. 任何 should_trade block
     for b in reversed(blocks):
         if "def should_trade" in b:
             return b
@@ -592,32 +606,42 @@ def evaluate_strategy_code(
     }
 
 
-_RISK_PATTERNS = [
-    (r"target_portion_of_balance\s*=\s*([\d.]+)", "portion"),
-    (r"portion\s*=\s*([\d.]+)", "portion"),
-    (r"leverage\s*=\s*(\d+)", "leverage"),
-]
+_DECISION_CALL_RE = re.compile(r"Decision\s*\((.*?)\)\s*,?\s*$", re.DOTALL | re.MULTILINE)
+_PORTION_RE = re.compile(r"target_portion_of_balance\s*=\s*([\d.]+)")
+_LEVERAGE_RE = re.compile(r"leverage\s*=\s*(\d+)")
+_OP_RE = re.compile(r'operation\s*=\s*["\'](buy|sell|close|hold)["\']')
 
 
 def _extract_risk_from_code(code: str) -> tuple:
-    """從 strategy_code 解析 portion/leverage，供 gate_violation deploy 項。
+    """從 strategy_code 解析 **進場** portion/leverage，供 gate_violation deploy 項。
 
-    預設 portion=0.35 / leverage=2（與 render_strategy_from_spec 預設一致）。
-    取 code 中最大值（多幣 loop 或多個 Decision 取最大倉位）。
-    解析失敗時 fail-open 回預設，不靜默回 0。
+    只看 operation="buy"/"sell" 的 Decision（close 的 target_portion_of_balance=1.0
+    是「平掉整個倉位」而非開倉規模，把它算進去會誤判 deploy 違規）。
+    多個進場分支取最大值（最壞情況名目）。
+    找不到時 fail-open 回預設 0.35 / 2（與 render_strategy_from_spec 一致）。
     """
-    portion = 0.35
-    leverage = 2
-    try:
-        import re as _re
-        portions = [float(m.group(1)) for pat, kind in _RISK_PATTERNS if kind == "portion"
-                    for m in _re.finditer(pat, code)]
-        leverages = [int(m.group(1)) for pat, kind in _RISK_PATTERNS if kind == "leverage"
-                     for m in _re.finditer(pat, code)]
-        if portions:
-            portion = max(p for p in portions if 0 < p <= 1.0) if any(0 < p <= 1.0 for p in portions) else portion
-        if leverages:
-            leverage = max(l for l in leverages if 1 <= l <= 50) if any(1 <= l <= 50 for l in leverages) else leverage
-    except Exception:
-        pass
+    portions: List[float] = []
+    leverages: List[int] = []
+    # 以 "Decision(" 切段，逐段檢查 operation，抓同一段內的參數
+    for chunk in code.split("Decision")[1:]:
+        head = chunk[:600]  # Decision 參數不會超過此長度
+        op_m = _OP_RE.search(head)
+        if not op_m or op_m.group(1) not in ("buy", "sell"):
+            continue
+        for m in _PORTION_RE.finditer(head):
+            try:
+                v = float(m.group(1))
+                if 0 < v <= 1.0:
+                    portions.append(v)
+            except ValueError:
+                pass
+        for m in _LEVERAGE_RE.finditer(head):
+            try:
+                v = int(m.group(1))
+                if 1 <= v <= 50:
+                    leverages.append(v)
+            except ValueError:
+                pass
+    portion = max(portions) if portions else 0.35
+    leverage = max(leverages) if leverages else 2
     return portion, leverage
