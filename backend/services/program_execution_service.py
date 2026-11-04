@@ -452,10 +452,41 @@ class ProgramExecutionService:
                     params.update(override)
                 except:
                     pass
-
             # Execute strategy
             result = execute_strategy(program.code, market_data, params)
 
+            # JEV pre-trade gate: veto entry decisions before quota/log/order.
+            # - hold/None decisions bypass the gate (no-op).
+            # - unconfigured (no JEV_API_KEY) → fail open.
+            # - rejected → rewrite decision to hold, keep reason traceable,
+            #   so _log_execution records jev_entry_rejected instead of the
+            #   original entry signal, and _handle_decision never fires.
+            try:
+                from backtest.jev_gate import build_jev_state, evaluate_gate
+
+                gate_candidate = result.decision if result.success else None
+                gate_op = (
+                    gate_candidate.operation.lower()
+                    if gate_candidate is not None and hasattr(gate_candidate, "operation")
+                    else ""
+                )
+                if gate_op and gate_op != "hold":
+                    jev_state = build_jev_state(gate_candidate, market_data)
+                    allowed, jev_reason, jev_conf, jev_checks = evaluate_gate(jev_state)
+                    if not allowed:
+                        orig = f"{gate_candidate.operation}/{gate_candidate.symbol}"
+                        gate_candidate.operation = "hold"
+                        gate_candidate.reason = (
+                            f"{jev_reason} (vetoed {orig}: {gate_candidate.reason or ''})"
+                        ).strip()
+                        logger.info(
+                            f"[ProgramExecution] Binding {binding.id} JEV veto: "
+                            f"{orig} -> hold ({jev_reason}, conf={jev_conf}, "
+                            f"checks={[c.get('name') + '=' + str(c.get('result')) for c in jev_checks]})"
+                        )
+            except Exception as jev_err:
+                # Gate itself must never break execution: fail open.
+                logger.warning(f"[ProgramExecution] JEV gate error (fail open): {jev_err}")
             # Determine if this is an actual trade (buy/sell/close) that needs quota check
             quota_exceeded = False
             quota_info = {}
