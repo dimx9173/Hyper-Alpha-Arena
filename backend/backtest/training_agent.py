@@ -611,6 +611,15 @@ def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
                                   db_factory=_DB_FACTORY,
                                   **eval_kwargs)
 
+    # Evaluate baseline using SPEC path (convert baseline spec to request first)
+    # For baseline, we just use the spec directly via SPEC eval
+    baseline_metrics = _run_evaluate(deepcopy(baseline_spec_dict), list(symbols),
+                                     generation=1, total_generations=max(rounds, 1),
+                                     **eval_kwargs)
+    best_spec = deepcopy(baseline_spec_dict)
+    best_metrics = baseline_metrics
+    history: List[Dict[str, Any]] = []
+
     for round_no in range(1, max(1, rounds) + 1):
         _cb(round_no, "build_prompt")
         messages = build_prompt_hyper(deepcopy(best_spec), best_metrics, round_no, history)
