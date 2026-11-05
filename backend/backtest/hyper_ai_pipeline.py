@@ -191,17 +191,39 @@ Decision(operation="close", symbol=symbol, target_portion_of_balance=<0.01-1.0>,
          leverage=<existing>, min_price=<float for closing long>,
          reason="...")
 
+## SANDBOX CONSTRAINTS (violating ANY of these makes the code invalid)
+
+The sandbox runs your class with a restricted builtin set. These are HARD
+failures, not style warnings:
+
+1. `getattr`, `setattr`, `hasattr`, `eval`, `exec`, `compile`, `open`,
+   `globals`, `locals`, `vars`, `input` are FORBIDDEN. Calling any of them
+   aborts the whole backtest with "Validation failed: Forbidden function".
+   Read attributes directly instead:
+     WRONG:  getattr(pos, "size", 0) > 0
+     RIGHT:  pos is not None and pos.size > 0
+     WRONG:  getattr(pos, "leverage", 2)
+     RIGHT:  pos.leverage if pos is not None else 2
+2. `leverage` MUST be an INTEGER in Decision (1-50). `leverage=1.5` fails
+   validation. Use 1, 2 or 3 — never a float, never a variable holding a float.
+3. `target_portion_of_balance` MUST be a float in (0.0, 1.0].
+4. Allowed builtins only: abs, min, max, sum, len, round, int, float, str,
+   bool, list, dict, tuple, set, range, enumerate, zip, sorted, reversed,
+   any, all, isinstance, type, print, True, False, None. `math` and `time`
+   are pre-injected, no import needed.
+5. Put the code body directly in the suggest_save_code `code` argument with
+   NO markdown fences (no ```python, no trailing ```).
+
 ## HARD RULES
 
-1. Output exactly ONE ```python fenced block. No prose inside the fence.
-2. Never read an indicator you did not need; every get_indicator call costs time.
-3. Guard missing indicator values: `.get("value", 0)` or `or 0`, never assume a key exists.
-4. If you hold a position on the symbol, you must have an exit path (close on the
+6. Never read an indicator you did not need; every get_indicator call costs time.
+7. Guard missing indicator values: `.get("value", 0)` or `or 0`, never assume a key exists.
+8. If you hold a position on the symbol, you must have an exit path (close on the
    inverse condition). Never leave a position with no exit rule.
-5. Do NOT use data.get_market_data, data.get_klines, data.get_flow,
+9. Do NOT use data.get_market_data, data.get_klines, data.get_flow,
    data.get_regime, data.get_factor, or any API not listed above.
-6. Do NOT return the sample trading logic from this message — it contains none.
-   Your conditions must come from the SPECIFICATION block only.
+10. Do NOT return the sample trading logic from this message — it contains none.
+    Your conditions must come from the SPECIFICATION block only.
 
 ## OFFLINE EVALUATION NOTE (READ CAREFULLY)
 
@@ -249,12 +271,50 @@ window.
     return code, done
 
 
+def _strip_fences(code: str) -> str:
+    """剝掉 Program AI 有時會加在 code 參數頭尾的 markdown 圍欄。
+
+    r3 實證：args.code 以 ```python 開頭、``` 結尾，導致 validator 誤判前綴
+    進而整個回測 0 筆交易。剝掉後才交給沙箱。
+    """
+    s = (code or "").strip()
+    if s.startswith("```"):
+        nl = s.find("\n")
+        s = s[nl + 1:] if nl != -1 else ""
+    if s.rstrip().endswith("```"):
+        s = s.rstrip()[:-3]
+    return s.strip()
+
+_GETATTR_RE = re.compile(
+    r'getattr\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']\s*,\s*([^()]+?)\s*\)'
+)
+
+
+def _sanitize_code(code: str) -> str:
+    """把 Program AI 常見的沙箱不合法寫法自動改寫成合法形式。
+
+    1. getattr(obj, "attr", default) -> (obj.attr if obj is not None else default)
+       getattr 在 FORBIDDEN_FUNCTIONS，但 LLM 防禦性程式碼必寫；機械改寫保住退款。
+    2. leverage=<float> 常數 -> int 截斷（Decision 校驗要求 1-50 整數）。
+    只處理字面量屬性名與單行 default 的形式；更複雜的呼叫讓沙箱報錯。
+    """
+    def _repl(m: "re.Match[str]") -> str:
+        obj, attr, default = m.group(1), m.group(2), m.group(3).strip()
+        return f"({obj}.{attr} if {obj} is not None else {default})"
+
+    s = _GETATTR_RE.sub(_repl, code)
+    s = re.sub(r"(leverage\s*=\s*)(\d+\.\d+)",
+               lambda m: f"{m.group(1)}{max(1, min(50, int(float(m.group(2)))))}", s)
+    return s
+
+
 def _extract_code_from_tool_calls(tool_calls_log: Any) -> str:
     """從 tool_calls_log 的 args.code 取最長的 Strategy 實作。
 
     優先順序：suggest_save_code > quick_verify_strategy > test_run_code >
     validate_code；同名取參數最長者（Program AI 先測草稿、後存定稿）。
     非 Strategy 代碼（散文、空字串）直接丟棄。
+    回傳前剝掉 markdown 圍欄。
     """
     if isinstance(tool_calls_log, str):
         try:
@@ -286,7 +346,7 @@ def _extract_code_from_tool_calls(tool_calls_log: Any) -> str:
     if not cands:
         return ""
     cands.sort()
-    return cands[0][2]
+    return _sanitize_code(_strip_fences(cands[0][2]))
 
 
 _PY_FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)

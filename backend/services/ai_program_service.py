@@ -2049,7 +2049,7 @@ You are creating a new program. Start fresh and design the strategy based on use
             last_status_code = None
             last_response_text = None  # Store full response text for error logging
 
-            for retry_attempt in range(API_MAX_RETRIES):
+            for retry_attempt in range(1 if offline_mode else API_MAX_RETRIES):
                 response = None
                 resp_json = None
                 # Don't reset last_error here - preserve error from previous attempts
@@ -2066,7 +2066,7 @@ You are creating a new program. Start fresh and design the strategy based on use
                             break  # Success
                         else:
                             # OpenAI format - use regular request
-                            response = requests.post(endpoint, json=payload, headers=headers, timeout=120)
+                            response = requests.post(endpoint, json=payload, headers=headers, timeout=(60 if offline_mode else 120))
                             last_status_code = response.status_code
                             last_response_text = response.text[:2000] if response.text else None
                             logger.info(f"[AI Program {request_id}] Response status: {response.status_code}")
