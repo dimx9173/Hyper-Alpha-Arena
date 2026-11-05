@@ -1788,10 +1788,18 @@ def generate_program_with_ai_stream(
     conversation_id: Optional[int] = None,
     program_id: Optional[int] = None,
     user_id: int = 1,
-    llm_config: Optional[Dict[str, Any]] = None
+    llm_config: Optional[Dict[str, Any]] = None,
+    offline_mode: bool = False,
+    max_rounds: int = 15,
 ) -> Generator[str, None, None]:
-    """
-    Generate program code using AI with SSE streaming.
+    """Generate program code using AI with SSE streaming.
+
+    offline_mode=True（Hyper AI 離線訓練用）：只保留 suggest_save_code，
+    去掉 query_market_data / test_run_code / quick_verify_strategy 等需要
+    live 資料或重回測的工具。Program AI 寫完代碼立刻存，不會在工具迴圈裡
+    燒掉整個 15 輪預算（v5 證據：4/5 輪超時 600s，v6 r5 唯一的成功只跑了
+    query_market_data x4 + suggest_save_code）。
+    max_rounds：工具迴圈上限，離線可調小（預設 15 是產品互動值）。
     Yields SSE events for real-time updates.
     """
     import requests
@@ -1962,7 +1970,13 @@ You are creating a new program. Start fresh and design the strategy based on use
         headers = build_llm_headers(api_format, api_config["api_key"], api_config["base_url"])
 
         # Tool calling loop
-        max_rounds = 15
+        # offline_mode: LLM 只拿到 suggest_save_code（一寫即存）；原本 15 輪工具
+        # 迴圈（query_market_data / test_run_code / quick_verify）是 timeout 主因。
+        _OFFLINE_TOOLS = [
+            t for t in PROGRAM_TOOLS
+            if t.get("type") == "function"
+            and t.get("function", {}).get("name") == "suggest_save_code"
+        ]
         tool_round = 0
         tool_calls_log = []
         final_content = ""
@@ -1991,7 +2005,10 @@ You are creating a new program. Start fresh and design the strategy based on use
             # Use unified payload builder (see build_llm_payload in ai_decision_service)
             if api_format == 'anthropic':
                 system_prompt, anthropic_messages = convert_messages_to_anthropic(messages)
-                tools_for_round = PROGRAM_TOOLS_ANTHROPIC if not is_last else None
+                tools_for_round = None
+                if not is_last:
+                    tools_for_round = (convert_tools_to_anthropic(_OFFLINE_TOOLS)
+                                       if offline_mode else PROGRAM_TOOLS_ANTHROPIC)
                 payload = build_llm_payload(
                     model=api_config["model"],
                     messages=[{"role": "system", "content": system_prompt}] + anthropic_messages,
@@ -1999,7 +2016,10 @@ You are creating a new program. Start fresh and design the strategy based on use
                     tools=tools_for_round,
                 )
             else:
-                tools_for_round = PROGRAM_TOOLS if not is_last else None
+                if not is_last:
+                    tools_for_round = _OFFLINE_TOOLS if offline_mode else PROGRAM_TOOLS
+                else:
+                    tools_for_round = None
                 payload = build_llm_payload(
                     model=api_config["model"],
                     messages=messages,
@@ -2200,6 +2220,10 @@ You are creating a new program. Start fresh and design the strategy based on use
                                         "description": suggestion.get("description", "")
                                     })
                                     yield format_sse_event("save_suggestion", {"data": suggestion})
+                                    if offline_mode:
+                                        # 離線：拿到 code 就收工，不再跑下一輪工具。
+                                        final_content = content or ""
+                                        break
                             except:
                                 pass
 
@@ -2274,6 +2298,10 @@ You are creating a new program. Start fresh and design the strategy based on use
                                         "description": suggestion.get("description", "")
                                     })
                                     yield format_sse_event("save_suggestion", {"data": suggestion})
+                                    if offline_mode:
+                                        # 離線：拿到 code 就收工，不再跑下一輪工具。
+                                        final_content = content or ""
+                                        break
                             except:
                                 pass
 

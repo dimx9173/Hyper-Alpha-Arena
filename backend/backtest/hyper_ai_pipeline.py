@@ -224,6 +224,10 @@ window.
         conversation_id=conversation_id,
         program_id=program_id,
         llm_config=llm_config,
+        # 離線評估外包給 harness：工具只留 suggest_save_code（一寫即停），
+        # 3 輪足夠（r5 成功只用 1 工具輪 + 存檔輪）。
+        offline_mode=True,
+        max_rounds=3,
     )
     done = _run_stream_to_completion(gen)
 
