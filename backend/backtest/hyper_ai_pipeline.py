@@ -45,6 +45,59 @@ def _db_session():
         db.close()
 
 
+def _run_direct_completion(task: str, llm_config: Dict[str, Any]) -> Dict[str, Any]:
+    """單次 chat completion（無工具）：離線訓練最穩定的代碼來源。
+
+    Program AI 的工具迴圈（15 輪 x 每輪 LLM+工具 60-180s）對網關抖動極敏感，
+    v10-v12 有 4/5、5/5、3/5 的輪次死在讀超時。直接要 fenced code：
+    一次請求、一次回覆（通常 15-60s），回來就抽 class Strategy。
+    requests 拋錯 → 呼叫端記 round_failed，不偽裝成静默垃圾。
+    """
+    import requests as _requests
+    from services.ai_decision_service import (
+        build_chat_completion_endpoints, build_llm_payload,
+        build_llm_headers, detect_api_format,
+    )
+    base_url = llm_config.get("base_url", "")
+    api_format = llm_config.get("api_format") or "openai"
+    endpoint, detected = detect_api_format(base_url)
+    if detected:
+        api_format = detected
+    if api_format == "anthropic":
+        endpoint = endpoint or (base_url.rstrip("/") + "/v1/messages")
+        endpoints = [endpoint]
+    else:
+        endpoints = build_chat_completion_endpoints(base_url, llm_config.get("model"))
+        if not endpoints:
+            endpoints = [base_url.rstrip("/") + "/chat/completions"]
+    payload = build_llm_payload(
+        model=llm_config.get("model"),
+        messages=[{"role": "user", "content": task}],
+        api_format=api_format,
+        max_tokens=4000,
+        temperature=0.7,
+    )
+    headers = build_llm_headers(api_format, llm_config.get("api_key"), base_url)
+    last_err = "no endpoint tried"
+    for ep in endpoints:
+        try:
+            resp = _requests.post(ep, json=payload, headers=headers, timeout=180)
+            resp.raise_for_status()
+            data = resp.json()
+            if api_format == "anthropic":
+                blocks = data.get("content") or []
+                text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+            else:
+                choices = data.get("choices") or []
+                text = str(choices[0].get("message", {}).get("content", "")) if choices else ""
+            if text.strip():
+                return {"content": text, "tool_calls_log": [], "direct": True, "endpoint": ep}
+            last_err = "empty response text"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+    raise RuntimeError(f"Direct completion failed: {last_err}")
+
+
 def _run_stream_to_completion(generator: Generator[str, None, None]) -> Dict[str, Any]:
     """Run a streaming generator to completion, return the final 'done' event data.
 
@@ -240,18 +293,25 @@ window.
 - Each tool round costs minutes. A reasonable first version should be saved
   immediately rather than iterated on.
 """
-    gen = generate_program_with_ai_stream(
-        db=db,
-        user_message=task,
-        conversation_id=conversation_id,
-        program_id=program_id,
-        llm_config=llm_config,
-        # 離線評估外包給 harness：工具只留 suggest_save_code（一寫即停），
-        # 3 輪足夠（r5 成功只用 1 工具輪 + 存檔輪）。
-        offline_mode=True,
-        max_rounds=3,
-    )
-    done = _run_stream_to_completion(gen)
+    # 離線評估外包給 harness：工具循環每輪都要 60-180s，網關讀超時（r2-r5）
+    # 就直接殺掉整輪。direct=True（預設）走單次 chat completion，不用任何工具：
+    # LLM 直接輸出 ```python fenced code，一次請求、一次回覆，不會超時。
+    use_direct = True
+    if use_direct:
+        done = _run_direct_completion(task, llm_config)
+    else:
+        gen = generate_program_with_ai_stream(
+            db=db,
+            user_message=task,
+            conversation_id=conversation_id,
+            program_id=program_id,
+            llm_config=llm_config,
+            # 離線評估外包給 harness：工具只留 suggest_save_code（一寫即停），
+            # 3 輪足夠（r5 成功只用 1 工具輪 + 存檔輪）。
+            offline_mode=True,
+            max_rounds=3,
+        )
+        done = _run_stream_to_completion(gen)
 
     # 1. Program AI 常把 code 當作工具參數（test_run_code / validate_code /
     #    quick_verify_strategy）送出，正文只剩摘要散文。v5 證明：save_suggestion
