@@ -448,49 +448,73 @@ def find_liquidity_sweeps(
     lows = [float(k["low"]) for k in klines]
     closes = [float(k["close"]) for k in klines]
 
-    swept_lows = set()
-    swept_highs = set()
+    # 效能：原實作對每個 swing 從 ready 掃到 n，並在內層重算 body/上下影線，
+    # 複雜度 O(swings x n)。4813 根 1h K 線 x 99 swings = 233 萬次 max/min/abs，
+    # 單次 ICT_OTE 要 302ms，而回測一個 trigger 就呼叫一次 → 8000 triggers
+    # 光 ICT 就 40 分鐘（v14 每輪撞 900s timeout 的直接原因）。
+    #
+    # 這裡先 O(n) 算好每根 K 線的實體與影線，並只保留「影線長度合格」的索引；
+    # swing 迴圈只掃這些候選（多數 swing 前幾根就命中）。
+    # 語意等價：命中後原碼把 sw.index 放進 swept set，同一 swing 之後的
+    # 迭代不可能再 append，因此「第一個命中即 break」與原行為相同；
+    # sweeps 的最終排序（index 遞減、截斷 max_sweeps）維持不變。
+    bodies = [0.0] * n
+    lower_wicks = [0.0] * n
+    upper_wicks = [0.0] * n
+    bull_candidates: List[int] = []
+    bear_candidates: List[int] = []
+    for i in range(n):
+        o = opens[i]
+        c = closes[i]
+        body = c - o if c >= o else o - c
+        lower_wick = (o if o < c else c) - lows[i]
+        upper_wick = highs[i] - (o if o > c else c)
+        bodies[i] = body
+        lower_wicks[i] = lower_wick
+        upper_wicks[i] = upper_wick
+        if lower_wick >= body * wick_ratio:
+            bull_candidates.append(i)
+        if upper_wick >= body * wick_ratio:
+            bear_candidates.append(i)
+
+    import bisect as _bisect_sweeps
+
     sweeps: List[Dict[str, Any]] = []
 
     for sw in swings:
         ready = confirm_index(sw, swing_right)
         if ready >= n:
             continue
-        i = ready
-        while i < n:
-            body = abs(closes[i] - opens[i])
-            lower_wick = min(opens[i], closes[i]) - lows[i]
-            upper_wick = highs[i] - max(opens[i], closes[i])
-
-            if sw.kind == "low" and sw.index not in swept_lows:
+        if sw.kind == "low":
+            cands = bull_candidates
+            idx_from = _bisect_sweeps.bisect_left(cands, ready)
+            for i in cands[idx_from:]:
                 if lows[i] < sw.price and closes[i] > sw.price:
-                    if lower_wick >= body * wick_ratio:
-                        sweeps.append({
-                            "index": i,
-                            "swing_index": sw.index,
-                            "direction": "bullish",
-                            "level": sw.price,
-                            "extreme": lows[i],
-                            "wick": lower_wick,
-                            "body": body,
-                        })
-                        swept_lows.add(sw.index)
-
-            if sw.kind == "high" and sw.index not in swept_highs:
+                    sweeps.append({
+                        "index": i,
+                        "swing_index": sw.index,
+                        "direction": "bullish",
+                        "level": sw.price,
+                        "extreme": lows[i],
+                        "wick": lower_wicks[i],
+                        "body": bodies[i],
+                    })
+                    break
+        else:
+            cands = bear_candidates
+            idx_from = _bisect_sweeps.bisect_left(cands, ready)
+            for i in cands[idx_from:]:
                 if highs[i] > sw.price and closes[i] < sw.price:
-                    if upper_wick >= body * wick_ratio:
-                        sweeps.append({
-                            "index": i,
-                            "swing_index": sw.index,
-                            "direction": "bearish",
-                            "level": sw.price,
-                            "extreme": highs[i],
-                            "wick": upper_wick,
-                            "body": body,
-                        })
-                        swept_highs.add(sw.index)
-
-            i += 1
+                    sweeps.append({
+                        "index": i,
+                        "swing_index": sw.index,
+                        "direction": "bearish",
+                        "level": sw.price,
+                        "extreme": highs[i],
+                        "wick": upper_wicks[i],
+                        "body": bodies[i],
+                    })
+                    break
 
     sweeps.sort(key=lambda s: s["index"], reverse=True)
     return sweeps[:max_sweeps]
