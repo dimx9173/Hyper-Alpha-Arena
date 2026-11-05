@@ -2066,7 +2066,7 @@ You are creating a new program. Start fresh and design the strategy based on use
                             break  # Success
                         else:
                             # OpenAI format - use regular request
-                            response = requests.post(endpoint, json=payload, headers=headers, timeout=(60 if offline_mode else 120))
+                            response = requests.post(endpoint, json=payload, headers=headers, timeout=(180 if offline_mode else 120))
                             last_status_code = response.status_code
                             last_response_text = response.text[:2000] if response.text else None
                             logger.info(f"[AI Program {request_id}] Response status: {response.status_code}")
@@ -2097,10 +2097,11 @@ You are creating a new program. Start fresh and design the strategy based on use
                     break
 
                 # Check if more retries available
-                if retry_attempt < API_MAX_RETRIES - 1:
+                _retries = 1 if offline_mode else API_MAX_RETRIES
+                if retry_attempt < _retries - 1:
                     delay = _get_retry_delay(retry_attempt)
-                    logger.warning(f"[AI Program {request_id}] Retrying in {delay:.1f}s (attempt {retry_attempt + 2}/{API_MAX_RETRIES})")
-                    yield format_sse_event("retry", {"attempt": retry_attempt + 2, "max_retries": API_MAX_RETRIES})
+                    logger.warning(f"[AI Program {request_id}] Retrying in {delay:.1f}s (attempt {retry_attempt + 2}/{_retries})")
+                    yield format_sse_event("retry", {"attempt": retry_attempt + 2, "max_retries": _retries})
                     time.sleep(delay)
 
             # Check for failure - build comprehensive error detail
