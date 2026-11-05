@@ -227,19 +227,62 @@ window.
     )
     done = _run_stream_to_completion(gen)
 
-    # 1. Program AI 真正的程式碼在 save_suggestion 工具呼叫裡（done["content"]
-    #    只是摘要散文；v4 r1/r2 證明只讀 content 會拿到 0 筆交易的垃圾）。
-    #    優先用工具存下的 code。
+    # 1. Program AI 常把 code 當作工具參數（test_run_code / validate_code /
+    #    quick_verify_strategy）送出，正文只剩摘要散文。v5 證明：save_suggestion
+    #    有時根本沒被調用，但 tool_calls_log 裡的 args.code 就是同一份真代碼。
+    code = _extract_code_from_tool_calls(done.get("tool_calls_log") or [])
+    if code:
+        return code, done
+
+    # 2. 真正存下的建議（live 路徑常用）。
     saved = (done.get("_saved_code") or "").strip()
     if saved:
         return saved, done
 
-    # 2. 回退：從 content 抽 fence（Program AI 直接把 code 寫在正文時）。
-    #    優先找含 "class Strategy" 的 python fence，
-    #    其次找最後一個 python fence（Program AI 常在前面放範例）。
+    # 3. 回退：從 content 抽 fence（Program AI 直接把 code 寫在正文時）。
     content = done.get("content", "") or ""
     code = _extract_strategy_code(content)
     return code, done
+
+
+def _extract_code_from_tool_calls(tool_calls_log: Any) -> str:
+    """從 tool_calls_log 的 args.code 取最長的 Strategy 實作。
+
+    優先順序：suggest_save_code > quick_verify_strategy > test_run_code >
+    validate_code；同名取參數最長者（Program AI 先測草稿、後存定稿）。
+    非 Strategy 代碼（散文、空字串）直接丟棄。
+    """
+    if isinstance(tool_calls_log, str):
+        try:
+            tool_calls_log = json.loads(tool_calls_log)
+        except Exception:
+            return ""
+    if not isinstance(tool_calls_log, list):
+        return ""
+    prio = {"suggest_save_code": 0, "quick_verify_strategy": 1,
+            "test_run_code": 2, "validate_code": 3}
+    cands: List[tuple] = []
+    for entry in tool_calls_log:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("tool", "")
+        if name not in prio:
+            continue
+        args = entry.get("args") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                continue
+        if not isinstance(args, dict):
+            continue
+        code = args.get("code") or ""
+        if "class Strategy" in code and "def should_trade" in code:
+            cands.append((prio[name], -len(code), code))
+    if not cands:
+        return ""
+    cands.sort()
+    return cands[0][2]
 
 
 _PY_FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
