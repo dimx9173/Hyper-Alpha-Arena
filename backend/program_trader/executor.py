@@ -3,7 +3,8 @@ Sandbox executor for Program Trader.
 Safely executes strategy code with restricted environment.
 """
 
-import ast
+import os
+import sys
 import math
 import time as pytime
 from typing import Dict, Any, Optional, List
@@ -190,13 +191,42 @@ class SandboxExecutor:
                 result_holder["error"] = f"Execution error: {str(e)}\n{traceback.format_exc()}"
 
         if self._thread_pool:
-            # Backtest mode: reuse pool thread to avoid thread creation overhead
+            # Backtest mode: reuse pool thread to avoid thread creation overhead.
+            # Runaway strategy code (infinite loops such as `while True`) would
+            # otherwise wedge the single-slot pool forever: future.cancel() cannot
+            # stop a running future, and a timed-out future.result() leaves the
+            # worker stuck. Interrupt every worker thread that is currently inside
+            # this module's sandbox frame (the strategy loop is nested deeper, so
+            # match by filename rather than by top-level frame name).
             future = self._thread_pool.submit(run_sandbox)
             try:
                 future.result(timeout=self.timeout_seconds)
             except Exception:
-                # Timeout or other error - future may still be running
-                pass
+                base = os.path.basename(__file__)
+                for tid, frm in sys._current_frames().items():
+                    f = frm
+                    while f is not None:
+                        if os.path.basename(f.f_code.co_filename) == base and \
+                                f.f_code.co_name in ("run_sandbox", "_execute_in_sandbox"):
+                            try:
+                                _raise_timeout_in_thread(tid)
+                            except Exception:
+                                pass
+                            break
+                        f = f.f_back
+                try:
+                    future.result(timeout=1.0)
+                except Exception:
+                    pass
+                # Timed out: result_holder was never filled. Report failure rather
+                # than falling through to the success path below.
+                return ExecutionResult(
+                    success=False,
+                    decision=None,
+                    error=f"Execution timed out after {self.timeout_seconds}s",
+                    execution_time_ms=(time.time() - start_time) * 1000,
+                    logs=self._execution_logs,
+                )
         else:
             # Real-time mode: create dedicated thread (no concurrency limit)
             execution_thread = threading.Thread(target=run_sandbox, daemon=True)
