@@ -332,6 +332,19 @@ failures, not style warnings:
     "bearish" (None when unconfirmed). A short entry must gate
     `direction == "bearish" and score >= threshold`, NEVER `score < -0.6`
     (score is never negative, so that branch can never fire → 0 trades).
+13. Entries must test STATE, not an EVENT. Never gate an entry on
+    `should_trade` detecting a cross that happened between calls (e.g.
+    `crossed = prev != current`, storing `self.prev_*`). `should_trade` is
+    invoked once per scheduled trigger, NOT once per bar, so a cross-event
+    gate fires roughly once per position lifetime and yields ~1 trade per
+    180 days. Compare current indicator ORDER instead:
+      WRONG: crossed = (self.prev_above != above); if crossed and above: buy
+      RIGHT: if ema_fast > ema_slow * tol and price >= donchian_upper: buy
+    Exit paths may use state too (e.g. `if holding long and ema_fast < ema_slow`).
+14. Target 60-150 entries per year. Before returning, sanity-check that your
+    gates can co-occur: an "all_pass" AND of 4 filters over an event-style
+    condition typically yields 0-2 trades. Prefer state comparisons and
+    tolerances (e.g. price >= upper * 0.99) over exact breakouts.
 
 ## HOW TO DELIVER THE CODE (this is the answer format)
 """
