@@ -46,12 +46,27 @@ def _db_session():
 
 
 def _run_stream_to_completion(generator: Generator[str, None, None]) -> Dict[str, Any]:
-    """Run a streaming generator to completion, return the final 'done' event data."""
+    """Run a streaming generator to completion, return the final 'done' event data.
+
+    done 本身不含 code_suggestion（Program AI 把 code 經 suggest_save_code
+    工具存進 assistant_msg，done 只剩摘要 prose；見 v4 r1/r2 code_head）。
+    所以順手收集最後一次 save_suggestion 的 code，存進 done["_saved_code"]。
+    """
     last_done = None
+    last_saved_code: Optional[str] = None
     for chunk in generator:
         try:
             # chunk is SSE format: "event: X\ndata: {...}\n\n"
-            if chunk.startswith("event: done"):
+            if chunk.startswith("event: save_suggestion"):
+                for line in chunk.strip().split("\n"):
+                    if line.startswith("data: "):
+                        payload = json.loads(line[6:])
+                        data = payload.get("data") or {}
+                        code = data.get("code") or ""
+                        if code.strip():
+                            last_saved_code = code
+                        break
+            elif chunk.startswith("event: done"):
                 # Extract JSON after "data: "
                 lines = chunk.strip().split("\n")
                 for line in lines:
@@ -63,6 +78,8 @@ def _run_stream_to_completion(generator: Generator[str, None, None]) -> Dict[str
             continue
     if last_done is None:
         raise RuntimeError("Stream did not produce a 'done' event")
+    if last_saved_code:
+        last_done["_saved_code"] = last_saved_code
     return last_done
 
 
@@ -195,8 +212,16 @@ Decision(operation="close", symbol=symbol, target_portion_of_balance=<0.01-1.0>,
     )
     done = _run_stream_to_completion(gen)
 
-    # 抽 code：優先找含 "class Strategy" 的 python fence，
-    # 其次找最後一個 python fence（Program AI 常在前面放範例）。
+    # 1. Program AI 真正的程式碼在 save_suggestion 工具呼叫裡（done["content"]
+    #    只是摘要散文；v4 r1/r2 證明只讀 content 會拿到 0 筆交易的垃圾）。
+    #    優先用工具存下的 code。
+    saved = (done.get("_saved_code") or "").strip()
+    if saved:
+        return saved, done
+
+    # 2. 回退：從 content 抽 fence（Program AI 直接把 code 寫在正文時）。
+    #    優先找含 "class Strategy" 的 python fence，
+    #    其次找最後一個 python fence（Program AI 常在前面放範例）。
     content = done.get("content", "") or ""
     code = _extract_strategy_code(content)
     return code, done

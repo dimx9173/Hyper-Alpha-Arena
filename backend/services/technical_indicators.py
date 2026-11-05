@@ -62,10 +62,13 @@ def calculate_indicators(kline_data: List[Dict[str, Any]], indicators: List[str]
                     results['MA20'] = _calculate_sma(df, 20)
                 elif indicator == 'MACD':
                     results['MACD'] = _calculate_macd(df)
-                elif indicator == 'RSI14':
-                    results['RSI14'] = _calculate_rsi(df, 14)
-                elif indicator == 'RSI7':
-                    results['RSI7'] = _calculate_rsi(df, 7)
+                elif indicator.startswith('RSI'):
+                    # Generic RSI: RSI7, RSI14, RSI21, etc.
+                    try:
+                        period = int(indicator[3:])
+                        results[indicator] = _calculate_rsi(df, period)
+                    except ValueError:
+                        logger.warning(f"Unknown indicator: {indicator}")
                 elif indicator == 'BOLL':
                     results['BOLL'] = _calculate_bollinger_bands(df)
                 elif indicator == 'ATR14':
