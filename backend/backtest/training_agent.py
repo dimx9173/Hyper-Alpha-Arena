@@ -303,6 +303,13 @@ def _run_hyper_ai_eval(
             symbols=symbols,
             db_factory=db_factory,
         )
+        if not strategy_code or "class Strategy" not in strategy_code:
+            # 抽取器已拒收散文/規格要點，這裡補一道：沒有 Strategy 類別就
+            # 不進回測。空 code 會得到 0 筆交易的假 fitness（-28 而非 -1e9），
+            # 訓練迴圈會誤以為「這輪有效但很差」，浪費一輪還污染 best 追蹤。
+            raise RuntimeError(
+                f"Program AI returned no Strategy code (len={len(strategy_code or '')})"
+            )
         # Stage 2: evaluate raw code directly (bypass spec parsing)
         metrics = evaluate_strategy_code(
             strategy_code,
@@ -315,6 +322,13 @@ def _run_hyper_ai_eval(
             kline_period=kline_period,
             db_factory=db_factory,
         )
+        if not strategy_code or "class Strategy" not in strategy_code:
+            # 抽取器已拒收散文/規格要點，這裡補一道：沒有 Strategy 類別就
+            # 不進回測。空 code 會得到 0 筆交易的假 fitness（-28 而非 -1e9），
+            # 訓練迴圈會誤以為「這輪有效但很差」，浪費一輪還污染 best 追蹤。
+            raise RuntimeError(
+                f"Program AI returned no Strategy code (len={len(strategy_code or '')})"
+            )
         metrics["strategy_code"] = strategy_code
         metrics["spec_id"] = trace.get("stages", {}).get("program_ai", {}).get("trace", {}).get("message_id", f"hyper_{generation}")
         metrics["pipeline_trace"] = trace

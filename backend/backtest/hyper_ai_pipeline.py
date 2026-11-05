@@ -76,26 +76,73 @@ def _run_direct_completion(task: str, llm_config: Dict[str, Any]) -> Dict[str, A
         api_format=api_format,
         max_tokens=4000,
         temperature=0.7,
+        stream=True,
     )
     headers = build_llm_headers(api_format, llm_config.get("api_key"), base_url)
+    # 非串流時網關要 85-97s 才吐第一個 byte，90s 讀超時幾乎必死（實測 3/3 timeout）。
+    # 串流讓每個 SSE chunk 重置讀時鐘：只要上游持續產出就不會撞 timeout。
+    # 仍保留 3 次嘗試：TCP 斷線、上游 5xx 都可重試。
     last_err = "no endpoint tried"
-    for ep in endpoints:
-        try:
-            resp = _requests.post(ep, json=payload, headers=headers, timeout=180)
-            resp.raise_for_status()
-            data = resp.json()
-            if api_format == "anthropic":
-                blocks = data.get("content") or []
-                text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
-            else:
-                choices = data.get("choices") or []
-                text = str(choices[0].get("message", {}).get("content", "")) if choices else ""
-            if text.strip():
-                return {"content": text, "tool_calls_log": [], "direct": True, "endpoint": ep}
-            last_err = "empty response text"
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-    raise RuntimeError(f"Direct completion failed: {last_err}")
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        for ep in endpoints:
+            try:
+                text_parts: List[str] = []
+                calls: List[Dict[str, Any]] = []
+                # OpenAI streaming 的 tool_calls 是分片送、以 index 累積 arguments。
+                pending: Dict[int, Dict[str, Any]] = {}
+                with _requests.post(ep, json=payload, headers=headers,
+                                    timeout=(15, 120), stream=True) as resp:
+                    resp.raise_for_status()
+                    for raw in resp.iter_lines(decode_unicode=True):
+                        if not raw:
+                            continue
+                        line = raw.strip()
+                        if line.startswith("data:"):
+                            line = line[5:].strip()
+                        if not line or line == "[DONE]":
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except Exception:
+                            continue
+                        if api_format == "anthropic":
+                            if chunk.get("type") == "content_block_delta":
+                                delta = chunk.get("delta") or {}
+                                if delta.get("text"):
+                                    text_parts.append(delta["text"])
+                            continue
+                        for choice in (chunk.get("choices") or []):
+                            delta = choice.get("delta") or {}
+                            if delta.get("content"):
+                                text_parts.append(str(delta["content"]))
+                            for tc in (delta.get("tool_calls") or []):
+                                idx = tc.get("index", 0)
+                                slot = pending.setdefault(
+                                    idx, {"tool": "", "args_raw": ""})
+                                fn = tc.get("function") or {}
+                                if fn.get("name"):
+                                    slot["tool"] = fn["name"]
+                                if fn.get("arguments"):
+                                    slot["args_raw"] += str(fn["arguments"])
+                for _idx in sorted(pending):
+                    slot = pending[_idx]
+                    try:
+                        args = json.loads(slot["args_raw"]) if slot["args_raw"] else {}
+                    except Exception:
+                        args = {"_raw": slot["args_raw"]}
+                    calls.append({"tool": slot["tool"], "args": args})
+                text = "".join(text_parts)
+                if calls:
+                    return {"content": text, "tool_calls_log": calls, "direct": True,
+                            "endpoint": ep, "attempts": attempt}
+                if text.strip():
+                    return {"content": text, "tool_calls_log": [], "direct": True,
+                            "endpoint": ep, "attempts": attempt}
+                last_err = "empty stream"
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+    raise RuntimeError(f"Direct completion failed after {attempts} attempts: {last_err}")
 
 
 def _run_stream_to_completion(generator: Generator[str, None, None]) -> Dict[str, Any]:
@@ -186,7 +233,7 @@ def run_program_ai_offline(
     # Sandbox 相容格式：只給「骨架 + API 清單」，不給可抄的完整範例邏輯。
     # 先前版本附了完整 EMA12/55+Donchian+RSI 範例，Program AI 直接原樣照抄，
     # 導致 5 輪訓練全部產出同一份代碼（fitness 幾乎不變）。
-    task = f"""Write a NEW Python trading strategy for this specification:
+    task_template = f"""Write a NEW Python trading strategy for this specification:
 
 --- SPECIFICATION START ---
 {prompt_text}
@@ -226,8 +273,8 @@ Supported `name` values for get_indicator:
   "BOLL"                           -> {{"upper": float, "middle": float, "lower": float}}
   "ATR14"                          -> {{"value": float}}
   "DONCHIAN<N>" any integer N      -> {{"upper": float, "middle": float, "lower": float}}
-  "ICT"                            -> ICT payload dict
-  "ICT_OTE"                        -> {{"score": float, "direction": str, ...}}
+  "ICT"                            -> ICT payload dict (NO direction/bias key — do not gate on it)
+  "ICT_OTE"                        -> {{"score": float, "direction": str, ...}}  <- use this for direction
   "STOCH"                          -> {{"k": float, "d": float}}
   "VWAP" / "OBV"                   -> {{"value": float}}
 
@@ -264,8 +311,7 @@ failures, not style warnings:
    bool, list, dict, tuple, set, range, enumerate, zip, sorted, reversed,
    any, all, isinstance, type, print, True, False, None. `math` and `time`
    are pre-injected, no import needed.
-5. Put the code body directly in the suggest_save_code `code` argument with
-   NO markdown fences (no ```python, no trailing ```).
+5. Descriptive comments in Chinese or English are fine, but no prose paragraphs.
 
 ## HARD RULES
 
@@ -277,26 +323,31 @@ failures, not style warnings:
    data.get_regime, data.get_factor, or any API not listed above.
 10. Do NOT return the sample trading logic from this message — it contains none.
     Your conditions must come from the SPECIFICATION block only.
+11. If ICT confirmation is requested, use `ICT_OTE` and gate on
+    `ict_data.get("direction")` + `ict_data.get("score")`. Never use raw `ICT`
+    for direction — its direction key is always None, which turns the ICT gate
+    permanently False and produces 0 trades.
 
-## OFFLINE EVALUATION NOTE (READ CAREFULLY)
-
-You are running OFFLINE. No user is watching, and there is no frontend to
-confirm a save dialog. The harness that calls you extracts the code you pass to
-the suggest_save_code tool and evaluates it with its own backtest over the full
-window.
-
-- Write the code, then call suggest_save_code EXACTLY ONCE with the complete
-  final code. Do not revise after that call.
-- Do NOT call quick_verify_strategy. Do NOT call get_backtest_history,
-  get_trigger_list, or get_trigger_details. Your own verification duplicates
-  the harness evaluation and consumes the entire budget.
-- Each tool round costs minutes. A reasonable first version should be saved
-  immediately rather than iterated on.
+## HOW TO DELIVER THE CODE (this is the answer format)
 """
     # 離線評估外包給 harness：工具循環每輪都要 60-180s，網關讀超時（r2-r5）
     # 就直接殺掉整輪。direct=True（預設）走單次 chat completion，不用任何工具：
     # LLM 直接輸出 ```python fenced code，一次請求、一次回覆，不會超時。
     use_direct = True
+    if use_direct:
+        delivery_instruction = (
+            "Output ONLY ONE ```python fenced code block containing the complete "
+            "`class Strategy` implementation. No prose before or after the fence — "
+            "no 'Looking at this specification', no plan, no summary. The fence is "
+            "the whole answer."
+        )
+    else:
+        delivery_instruction = (
+            "Put the code body directly in the suggest_save_code `code` argument "
+            "with NO markdown fences. Call suggest_save_code EXACTLY ONCE with "
+            "the complete final code."
+        )
+    task = task_template + "\n" + delivery_instruction
     if use_direct:
         done = _run_direct_completion(task, llm_config)
     else:
@@ -421,10 +472,15 @@ def _extract_strategy_code(content: str) -> str:
     2. 任一含 "class Strategy" 的 fence（取最後一個）
     3. 最後一個含 "def should_trade" 的 fence
     4. 最後一個 python fence
-    5. 原文（讓 backtest 報錯，不靜默替換）
+    5. 空字串 —— v13 教訓：direct completion 有時只回散文（"Looking at this
+       specification..."）。把散文當 code 進沙箱會產生 fake fitness（0 筆
+       交易靜默通過），寧可記 round_failed 讓訓練迴圈跳過。
     """
     blocks = [m.group(1) for m in _PY_FENCE_RE.finditer(content)]
     if not blocks:
+        # 無 fence：內容若不含 Strategy 類別關鍵字 → 散文，拒收。
+        if "class Strategy" not in content:
+            return ""
         return content
     # 1. 有實質邏輯的實作（骨架 block 只有註解與 return hold）
     for b in reversed(blocks):
@@ -440,7 +496,10 @@ def _extract_strategy_code(content: str) -> str:
     for b in reversed(blocks):
         if "def should_trade" in b:
             return b
-    return blocks[-1]
+    # 4. 沒有任何實質程式碼的 fence —— v14 r-probe：模型回了一串
+    #    ```...``` 包住的規格要點（"RSI band gates: - long: RSI14 between..."），
+    #    blocks[-1] 把它當 code 送進沙箱，回測 0 筆交易且 fitness 假通過。
+    return ""
 
 
 def run_signal_ai_offline(
