@@ -202,6 +202,21 @@ Decision(operation="close", symbol=symbol, target_portion_of_balance=<0.01-1.0>,
    data.get_regime, data.get_factor, or any API not listed above.
 6. Do NOT return the sample trading logic from this message — it contains none.
    Your conditions must come from the SPECIFICATION block only.
+
+## OFFLINE EVALUATION NOTE (READ CAREFULLY)
+
+You are running OFFLINE. No user is watching, and there is no frontend to
+confirm a save dialog. The harness that calls you extracts the code you pass to
+the suggest_save_code tool and evaluates it with its own backtest over the full
+window.
+
+- Write the code, then call suggest_save_code EXACTLY ONCE with the complete
+  final code. Do not revise after that call.
+- Do NOT call quick_verify_strategy. Do NOT call get_backtest_history,
+  get_trigger_list, or get_trigger_details. Your own verification duplicates
+  the harness evaluation and consumes the entire budget.
+- Each tool round costs minutes. A reasonable first version should be saved
+  immediately rather than iterated on.
 """
     gen = generate_program_with_ai_stream(
         db=db,
