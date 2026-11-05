@@ -327,6 +327,11 @@ failures, not style warnings:
     `ict_data.get("direction")` + `ict_data.get("score")`. Never use raw `ICT`
     for direction — its direction key is always None, which turns the ICT gate
     permanently False and produces 0 trades.
+12. `ICT_OTE.score` is ALWAYS in [0.0, 1.0] — it is confluence STRENGTH, never
+    signed. Direction lives in `ict_data.get("direction")`: "bullish" or
+    "bearish" (None when unconfirmed). A short entry must gate
+    `direction == "bearish" and score >= threshold`, NEVER `score < -0.6`
+    (score is never negative, so that branch can never fire → 0 trades).
 
 ## HOW TO DELIVER THE CODE (this is the answer format)
 """
@@ -778,6 +783,7 @@ def evaluate_strategy_code(
     end_time_ms: Optional[int] = None,
     kline_period: str = "1h",
     db_factory: Optional[Any] = None,
+    max_triggers: int = 8000,
 ) -> Dict[str, Any]:
     """
     Evaluate raw strategy code directly using the same path as evaluate_individual.
@@ -811,7 +817,7 @@ def evaluate_strategy_code(
     try:
         ga, info = validate(
             db, strategy_code, symbols=symbols or ["BTC"], exchange=exchange,
-            fast_fail=True, max_triggers=8000,
+            fast_fail=True, max_triggers=max_triggers,
             backtest_days=backtest_days, end_time_ms=end_time_ms
         )
     except Exception as e:
