@@ -552,10 +552,12 @@ def run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
                             end_time_ms: Optional[int] = None,
                             kline_period: str = "1h",
                             exchange: str = "hyperliquid",
-                            db_factory: Optional[Any] = None) -> Dict[str, Any]:
+                            db_factory: Optional[Any] = None,
+                            progress_cb: Optional[Any] = None) -> Dict[str, Any]:
     """Hyper AI 模式訓練迴圈：LLM 輸出自然語言請求 -> Hyper AI pipeline -> 評估 -> 保留最佳。
 
     與 SPEC 模式共用同一套評估標準 (evaluate_spec_individual)，只換「提案生成方式」。
+    progress_cb(round_no, status)：長時間背景任務落盤進度（避免被殺後無從得知卡在哪）。
     """
     global _DB_FACTORY
     prev_factory = _DB_FACTORY
@@ -565,7 +567,8 @@ def run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
                                         backtest_days=backtest_days,
                                         end_time_ms=end_time_ms,
                                         kline_period=kline_period,
-                                        exchange=exchange)
+                                        exchange=exchange,
+                                        progress_cb=progress_cb)
     finally:
         _DB_FACTORY = prev_factory
 
@@ -576,7 +579,14 @@ def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
                              backtest_days: int = 60,
                              end_time_ms: Optional[int] = None,
                              kline_period: str = "1h",
-                             exchange: str = "hyperliquid") -> Dict[str, Any]:
+                             exchange: str = "hyperliquid",
+                             progress_cb: Optional[Any] = None) -> Dict[str, Any]:
+    def _cb(round_no: int, status: str) -> None:
+        try:
+            if progress_cb is not None:
+                progress_cb(round_no, status)
+        except Exception:
+            pass
     eval_kwargs = dict(exchange=exchange, backtest_days=backtest_days,
                        end_time_ms=end_time_ms, kline_period=kline_period)
 
@@ -597,6 +607,7 @@ def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
     history: List[Dict[str, Any]] = []
 
     for round_no in range(1, max(1, rounds) + 1):
+        _cb(round_no, "build_prompt")
         messages = build_prompt_hyper(deepcopy(best_spec), best_metrics, round_no, history)
         request_text: Optional[str] = None
         error: Optional[str] = None
@@ -608,9 +619,12 @@ def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
                     f"\nYour previous attempt was invalid: {error}. "
                     "Return one valid JSON with 'request' field.")
             try:
+                _cb(round_no, f"llm_call_attempt{attempt}")
                 text = _call_llm(messages)
+                _cb(round_no, f"llm_done_attempt{attempt}")
             except Exception as e:
                 error = f"llm_call_failed: {e}"
+                _cb(round_no, f"llm_failed: {error[:80]}")
                 break
             request_text, p_errors = _extract_request_from_llm(text)
             if request_text is not None:
@@ -621,9 +635,12 @@ def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
             history.append({"round": round_no, "spec_id": None, "fitness": None,
                             "accepted": False, "error": error,
                             "request": None})
+            _cb(round_no, f"no_request: {(error or '')[:80]}")
             continue
+        _cb(round_no, f"pipeline_start: {(request_text or '')[:60]}")
         # Run Hyper AI pipeline + evaluation
         metrics = _hyper_eval(request_text, generation=round_no + 1)
+        _cb(round_no, f"pipeline_done: fitness={metrics.get('fitness')}")
         fitness = float(metrics.get("fitness", -1e9) or -1e9)
         best_fitness = float(best_metrics.get("fitness", -1e9) or -1e9)
         accepted = fitness > best_fitness
