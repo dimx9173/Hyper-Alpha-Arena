@@ -273,12 +273,19 @@ def run_hyper_ai_offline(
     exchange: str = "hyperliquid",
     symbols: Optional[List[str]] = None,
     db_factory: Optional[Any] = None,
+    use_prompt_ai: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
     """
-    Run the full Hyper AI pipeline offline (Prompt AI → Program AI).
-    Returns (strategy_code, trace_dict).
+    Run the Hyper AI pipeline offline (Program AI directly by default).
 
-    This is the main entry point for Training Agent to evaluate Hyper AI output.
+    use_prompt_ai=False（預設）：Training Agent 的 LLM 請求就是乾淨的自然語言
+    策略規格（entry/exit、指標、參數），直接餵給 Program AI。
+    use_prompt_ai=True：走 Prompt AI → Program AI 兩段（產品 live 路徑用；
+    Prompt AI 輸出的是帶 {runtime_minutes}/{trading_environment} 佔位符和
+    live-money 警告的 session-templated prompt，Program AI 離線會誤讀為
+    「規格為空」，只能產出 hold-stub — 見 /tmp/hyper_train_v3.json 五輪全 0 筆）。
+
+    Returns (strategy_code, trace_dict).
     """
     db = (db_factory or SessionLocal)()
     trace = {
@@ -289,12 +296,17 @@ def run_hyper_ai_offline(
     }
 
     try:
-        # Stage 1: Prompt AI
-        prompt_text, prompt_trace = run_prompt_ai_offline(db, user_request, exchange)
-        trace["stages"]["prompt_ai"] = {
-            "prompt_text": prompt_text,
-            "trace": prompt_trace,
-        }
+        if use_prompt_ai:
+            # Stage 1: Prompt AI（僅產品路徑用，offline 預設跳過）
+            prompt_text, prompt_trace = run_prompt_ai_offline(db, user_request, exchange)
+            trace["stages"]["prompt_ai"] = {
+                "prompt_text": prompt_text,
+                "trace": prompt_trace,
+            }
+        else:
+            # Training Agent 的 request 本身就是規格，直接當作 prompt_text。
+            prompt_text = user_request
+            trace["stages"]["prompt_ai"] = {"skipped": True}
 
         # Stage 2: Program AI
         strategy_code, program_trace = run_program_ai_offline(
@@ -304,10 +316,6 @@ def run_hyper_ai_offline(
             "strategy_code": strategy_code,
             "trace": program_trace,
         }
-
-        # Optional: Stage 3 - Signal AI (for trigger config)
-        # signal_config, signal_trace = run_signal_ai_offline(db, user_request, exchange, symbols)
-        # trace["stages"]["signal_ai"] = {"signal_config": signal_config, "trace": signal_trace}
 
         trace["status"] = "success"
         return strategy_code, trace
