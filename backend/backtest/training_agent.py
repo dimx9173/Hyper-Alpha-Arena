@@ -553,11 +553,16 @@ def run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
                             kline_period: str = "1h",
                             exchange: str = "hyperliquid",
                             db_factory: Optional[Any] = None,
-                            progress_cb: Optional[Any] = None) -> Dict[str, Any]:
+                            progress_cb: Optional[Any] = None,
+                            round_timeout_sec: float = 0,
+                            history_cb: Optional[Any] = None) -> Dict[str, Any]:
     """Hyper AI 模式訓練迴圈：LLM 輸出自然語言請求 -> Hyper AI pipeline -> 評估 -> 保留最佳。
 
     與 SPEC 模式共用同一套評估標準 (evaluate_spec_individual)，只換「提案生成方式」。
     progress_cb(round_no, status)：長時間背景任務落盤進度（避免被殺後無從得知卡在哪）。
+    round_timeout_sec：單輪超時（秒）；0 = 不限制。Program AI 串流可能永不返回，
+    超時該輪作廢繼續下一輪，daemon 執行緒泄漏可接受（程序級上限）。
+    history_cb(history, best_metrics)：每輪落盤快照。
     """
     global _DB_FACTORY
     prev_factory = _DB_FACTORY
@@ -568,7 +573,9 @@ def run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
                                         end_time_ms=end_time_ms,
                                         kline_period=kline_period,
                                         exchange=exchange,
-                                        progress_cb=progress_cb)
+                                        progress_cb=progress_cb,
+                                        round_timeout_sec=round_timeout_sec,
+                                        history_cb=history_cb)
     finally:
         _DB_FACTORY = prev_factory
 
@@ -580,7 +587,14 @@ def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
                              end_time_ms: Optional[int] = None,
                              kline_period: str = "1h",
                              exchange: str = "hyperliquid",
-                             progress_cb: Optional[Any] = None) -> Dict[str, Any]:
+                             progress_cb: Optional[Any] = None,
+                             round_timeout_sec: float = 0,
+                             history_cb: Optional[Any] = None) -> Dict[str, Any]:
+    """round_timeout_sec > 0 時，每輪在背景執行緒跑，超時即作廢該輪繼續下一輪。
+
+    Program AI 的 HTTP 串流可能永遠不返回（v5 r2/r5 各卡 20+ 分鐘，socket 停在
+    CLOSE_WAIT）。沒有超時就整份訓練卡死；沒有 history_cb 就一掛全丟。
+    """
     def _cb(round_no: int, status: str) -> None:
         try:
             if progress_cb is not None:
@@ -596,15 +610,6 @@ def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
                                   total_generations=max(rounds, 1),
                                   db_factory=_DB_FACTORY,
                                   **eval_kwargs)
-
-    # Evaluate baseline using SPEC path (convert baseline spec to request first)
-    # For baseline, we just use the spec directly via SPEC eval
-    baseline_metrics = _run_evaluate(deepcopy(baseline_spec_dict), list(symbols),
-                                     generation=1, total_generations=max(rounds, 1),
-                                     **eval_kwargs)
-    best_spec = deepcopy(baseline_spec_dict)
-    best_metrics = baseline_metrics
-    history: List[Dict[str, Any]] = []
 
     for round_no in range(1, max(1, rounds) + 1):
         _cb(round_no, "build_prompt")
@@ -638,43 +643,72 @@ def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
             _cb(round_no, f"no_request: {(error or '')[:80]}")
             continue
         _cb(round_no, f"pipeline_start: {(request_text or '')[:60]}")
-        # Run Hyper AI pipeline + evaluation
-        metrics = _hyper_eval(request_text, generation=round_no + 1)
-        _cb(round_no, f"pipeline_done: fitness={metrics.get('fitness')}")
-        fitness = float(metrics.get("fitness", -1e9) or -1e9)
-        best_fitness = float(best_metrics.get("fitness", -1e9) or -1e9)
-        accepted = fitness > best_fitness
-        code = metrics.get("strategy_code") or ""
-        history.append({
-            "round": round_no,
-            "spec_id": metrics.get("spec_id"),
-            "fitness": fitness,
-            "accepted": accepted,
-            "error": metrics.get("error"),
-            "request": request_text,
-            # 診斷：讓事後能看出每輪到底產出什麼、為什麼 fitness 相同
-            "strategy_code_len": len(code),
-            "strategy_code_head": (code[:200] if code else ""),
-            "risk": metrics.get("risk"),
-            "metrics": {k: metrics.get(k) for k in
-                        ("gate_annual", "pnl_365d", "maxdd_365d", "sharpe_365d",
-                         "pf", "trades_365d", "win_rate")},
-        })
-        if accepted:
-            # For next round, we need a spec dict to feed build_prompt_hyper
-            # Use the derived spec from the evaluation trace
-            # Note: we don't have direct access to it here, so we keep best_spec as-is
-            # and rely on the history to show what changed
-            best_metrics = metrics
-            next_hist = dict(history[-1])
-            next_hist["delta_fitness"] = round(fitness - best_fitness, 6)
-            next_hist["changed"] = {"request": request_text}
-            history[-1] = next_hist
+
+        def _round_work(rt=request_text, rn=round_no):
+            metrics = _hyper_eval(rt, generation=rn + 1)
+            fitness = float(metrics.get("fitness", -1e9) or -1e9)
+            accepted = fitness > float(best_metrics.get("fitness", -1e9) or -1e9)
+            code = metrics.get("strategy_code") or ""
+            rec = {
+                "round": rn,
+                "spec_id": metrics.get("spec_id"),
+                "fitness": fitness,
+                "accepted": accepted,
+                "error": metrics.get("error"),
+                "request": rt,
+                # 診斷：讓事後能看出每輪到底產出什麼、為什麼 fitness 相同
+                "strategy_code_len": len(code),
+                "strategy_code_head": (code[:200] if code else ""),
+                "risk": metrics.get("risk"),
+                "metrics": {k: metrics.get(k) for k in
+                            ("gate_annual", "pnl_365d", "maxdd_365d", "sharpe_365d",
+                             "pf", "trades_365d", "win_rate")},
+            }
+            return metrics, rec
+
+        if round_timeout_sec and round_timeout_sec > 0:
+            import threading as _threading
+            result_box: Dict[str, Any] = {}
+
+            def _runner():
+                try:
+                    result_box["ok"] = _round_work()
+                except BaseException as e:
+                    result_box["err"] = e
+
+            th = _threading.Thread(target=_runner, daemon=True)
+            th.start()
+            th.join(timeout=round_timeout_sec)
+            if th.is_alive():
+                # 執行緒是 daemon，泄漏一輪的等待可接受；上限先記錄再繼續。
+                _cb(round_no, f"timeout_after_{int(round_timeout_sec)}s")
+                history.append({"round": round_no, "spec_id": None, "fitness": None,
+                                "accepted": False,
+                                "error": f"round_timeout: exceeded {round_timeout_sec}s",
+                                "request": request_text})
+                continue
+            if "err" in result_box:
+                history.append({"round": round_no, "spec_id": None, "fitness": None,
+                                "accepted": False,
+                                "error": f"round_failed: {result_box['err']}",
+                                "request": request_text})
+                continue
+            metrics, rec = result_box["ok"]
         else:
-            next_hist = dict(history[-1])
-            next_hist["delta_fitness"] = round(fitness - best_fitness, 6)
-            next_hist["changed"] = {"request": request_text}
-            history[-1] = next_hist
+            metrics, rec = _round_work()
+
+        _cb(round_no, f"pipeline_done: fitness={metrics.get('fitness')}")
+        history.append(rec)
+        try:
+            if history_cb is not None:
+                history_cb(deepcopy(history), deepcopy(best_metrics))
+        except Exception:
+            pass
+        best_fitness = float(best_metrics.get("fitness", -1e9) or -1e9)
+        rec["delta_fitness"] = round(rec["fitness"] - best_fitness, 6)
+        rec["changed"] = {"request": request_text}
+        if rec["accepted"]:
+            best_metrics = metrics
 
     return {
         "best_spec": deepcopy(best_spec),
