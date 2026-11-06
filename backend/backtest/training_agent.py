@@ -244,12 +244,21 @@ def build_prompt_hyper(baseline_spec_dict: Dict[str, Any],
     baseline = deepcopy(baseline_spec_dict)
     history_rows = []
     for h in (history or []):
+        m = h.get("metrics") or {}
+        # 訓練迴圈本來只給 LLM 看 delta_fitness，LLM 完全不知道上一輪
+        # 是「交易太多淹死」（r2 952 筆、r3 3448 筆）還是「交易太少餓死」
+        # （r4 3 筆）。v17 起把每輪的 trades/pnl/dd/pf 一起寫進 history，
+        # LLM 才能朝「60-150 筆、dd<8%、pnl>0」的正確方向修正。
         history_rows.append(
-            "round {r}: spec_id={sid} delta_fitness={df} changed={ch}".format(
+            "round {r}: delta_fitness={df} trades={t} pnl={p}% maxdd={dd}% "
+            "pf={pf} req={req}".format(
                 r=h.get("round", "?"),
-                sid=h.get("spec_id", "n/a"),
                 df=h.get("delta_fitness", "n/a"),
-                ch=h.get("changed", "n/a"),
+                t=m.get("trades_365d", "?"),
+                p=m.get("pnl_365d", "?"),
+                dd=m.get("maxdd_365d", "?"),
+                pf=m.get("pf", "?"),
+                req=str((h.get("changed") or {}).get("request", "?"))[:120],
             ))
     history_block = ""
     if history_rows:
