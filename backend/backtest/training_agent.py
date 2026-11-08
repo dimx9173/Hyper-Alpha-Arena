@@ -194,54 +194,94 @@ def build_prompt(baseline_spec_dict: Dict[str, Any],
 # ========== Hyper AI Mode Prompts ==========
 
 HYPER_AI_SYSTEM_PROMPT = """You are a systematic trading strategy designer.
-Your job: output a NATURAL LANGUAGE REQUEST for the Hyper AI trading team (4 agents:
-Prompt AI → Program AI → Signal AI → Attribution AI).
-
-The Hyper AI team will:
-1. Prompt AI: refine your request into a detailed trading prompt
-2. Program AI: write executable Python strategy code (sandboxed)
-3. Signal AI: configure trigger signals (optional)
-4. Attribution AI: post-hoc analysis (not used in offline eval)
+Your job: output a NATURAL LANGUAGE REQUEST for the Hyper AI trading team
+(Prompt AI → Program AI, sandboxed Python strategy code).
 
 Your output must be a single JSON object:
 {"request": "your natural language request here"}
 
-Allowed concepts (the Program AI knows these):
-- EMA cross (fast/slow periods, tolerance)
-- Donchian breakout (lookback, threshold)
-- RSI band (low/high)
-- ICT/SMC (OTE threshold, structure alignment, weight)
-- Risk: TP/SL %, portion of balance, leverage, max positions
-- Logic: all_pass (all filters must agree)
+DROP the old family: after 25 rounds the EMA-cross / Donchian-breakout /
+RSI-band / ICT_OTE combination has no positive edge (all fitness negative).
+Design entries from the NEW indicator family below. Never use EMA cross,
+Donchian, RSI band, or ICT as the primary entry gate.
 
-Fitness reality (same as SPEC mode):
-- Trade sweet spot: 60-150 trades/year. Below 60 penalized (small sample).
-- MaxDD > 8% heavily penalized. Keep portion * leverage small.
-- Each added filter ANDs another gate → fewer trades.
-- Prefer tuning current structure over adding filters.
+New indicator family (exact get_indicator(symbol, NAME, "1h") shapes —
+copy these dict keys verbatim into the request so Program AI emits
+working access code):
+- MACD: data.get_indicator(symbol, "MACD", "1h") -> {"macd": float,
+  "signal": float, "histogram": float}. Bullish: histogram > 0 and
+  macd > signal. Bearish: histogram < 0 and macd < signal.
+- BOLL: data.get_indicator(symbol, "BOLL", "1h") -> {"upper": float,
+  "middle": float, "lower": float}. Long only when price <= lower
+  (bounce) or price >= upper (squeeze breakout) — pick ONE per side.
+- STOCH: data.get_indicator(symbol, "STOCH", "1h") -> {"k": float,
+  "d": float}. Oversold k < 20 with k > d for longs; overbought
+  k > 80 with k < d for shorts. STOCH oscillates 0-100.
+- VWAP: data.get_indicator(symbol, "VWAP", "1h") -> {"value": float}.
+  Long bias when price > vwap, short bias when price < vwap.
+- OBV: data.get_indicator(symbol, "OBV", "1h") -> {"value": float}.
+  OBV is cumulative volume and the Strategy object is rebuilt EVERY
+  trigger, so NO slope/history is available (self.* never persists).
+  Only use its SIGN as a weak same-trigger filter (obv > 0 for longs,
+  obv < 0 for shorts). Never compare to a fixed level.
+- ATR14: data.get_indicator(symbol, "ATR14", "1h") -> {"value": float}
+  in price units. Use for volatility stops: sl_dist = 1.5*ATR,
+  tp_dist = 3.0*ATR. ATR entries must ALSO gate on a directional
+  signal (MACD histogram sign or VWAP side) — ATR alone has no direction.
+
+Semantic pairing (mixing opposite regimes yields ~0 trades):
+- OVERSOLD family (use together): STOCH k<20 with k>d, price <= BOLL
+  lower (bounce), price < VWAP about to reclaim. All three say
+  "washed-out long".
+- OVERBOUGHT family (use together): STOCH k>80 with k<d, price >= BOLL
+  upper (breakout), price < VWAP (short continuation). All three say
+  "weak short".
+- TREND family (use together): MACD histogram>0, price > VWAP, price
+  near/above BOLL middle.
+- NEVER combine STOCH k<20 (oversold) with price >= BOLL upper
+  (overbought breakout) on the same side — they almost never co-occur
+  and the pair yields ~0 trades (v21 r5 proved this exact failure).
+- NEVER combine STOCH k>80 (overbought) with price <= BOLL lower.
+
+Entry recipe (state-based, NEVER self.prev_*/crossed/self.* event gates —
+should_trade fires per scheduled trigger on a FRESH object, not per bar):
+- Pick ONE family per side (oversold-long + overbought-short, OR
+  trend both-sides) and 2 signals max per side.
+- Add a 3rd filter (ATR stop) only if trades > 150/yr.
+- Target 60-150 trades/year. MaxDD > 8% is heavily penalized, so keep
+  portion 0.2-0.35 and leverage 1-2.
 
 Hard rules:
 1. Output ONE valid JSON object only: {"request": "..."}
-2. Request must be specific and actionable for the Hyper AI team.
-3. Change something meaningful vs. the baseline (structure or tuning).
-4. Keep it concise (1-3 sentences)."""
+2. Request names exact indicator keys above, with numeric thresholds
+  (e.g. "STOCH k<20 with k>d", "MACD histogram>0", "price within 0.3%
+  of BOLL lower").
+3. Request must be state-comparison only (price vs level, k vs d,
+  macd vs signal) — forbid crossover-event phrasing.
+4. Change entry family vs. the baseline; tune thresholds, not structure.
+5. Keep it concise (2-4 sentences)."""
 
-HYPER_AI_USER_PROMPT = """Baseline performance (fitness {fitness}, gate={gate}, pnl={pnl}%, \
-maxdd={maxdd}%, sharpe={sharpe}, pf={pf}, trades={trades}):
 
-{baseline_json}
+HYPER_AI_USER_PROMPT = """Best fitness so far: {fitness} (gate={gate}, pnl={pnl}%,
+maxdd={maxdd}%, sharpe={sharpe}, pf={pf}, trades={trades}).
+The old EMA/Donchian/RSI/ICT family is retired — do NOT reference it.
 
 {history_block}
 
-Propose ONE improved natural language request for the Hyper AI team as JSON: {{"request": "..."}}"""
+Propose ONE improved natural language request for the Hyper AI team as JSON: {{"request": "..."}} — entry must come from the NEW indicator family in the system prompt."""
 
 
 def build_prompt_hyper(baseline_spec_dict: Dict[str, Any],
                        eval_summary: Dict[str, Any],
                        round_no: int,
                        history: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """Build prompt for Hyper AI mode: LLM outputs natural language request."""
-    baseline = deepcopy(baseline_spec_dict)
+    """Build prompt for Hyper AI mode: LLM outputs natural language request.
+
+    刻意不把 baseline spec JSON 貼進 prompt：baseline 是 genome_to_spec 產物，
+    形狀全是 ema_cross/donchian/rsi_band/ict_confirm。舊家族在 pinned 窗口
+    25 輪全負 fitness，貼 JSON 只會把 LLM 錨回同一組欄位名。改用「指標家族」
+    描述（HYPER_AI_SYSTEM_PROMPT）加每輪實測數字驅動。
+    """
     history_rows = []
     for h in (history or []):
         m = h.get("metrics") or {}
@@ -261,10 +301,25 @@ def build_prompt_hyper(baseline_spec_dict: Dict[str, Any],
                 req=str((h.get("changed") or {}).get("request", "?"))[:120],
             ))
     history_block = ""
-    if history_rows:
+    seed = (eval_summary or {}).get("seed_structure") if round_no == 1 else None
+    if seed:
+        # 種子輪（v24 起）：同一份 STOCH/BOLL 代碼同時跑 BTC+ETH+SOL。
+        # 前提：v22 r3 的 19 筆 +4.74% 是該結構在單幣 180d 的方向。
+        # 跑三幣合計頻率（目標 60-150 筆/年），保持同一 entry 邏輯不變。
+        # 若三幣同為負：結構無 alpha，不是頻率問題。
+        family = seed.get("family") or "STOCH/BOLL"
+        history_block = (
+            f"SEED STRUCTURE ({family}): {seed['structure']}\n"
+            f"Single-coin baseline: {seed['trades']} trades/yr, "
+            f"{seed['pnl']:+.2f}% PnL, PF {seed['pf']:.3f}.\n"
+            "Run the SAME entry logic on all symbols (BTC+ETH+SOL). "
+            "Do NOT change thresholds or add filters — this run measures "
+            "whether frequency scales with symbols, not whether tuning helps."
+        )
+    elif history_rows:
         history_block = ("Previous rounds:\n" + "\n".join(history_rows)
                          + "\n\nAvoid repeating rejected/edited ideas; "
-                           "try a different direction.")
+                           "try a different indicator pair.")
     user = HYPER_AI_USER_PROMPT.format(
         fitness=_fmt(eval_summary.get("fitness")),
         gate=str(bool(eval_summary.get("gate_annual"))).lower(),
@@ -273,7 +328,6 @@ def build_prompt_hyper(baseline_spec_dict: Dict[str, Any],
         sharpe=_fmt(eval_summary.get("sharpe_365d")),
         pf=_fmt(eval_summary.get("pf")),
         trades=_fmt(eval_summary.get("trades_365d")),
-        baseline_json=json.dumps(baseline, sort_keys=True, ensure_ascii=False),
         history_block=history_block,
     ) + f"\nRound {round_no}."
     return [{"role": "system", "content": HYPER_AI_SYSTEM_PROMPT},
@@ -319,7 +373,23 @@ def _run_hyper_ai_eval(
             raise RuntimeError(
                 f"Program AI returned no Strategy code (len={len(strategy_code or '')})"
             )
-        # Stage 2: evaluate raw code directly (bypass spec parsing)
+        # A（v18, v20 擴大）：靜態預檢事件型入口與跨觸發實例狀態。
+        # 沙箱每次 trigger 都重建 Strategy 實例（engine 兩條 _execute 路徑皆然），
+        # 所以 self.prev_*/crossed（v15 實證 ~1 筆/180d）與 self.obv_history/
+        # self.last_obv（v20 r2 實證：邏輯退化為常數路徑）都注定無效。
+        # 直接記 round_invalid，省下 200s 回測。
+        _lc = strategy_code.lower()
+        _has_state_abuse = (
+            "prev_" in _lc or "crossed" in _lc
+            or "self.obv" in _lc or "self.last_" in _lc
+            or "self.history" in _lc or "self.prices" in _lc
+        )
+        if _has_state_abuse and "get_indicator" in _lc:
+            raise RuntimeError(
+                "static_reject: instance-state entry (self.prev_*/crossed/obv/last_/history/prices). "
+                "Strategy is rebuilt every trigger — self.* never persists. "
+                "Use same-trigger state comparison instead."
+            )
         metrics = evaluate_strategy_code(
             strategy_code,
             symbols=symbols,
@@ -331,13 +401,6 @@ def _run_hyper_ai_eval(
             kline_period=kline_period,
             db_factory=db_factory,
         )
-        if not strategy_code or "class Strategy" not in strategy_code:
-            # 抽取器已拒收散文/規格要點，這裡補一道：沒有 Strategy 類別就
-            # 不進回測。空 code 會得到 0 筆交易的假 fitness（-28 而非 -1e9），
-            # 訓練迴圈會誤以為「這輪有效但很差」，浪費一輪還污染 best 追蹤。
-            raise RuntimeError(
-                f"Program AI returned no Strategy code (len={len(strategy_code or '')})"
-            )
         metrics["strategy_code"] = strategy_code
         metrics["spec_id"] = trace.get("stages", {}).get("program_ai", {}).get("trace", {}).get("message_id", f"hyper_{generation}")
         metrics["pipeline_trace"] = trace
@@ -578,7 +641,8 @@ def run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
                             db_factory: Optional[Any] = None,
                             progress_cb: Optional[Any] = None,
                             round_timeout_sec: float = 0,
-                            history_cb: Optional[Any] = None) -> Dict[str, Any]:
+                            history_cb: Optional[Any] = None,
+                            seed_structure: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Hyper AI 模式訓練迴圈：LLM 輸出自然語言請求 -> Hyper AI pipeline -> 評估 -> 保留最佳。
 
     與 SPEC 模式共用同一套評估標準 (evaluate_spec_individual)，只換「提案生成方式」。
@@ -586,6 +650,8 @@ def run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
     round_timeout_sec：單輪超時（秒）；0 = 不限制。Program AI 串流可能永不返回，
     超時該輪作廢繼續下一輪，daemon 執行緒泄漏可接受（程序級上限）。
     history_cb(history, best_metrics)：每輪落盤快照。
+    seed_structure：已知正 PnL 但頻率不足的結構（dict: structure/trades/pnl/pf），
+    只在第 1 輪寫進 prompt 當放寬起點；之後輪次看實測數字。
     """
     global _DB_FACTORY
     prev_factory = _DB_FACTORY
@@ -598,7 +664,8 @@ def run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
                                         exchange=exchange,
                                         progress_cb=progress_cb,
                                         round_timeout_sec=round_timeout_sec,
-                                        history_cb=history_cb)
+                                        history_cb=history_cb,
+                                        seed_structure=seed_structure)
     finally:
         _DB_FACTORY = prev_factory
 
@@ -612,7 +679,8 @@ def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
                              exchange: str = "hyperliquid",
                              progress_cb: Optional[Any] = None,
                              round_timeout_sec: float = 0,
-                             history_cb: Optional[Any] = None) -> Dict[str, Any]:
+                             history_cb: Optional[Any] = None,
+                             seed_structure: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """round_timeout_sec > 0 時，每輪在背景執行緒跑，超時即作廢該輪繼續下一輪。
 
     Program AI 的 HTTP 串流可能永遠不返回（v5 r2/r5 各卡 20+ 分鐘，socket 停在
@@ -645,7 +713,12 @@ def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
 
     for round_no in range(1, max(1, rounds) + 1):
         _cb(round_no, "build_prompt")
-        messages = build_prompt_hyper(deepcopy(best_spec), best_metrics, round_no, history)
+        # 種子結構只在第 1 輪注入；之後輪次改用實測 history 驅動。
+        _eval_for_prompt = dict(best_metrics or {})
+        if round_no == 1 and seed_structure:
+            _eval_for_prompt["seed_structure"] = seed_structure
+        messages = build_prompt_hyper(deepcopy(best_spec), _eval_for_prompt,
+                                      round_no, history)
         request_text: Optional[str] = None
         error: Optional[str] = None
         for attempt in range(2):
@@ -688,7 +761,11 @@ def _run_training_loop_hyper(baseline_spec_dict: Dict[str, Any],
                 "accepted": accepted,
                 "error": metrics.get("error"),
                 "request": rt,
-                # 診斷：讓事後能看出每輪到底產出什麼、為什麼 fitness 相同
+                # 診斷：讓事後能看出每輪到底產出什麼、為什麼 fitness 相同。
+                # v22 前快照只存 head 前 200 字 —— 正收益輪的完整代碼全部
+                # 不可復用（35 輪訓練等於白跑）。v22 起存全文，promote 的
+                # 種子直接從快照取 code 再評估。
+                "strategy_code": code,
                 "strategy_code_len": len(code),
                 "strategy_code_head": (code[:200] if code else ""),
                 "risk": metrics.get("risk"),

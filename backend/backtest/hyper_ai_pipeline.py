@@ -340,11 +340,38 @@ failures, not style warnings:
     180 days. Compare current indicator ORDER instead:
       WRONG: crossed = (self.prev_above != above); if crossed and above: buy
       RIGHT: if ema_fast > ema_slow * tol and price >= donchian_upper: buy
-    Exit paths may use state too (e.g. `if holding long and ema_fast < ema_slow`).
 14. Target 60-150 entries per year. Before returning, sanity-check that your
     gates can co-occur: an "all_pass" AND of 4 filters over an event-style
     condition typically yields 0-2 trades. Prefer state comparisons and
     tolerances (e.g. price >= upper * 0.99) over exact breakouts.
+15. The Strategy object is REBUILT on every trigger — `self.*` does not persist.
+    NEVER store history in instance attributes (self.prev_*, self.last_obv,
+    self.obv_history, self.prices, ...). Anything written in one call is GONE
+    by the next call, so such branches silently run on half-initialized
+    constants every time.
+      WRONG: self.obv_history.append(obv); slope = obv - self.obv_history[0]
+      RIGHT: use same-trigger direction proxies (MACD histogram sign, VWAP
+             side, BOLL position) and OBV only as an optional same-call
+             sanity check (e.g. require obv value > 0 for longs).
+16. OBV is CUMULATIVE volume — it has no fixed levels. Never compare it to an
+    absolute threshold (e.g. `obv > 1000` is meaningless). If you must use it,
+    only use its sign (obv value > 0 vs < 0) as a weak same-trigger filter.
+17. MULTI-SYMBOL POLLING (required when Symbols lists more than one). The engine
+    fires ONE scheduled trigger per interval with `data.trigger_symbol` set to
+    Symbols[0] only. Indicators and prices ARE available for every symbol:
+    `data.get_indicator("ETH", "STOCH", "1h")` works. Therefore a single-symbol
+    body silently trades only Symbols[0] and wastes the rest of the universe.
+    Correct shape — poll every symbol each call, exits first, then entries:
+      SYMBOLS = ("BTC", "ETH", "SOL")
+      for s in SYMBOLS:                      # 1) exit pass
+          pos = data.positions.get(s)
+          ...
+      for s in SYMBOLS:                      # 2) entry pass
+          if s in data.positions and data.positions[s].size > 0: continue
+          ...
+          return Decision(operation="buy", symbol=s, ...)
+    Verified: same STOCH/BOLL logic went 34 trades (-32.8%) on one symbol to
+    100 trades (-23.3%, PF 0.32 -> 0.56) when polled across three.
 
 ## HOW TO DELIVER THE CODE (this is the answer format)
 """
