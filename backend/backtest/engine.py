@@ -246,6 +246,9 @@ class ProgramBacktestEngine:
                 except Exception:
                     pass
 
+            # 強平檢查：任何 trigger 都先確認倉位沒有達到維持保證金線。
+            # 無此檢查時逆勢槓桿單無限扛單（實測 ZEC 1d 862d equity -1242%）。
+            self._check_liquidations(account, prices, trigger.timestamp, trades, simulator)
             # Determine trigger symbol
             trigger_symbol = trigger.symbol if trigger.symbol else config.symbols[0]
 
@@ -630,6 +633,44 @@ class ProgramBacktestEngine:
                 yield exec_result
                 next_scheduled_time = last_trigger_time + scheduled_interval_ms
 
+    def _check_liquidations(
+        self,
+        account,
+        prices,
+        timestamp: int,
+        trades: list,
+        simulator,
+    ) -> None:
+        """HL-style isolated-margin liquidation check (one-liner hook).
+
+        無強平的回測是假的：逆勢槓桿單在真實市場早被砍掉，不能無限扛單。
+        維持保證金率 50%（與 VirtualAccount.get_maintenance_margin 一致），
+        權益 <= 維持保證金即市價全平，當根 trigger 收一筆強平費用。
+        """
+        for symbol in list(account.positions.keys()):
+            px = prices.get(symbol, 0) or 0
+            if px <= 0:
+                continue
+            pos = account.positions.get(symbol)
+            if pos is None or pos.size <= 0:
+                continue
+            pos.update_pnl(px)
+            eq = account.initial_balance + account.realized_pnl_total
+            eq += sum(
+                p.update_pnl(prices[s]) for s, p in account.positions.items()
+                if s in prices and prices[s]
+            )
+            eq -= account.total_fees
+            if eq <= pos.margin_used * 0.5:
+                rec = simulator._execute_close(
+                    account=account, symbol=symbol, current_price=px,
+                    timestamp=timestamp, trigger_type="scheduled", pool_name="",
+                    triggered_signals=[], reason="liquidation", target_portion=1.0,
+                )
+                if rec is not None:
+                    rec.exit_reason = "liquidation"
+                    trades.append(rec)
+
     def _build_market_data(
         self,
         account: VirtualAccount,
@@ -773,20 +814,24 @@ class ProgramBacktestEngine:
         # 未收盤的變動價格，造成候選間不可比。
         prices: Dict[str, float] = {}
         for symbol in account.positions:
+            # 主週期取 config.kline_period（預設 1h 保持舊行為）。寫死 1h 會讓
+            # 2h/4h/1d 回測在只有粗週期資料的區間（如 2026-04 之前的乾淨區）
+            # 拿不到價格，部位不平倉 -> 會計恆等式破裂（實測 ZEC DD 216%）。
             row = self.db.execute(text(
                 "SELECT close_price FROM crypto_klines "
-                "WHERE symbol = :s AND exchange = :ex AND period = '1h' "
+                "WHERE symbol = :s AND exchange = :ex AND period = :p "
                 "AND timestamp <= :t ORDER BY timestamp DESC LIMIT 1"
-            ), {"s": symbol, "ex": config.exchange, "t": end_time_sec}).fetchone()
+            ), {"s": symbol, "ex": config.exchange, "t": end_time_sec,
+                "p": config.kline_period}).fetchone()
             if row and row[0] is not None:
                 prices[symbol] = float(row[0])
             else:
-                # fallback：允許更粗的週期，但必須 <= end_time_sec。
-                # 寧可降級到 5m/15m，也不要拿 end_time 之後的資料造成前視偏差。
+                # fallback：允許任何已存在的週期，但必須 <= end_time_sec。
+                # 不要只列細週期：乾淨區沒有 1h/5m/15m，只有 2h/4h/1d。
                 row2 = self.db.execute(text(
-                    "SELECT close_price, timestamp FROM crypto_klines "
+                    "SELECT close_price, timestamp, period FROM crypto_klines "
                     "WHERE symbol = :s AND exchange = :ex "
-                    "AND period IN ('1h','5m','15m') AND timestamp <= :t "
+                    "AND timestamp <= :t "
                     "ORDER BY timestamp DESC LIMIT 1"
                 ), {"s": symbol, "ex": config.exchange, "t": end_time_sec}).fetchone()
                 if row2 and row2[0] is not None:

@@ -25,6 +25,9 @@ class BacktestConfig:
     initial_balance: float = 10000.0
     slippage_percent: float = 0.05         # 0.05% default slippage
     fee_rate: float = 0.035                # 0.035% Hyperliquid taker fee
+    # Primary kline period for engine price queries (force-close etc.)
+    # Default "1h" keeps historical behavior for existing callers.
+    kline_period: str = "1h"
 
     # Execution assumptions
     execution_price: str = "close"         # "close", "open", "vwap"
