@@ -996,19 +996,29 @@ class ProgramBacktestEngine:
         # Win rate
         win_rate = (len(winning_trades) / total_trades * 100) if total_trades > 0 else 0
 
-        # Profit factor
-        total_profit = sum(t.pnl for t in winning_trades)
-        total_loss = abs(sum(t.pnl for t in losing_trades))
+        # Net-basis PF: attribute account-level fees (entry + exit + funding shadow)
+        # pro-rata across closed trades by notional. Per-trade fee records only
+        # hold the exit leg (t.fee), so dividing total_fees by notional is the
+        # only consistent basis. All-loss/all-win edge cases stay None-safe.
+        total_notional = sum((t.size or 0) * (t.entry_price or 0) for t in closed_trades)
+        fee_rate = (abs(account.total_fees) / total_notional) if total_notional > 0 else 0.0
+        net_profits = [t.pnl - (t.size or 0) * (t.entry_price or 0) * fee_rate for t in winning_trades]
+        net_losses = [t.pnl - (t.size or 0) * (t.entry_price or 0) * fee_rate for t in losing_trades]
+        # Re-split: a fee-adjusted winner may flip to a loser and vice versa.
+        net_wins = [p for p in net_profits + net_losses if p > 0]
+        net_ls = [p for p in net_profits + net_losses if p <= 0]
+        total_profit = sum(net_wins)
+        total_loss = abs(sum(net_ls))
         # When total_loss is 0, profit_factor is undefined (use None to avoid JSON Infinity issue)
         profit_factor = (total_profit / total_loss) if total_loss > 0 else None
 
         # Average win/loss
-        avg_win = (total_profit / len(winning_trades)) if winning_trades else 0
-        avg_loss = (total_loss / len(losing_trades)) if losing_trades else 0
+        avg_win = (total_profit / len(net_wins)) if net_wins else 0
+        avg_loss = (total_loss / len(net_ls)) if net_ls else 0
 
         # Largest win/loss
-        largest_win = max((t.pnl for t in winning_trades), default=0)
-        largest_loss = min((t.pnl for t in losing_trades), default=0)
+        largest_win = max(net_wins, default=0)
+        largest_loss = min(net_ls, default=0)
 
         # Trigger counts
         signal_triggers = sum(1 for t in triggers if t.trigger_type == "signal")
