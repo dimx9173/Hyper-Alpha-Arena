@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 _BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_BACKEND))
@@ -36,6 +37,19 @@ from backtest.ga_annual import Genome, evaluate_individual  # noqa: E402
 from database.connection import SessionLocal  # noqa: E402
 
 DEFAULT_SYMBOLS = ("BTC,ETH,SOL,HYPE,DOGE,SUI,ARB,AVAX,BNB,NEAR,AAVE,TAO").split(",")
+
+
+def _record_kind(record: dict) -> str:
+    """ledger 記錄的策略型別。舊記錄沒有 kind，一律視為 genome。"""
+    kind = record.get("kind")
+    return str(kind) if kind else "genome"
+
+
+def _payload(record: dict) -> dict:
+    """取記錄的策略定義：spec 記錄用 spec，genome 記錄用 genome。"""
+    if _record_kind(record) == "spec":
+        return dict(record.get("spec") or {})
+    return dict(record.get("genome") or {})
 
 
 def _metrics(res: dict) -> dict:
@@ -52,17 +66,30 @@ def _metrics(res: dict) -> dict:
 def _reeval_champion(
     led: ChampionLedger, champ: dict, symbols: list, period: str,
     eval_days: int, end_ms: int, max_triggers: int,
+    bars_5m: Optional[dict] = None,
 ) -> None:
-    res = evaluate_individual(
-        champ["genome"], symbols, "hyperliquid",
-        generation=1, total_generations=1,
-        backtest_days=eval_days, end_time_ms=end_ms,
-        kline_period=period,
-    )
+    """Reevaluate the champion on a shorter window, dispatching on record kind."""
+    if _record_kind(champ) == "spec":
+        from backtest.strategy_spec import evaluate_lgbm_spec
+
+        if not bars_5m:
+            raise SystemExit("spec 記錄的 reeval 需要 bars_5m（5m K 線）")
+        res = evaluate_lgbm_spec(
+            _payload(champ), bars_5m, symbols=symbols,
+            generation=1, total_generations=1,
+            backtest_days=eval_days, end_time_ms=end_ms,
+        )
+    else:
+        res = evaluate_individual(
+            _payload(champ), symbols, "hyperliquid",
+            generation=1, total_generations=1,
+            backtest_days=eval_days, end_time_ms=end_ms,
+            kline_period=period,
+        )
     entry = led.reeval(
         champ, _metrics(res), float(res.get("fitness") or 0.0),
         eval_days, end_ms,
-        note=f"refit reeval on {period}/{eval_days}d",
+        note=f"refit reeval on {period}/{eval_days}d ({_record_kind(champ)})",
     )
     print(f"  現任 reeval：PnL {entry['metrics']['pnl_percent']:+.2f}%  "
           f"decay {entry['decay_pnl']:+.2f}%  gate={entry['metrics']['gate']}")
@@ -107,6 +134,94 @@ def _best(rows: list) -> dict:
     return max(rows, key=lambda r: r.get("fitness") or -1e18)
 
 
+def _load_bars_5m(path: str) -> dict:
+    """讀 spec 模式的 5m K 線：{symbol: [{timestamp, open, ...}]} -> DataFrame。
+
+    timestamp 是 period 起始秒（與 _query_klines_from_db 同語義）。
+    """
+    import pandas as _pd
+
+    raw = json.loads(Path(path).read_text())
+    out = {}
+    for symbol, rows in raw.items():
+        frame = _pd.DataFrame(rows)
+        if "timestamp" in frame.columns:
+            idx = _pd.to_datetime(frame["timestamp"].astype(int), unit="s", utc=True)
+            frame = frame.drop(columns=["timestamp"]).set_index(idx)
+            frame.index.name = "open_time"
+        out[str(symbol)] = frame
+    return out
+
+
+def _default_lgbm_spec() -> dict:
+    from backtest.strategy_spec import FILTER_DEFAULTS
+
+    return {
+        "filters": [{
+            "kind": "lgbm_gate",
+            "params": dict(FILTER_DEFAULTS["lgbm_gate"]),
+        }],
+        "risk": {"tp_pct": 0.08, "sl_pct": 0.04, "portion": 0.25,
+                 "leverage": 2, "max_positions": 3},
+        "logic": "all_pass",
+    }
+
+
+def _run_spec_refit(args: argparse.Namespace) -> int:
+    """spec 模式的一輪：現任 reeval -> 候選評估 -> promote。
+
+    不跑 GA、不跑鄰域子程序。ledger 用 kind=spec 區分，genome 鍵留空 dict。
+    """
+    from backtest.strategy_spec import StrategySpec, evaluate_lgbm_spec, is_lgbm_spec
+
+    if not args.bars_5m_json:
+        raise SystemExit("spec 模式需要 --bars-5m-json")
+    bars = _load_bars_5m(args.bars_5m_json)
+    led = ChampionLedger(args.ledger)
+    end_ms = int(time.time() * 1000)
+    t0 = time.time()
+    print(f"[refit:spec] window={args.window_days}d symbols={list(bars)}")
+
+    champ = led.current()
+    if champ is not None and _record_kind(champ) == "spec":
+        print(f"[refit:spec] 現任 {champ.get('genome_id')} reeval…")
+        _reeval_champion(led, champ, args.symbols, "5m",
+                         args.eval_days, end_ms, args.max_triggers,
+                         bars_5m=bars)
+    elif champ is not None:
+        print("[refit:spec] 現任是 genome 記錄，跳過 reeval（跨型別首輪）")
+    else:
+        print("[refit:spec] ledger 無現任，跳過 reeval（首輪）")
+
+    if args.spec_json:
+        candidate = json.loads(Path(args.spec_json).read_text())
+    elif champ is not None and _record_kind(champ) == "spec":
+        candidate = _payload(champ)
+    else:
+        candidate = _default_lgbm_spec()
+    spec = StrategySpec.from_dict(candidate)
+    if not is_lgbm_spec(spec):
+        raise SystemExit("spec 模式只接受含 lgbm_gate 的 spec")
+    res = evaluate_lgbm_spec(
+        candidate, bars, symbols=args.symbols or list(bars),
+        generation=1, total_generations=1,
+        backtest_days=args.window_days, end_time_ms=end_ms,
+    )
+    print(f"[refit:spec] 候選 gate={res['gate_annual']} "
+          f"pnl {res.get('pnl_365d', 0):+.2f}%  trades {res.get('trades_365d')}  "
+          f"fitness {res.get('fitness', 0):+.3f}")
+    led._append({
+        "event": "promote", "ts": int(time.time() * 1000),
+        "kind": "spec", "spec": spec.to_dict(), "genome": {},
+        "genome_id": spec.spec_id(), "period": "5m",
+        "window_days": int(args.window_days), "end_time_ms": int(end_ms),
+        "metrics": _metrics(res), "fitness": float(res.get("fitness") or 0.0),
+        "run_id": f"refit_spec_{end_ms}", "note": args.note,
+    })
+    print(f"[refit:spec] promote 完成（{time.time()-t0:.0f}s）：spec {spec.spec_id()}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="refit 循環：一輪重新擬合")
     ap.add_argument("--symbols", default=",".join(DEFAULT_SYMBOLS),
@@ -122,6 +237,12 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--max-triggers", type=int, default=8000)
     ap.add_argument("--ledger", type=Path, default=Path("/tmp/champion_ledger.jsonl"))
+    ap.add_argument("--strategy-kind", default="genome", choices=("genome", "spec"),
+                    help="genome 走 GA 路徑；spec 走 LGBM 分支（需 --bars-5m-json）")
+    ap.add_argument("--bars-5m-json", type=str, default=None,
+                    help="5m K 線 JSON（symbol -> records），spec 模式必填")
+    ap.add_argument("--spec-json", type=str, default=None,
+                    help="候選 spec JSON 檔；不傳則用 ledger 現任 spec 或預設 lgbm_gate")
     ap.add_argument("--seed-log-inline", type=str, default=None,
                     help="GA 初代 seed 用的 jsonl（通常是 champion 歷史）")
     ap.add_argument("--neighbors", type=int, default=10,
@@ -129,6 +250,8 @@ def main() -> int:
     ap.add_argument("--note", type=str, default="")
     args = ap.parse_args()
     args.symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if args.strategy_kind == "spec":
+        return _run_spec_refit(args)
 
     led = ChampionLedger(args.ledger)
     end_ms = int(time.time() * 1000)

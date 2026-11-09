@@ -100,7 +100,9 @@ class ChampionLedger:
         return self._append({
             "event": "reeval",
             "ts": int(time.time() * 1000),
-            "genome_id": champion.get("genome_id") or genome_id(champion["genome"]),
+            # kind 必須繼承，否則 spec 記錄的 reeval 會被分派誤判為 genome。
+            "kind": champion.get("kind") or "genome",
+            "genome_id": champion.get("genome_id") or genome_id(champion.get("genome") or champion.get("spec") or {}),
             "period": champion.get("period"),
             "window_days": int(window_days),
             "end_time_ms": int(end_time_ms),
