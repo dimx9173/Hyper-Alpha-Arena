@@ -28,10 +28,10 @@ except ImportError:  # pragma: no cover - 非標準路徑下的退路
 
 # ========== 型別 ==========
 
-FilterKind = Literal["ema_cross", "donchian_breakout", "rsi_band", "ict_confirm"]
+FilterKind = Literal["ema_cross", "donchian_breakout", "rsi_band", "ict_confirm", "lgbm_gate"]
 LogicSpec = Literal["all_pass"]
 
-FILTER_KINDS = ("ema_cross", "donchian_breakout", "rsi_band", "ict_confirm")
+FILTER_KINDS = ("ema_cross", "donchian_breakout", "rsi_band", "ict_confirm", "lgbm_gate")
 
 # 每種 filter 的參數範圍，鏡像 ga_annual.BOUNDS（含 ICT_BOUNDS）。
 FILTER_PARAM_RANGES: Dict[str, Dict[str, tuple]] = {
@@ -61,6 +61,14 @@ FILTER_PARAM_RANGES: Dict[str, Dict[str, tuple]] = {
         "swing_len": (1, 6),
         "weight": (0.0, 1.0),
     },
+    # lgbm_gate 是腦不是規則：x/y/M 走三重障礙（v15 下限由 validate 強制），
+    # entry_threshold 是 p_cal 進場線。lag_n 固定 5 不開放擾動。
+    "lgbm_gate": {
+        "x": (0.004, 0.06),
+        "y": (1.0, 4.0),
+        "M": (144, 500),
+        "entry_threshold": (0.50, 0.75),
+    },
 }
 
 # 每種 filter 的預設值（= Genome 預設值）。
@@ -72,6 +80,7 @@ FILTER_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "ict_confirm": {"ote_threshold": 0.0, "require_alignment": 0,
                     "require_bull_structure": 0, "require_discount": 0,
                     "swing_len": 5, "weight": 0.0},
+    "lgbm_gate": {"x": 0.03, "y": 2.0, "M": 144, "entry_threshold": 0.55},
 }
 
 # 整數參數（擾動後 round；鏡像 neighborhood_robustness.INT_GENES 語義）。
@@ -94,12 +103,13 @@ RISK_DEFAULTS: Dict[str, Any] = {
     "leverage": 2, "max_positions": 3,
 }
 
-# 每種 filter 背後的因子名（validate_spec 用它做可解析性檢查）。
 _KIND_FACTOR_NAMES: Dict[str, List[str]] = {
     "ema_cross": ["ema_fast", "ema_slow"],
     "donchian_breakout": ["donchian"],
     "rsi_band": ["RSI14"],
     "ict_confirm": ["ICT_OTE", "ICT_STRUCTURE", "ICT_PREMIUM_DISCOUNT"],
+    # lgbm_gate 不走 registry 因子：特徵由管線內定，驗證只收 M 與閾值。
+    "lgbm_gate": [],
 }
 
 # closes 迴歸計算用的 lookback 名（非 registry 因子，但合法）。
@@ -228,6 +238,20 @@ def validate_spec(spec: StrategySpec) -> List[str]:
             if pname in params:
                 _check_numeric(errors, f"{where} ({kind})", pname,
                                params[pname], lo, hi)
+        if kind == "lgbm_gate" and "M" in params:
+            # v15 執行層約束：M 低於 12h 等價根數時直接判非法，
+            # 錯誤字串即判據，不依賴呼叫端記得檢查。
+            try:
+                from backtest.lgbm_meta_labeling import min_hold_bars
+            except ImportError:  # pragma: no cover - 非標準路徑退路
+                from backend.backtest.lgbm_meta_labeling import (  # type: ignore
+                    min_hold_bars,
+                )
+            if float(params["M"]) < min_hold_bars():
+                errors.append(
+                    f"{where} (lgbm_gate): M={params['M']} 低於 v15 下限 "
+                    f"{min_hold_bars()} 根（12h / 5m 軸），短持倉不做"
+                )
         for fname in _KIND_FACTOR_NAMES[kind]:
             if not _resolvable(fname):
                 errors.append(f"{where} ({kind}): 因子名 {fname!r} 無法解析")
@@ -263,6 +287,10 @@ def render_strategy_from_spec(spec: StrategySpec,
     for f in spec.filters:
         if f.kind not in FILTER_KINDS:
             raise ValueError(f"未知 filter kind: {f.kind!r}")
+        if f.kind == "lgbm_gate":
+            # LGBM 無法在受限 sandbox 內推論（無 lightgbm/numpy）。
+            # lgbm_gate 走 _evaluate_lgbm_spec 的 Fuxi 模擬器，不 render。
+            raise ValueError("lgbm_gate 不支援 render：請用 evaluate_lgbm_spec")
 
     fmap = _filter_map(spec)
     ema = dict(FILTER_DEFAULTS["ema_cross"])
@@ -712,6 +740,238 @@ def evaluate_spec_individual(spec_dict, symbols, exchange="hyperliquid", generat
     exploration_gens = min(exploration_gens, max(1, total_generations))
     use_exploration = (generation - 1) < exploration_gens
     return _evaluate_spec(spec, symbols, exchange, use_exploration, backtest_days, end_time_ms, windows, kline_period)
+
+
+LGBM_GATE_KIND = "lgbm_gate"
+
+
+def is_lgbm_spec(spec: "StrategySpec") -> bool:
+    """spec 是否含 lgbm_gate。含則走 Fuxi 模擬器，不走 render 路徑。"""
+    return any(getattr(f, "kind", None) == LGBM_GATE_KIND for f in (spec.filters or []))
+
+
+def lgbm_gate_params(spec: "StrategySpec") -> dict:
+    """取第一個 lgbm_gate 的參數，未填則補預設。"""
+    merged = dict(FILTER_DEFAULTS[LGBM_GATE_KIND])
+    for f in spec.filters or []:
+        if getattr(f, "kind", None) == LGBM_GATE_KIND:
+            merged.update(dict(getattr(f, "params", {}) or {}))
+            break
+    return merged
+
+
+def _fuxi_result_to_f365(result, initial_capital: float = 1000.0) -> dict:
+    """FuxiBacktestResult -> f365 欄位（語義對齊 _extract_gate_fields）。
+
+    pnl_percent 是相對本金的百分比；win 是 0-100；sharpe 用逐筆淨報酬的
+    mean/std（單筆或零波動回 0，不偽造）；pf 是總盈利/總虧損。
+    """
+    import numpy as _np
+
+    trades = list(getattr(result, "trades", []) or [])
+    wins = [t for t in trades if float(getattr(t, "net_pnl_u", 0.0) or 0.0) > 0]
+    losses = [t for t in trades if float(getattr(t, "net_pnl_u", 0.0) or 0.0) <= 0]
+    gross_win = float(sum(float(getattr(t, "net_pnl_u", 0.0) or 0.0) for t in wins))
+    gross_loss = float(sum(-float(getattr(t, "net_pnl_u", 0.0) or 0.0) for t in losses))
+    rets = _np.asarray([float(getattr(t, "net_ret", 0.0) or 0.0) for t in trades], dtype=float)
+    if len(rets) >= 2 and float(_np.std(rets, ddof=1)) > 1e-12:
+        sharpe = float(_np.mean(rets) / _np.std(rets, ddof=1))
+    else:
+        sharpe = 0.0
+    base = float(initial_capital) if float(initial_capital or 0.0) > 0 else 1000.0
+    return {
+        "pnl_percent": float(getattr(result, "total_net_pnl", 0.0) or 0.0) / base * 100.0,
+        "pnl": float(getattr(result, "total_net_pnl", 0.0) or 0.0),
+        "sharpe": sharpe,
+        "pf": (gross_win / gross_loss) if gross_loss > 0 else None,
+        "win": float(getattr(result, "win_rate", 0.0) or 0.0) * 100.0,
+        "trades": int(getattr(result, "n_trades", 0) or 0),
+        "maxdd_pct": float(getattr(result, "max_drawdown", 0.0) or 0.0) * 100.0,
+        "maxdd": float(getattr(result, "max_drawdown", 0.0) or 0.0),
+    }
+
+
+def evaluate_lgbm_spec(
+    spec_dict,
+    bars_5m,
+    symbols=("BTC",),
+    exchange="hyperliquid",
+    generation=0,
+    total_generations=100,
+    backtest_days=365,
+    end_time_ms=None,
+    windows=None,
+    kline_period="5m",
+):
+    """用 Fuxi 模擬器評估含 lgbm_gate 的 spec。
+
+    ``bars_5m`` 是 dict[symbol, DataFrame] 或單一 DataFrame（單標的時）。
+    回傳鍵與 evaluate_spec_individual 同名同義。
+    """
+    spec = StrategySpec.from_dict(spec_dict)
+    errors = validate_spec(spec)
+    if errors:
+        raise ValueError("invalid spec: " + "; ".join(errors))
+    if not is_lgbm_spec(spec):
+        raise ValueError("evaluate_lgbm_spec 只接受含 lgbm_gate 的 spec")
+
+    _load_ga()
+    override = _GA["ga"].EXPLORATION_GENS_OVERRIDE
+    if override is not None and override > 0:
+        exploration_gens = int(override)
+    else:
+        exploration_gens = max(3, int(total_generations * 0.5))
+    exploration_gens = min(exploration_gens, max(1, total_generations))
+    use_exploration = (generation - 1) < exploration_gens
+
+    if isinstance(bars_5m, dict):
+        per_symbol = dict(bars_5m)
+    else:
+        only = list(symbols or ["BTC"])[0]
+        per_symbol = {only: bars_5m}
+    if not windows:
+        windows = [(end_time_ms, backtest_days, 1.0)]
+
+    try:
+        from backtest.lgbm_meta_labeling import (
+            MetaLabelConfig,
+            build_meta_frame,
+            fit_meta_label_model,
+        )
+    except ImportError:  # pragma: no cover - 非標準路徑退路
+        from backend.backtest.lgbm_meta_labeling import (  # type: ignore
+            MetaLabelConfig,
+            build_meta_frame,
+            fit_meta_label_model,
+        )
+    try:
+        from fuxi.backtest import FuxiBacktestConfig, FuxiBacktestRunner
+        from fuxi.ratchet import AsymmetricCompoundingRatchet
+        from fuxi.risk import PerpetualRiskAndSmoothingEngine
+        from fuxi.rolling import RollingClosedLoopController
+    except ImportError:  # pragma: no cover - 非標準路徑退路
+        from backend.fuxi.backtest import (  # type: ignore
+            FuxiBacktestConfig,
+            FuxiBacktestRunner,
+        )
+        from backend.fuxi.ratchet import AsymmetricCompoundingRatchet  # type: ignore
+        from backend.fuxi.risk import PerpetualRiskAndSmoothingEngine  # type: ignore
+        from backend.fuxi.rolling import RollingClosedLoopController  # type: ignore
+    try:
+        from config.fees import FeeSchedule
+    except ImportError:  # pragma: no cover - 非標準路徑退路
+        from backend.config.fees import FeeSchedule  # type: ignore
+
+    params = lgbm_gate_params(spec)
+    threshold = float(params.get("entry_threshold", 0.55))
+    cfg_bt = FuxiBacktestConfig(entry_threshold=threshold)
+    try:
+        from fuxi.labels import MetaLabelingEngine
+    except ImportError:  # pragma: no cover - 非標準路徑退路
+        from backend.fuxi.labels import MetaLabelingEngine  # type: ignore
+    per_window = []
+    for _w_end, w_days, w_weight in windows:
+        cfg_lgbm = MetaLabelConfig(
+            x=float(params["x"]), y=float(params["y"]), M_bars=int(params["M"]),
+            entry_threshold=threshold,
+        )
+        symbol = list(per_symbol.keys())[0]
+        bars = per_symbol[symbol]
+        X, y, w, realized, expired = build_meta_frame(bars, cfg_lgbm)
+        if len(X) == 0:
+            per_window.append((_w_end, w_days, float(w_weight), False, {
+                "f365": {"pnl_percent": 0.0, "maxdd_pct": 100.0, "sharpe": 0.0,
+                         "trades": 0, "win": 0.0, "pf": None},
+                "pf_ok": False,
+            }))
+            continue
+        split = max(1, int(len(X) * 0.7))
+        ctrl = RollingClosedLoopController(dsr_threshold=0.95)
+        duel = ctrl.train_and_evaluate_challenger(
+            X.iloc[:split], y.iloc[:split], w[:split],
+            X.iloc[split:], y.iloc[split:], realized[split:],
+            candidate_params={"x": cfg_lgbm.x, "y": cfg_lgbm.y,
+                              "M": float(cfg_lgbm.M_bars)},
+            val_expired=expired[split:],
+            entry_threshold=threshold,
+        )
+        if ctrl.champion is None:
+            per_window.append((_w_end, w_days, float(w_weight), False, {
+                "f365": {"pnl_percent": 0.0, "maxdd_pct": 100.0, "sharpe": 0.0,
+                         "trades": 0, "win": 0.0, "pf": None},
+                "pf_ok": False, "duel": duel,
+            }))
+            continue
+        runner = FuxiBacktestRunner(
+            ctrl, AsymmetricCompoundingRatchet(cfg_bt.initial_capital),
+            PerpetualRiskAndSmoothingEngine(), cfg_bt, FeeSchedule(),
+        )
+        primary_signals = MetaLabelingEngine(
+            x=cfg_lgbm.x, y=cfg_lgbm.y, M=cfg_lgbm.M_bars,
+        ).generate_primary_signals(bars)
+        fuxi_out = runner.run(bars, X, primary_signals)
+        f365 = _fuxi_result_to_f365(fuxi_out, cfg_bt.initial_capital)
+        pf = f365.get("pf")
+        pf_ok = (pf is not None) and (float(pf) > 1.5)
+        gate_pass = bool(
+            duel.get("status") in ("INITIAL_CHAMPION_DEPLOYED", "CHALLENGER_PROMOTED")
+            and f365["pnl_percent"] >= 20.0
+            and f365["maxdd_pct"] <= 8.0
+            and pf_ok
+        )
+        per_window.append((_w_end, w_days, float(w_weight), gate_pass, {
+            "f365": f365, "pf_ok": pf_ok, "duel": duel,
+        }))
+
+    refs = _load_ga()
+    ga_mod = refs["ga"]
+    calc = (refs["calculate_exploration_fitness"] if use_exploration
+            else refs["calculate_fitness"])
+    primary = max(range(len(per_window)), key=lambda i: (per_window[i][2], i))
+    _w_end, _w_days, _w_weight, gate, info = per_window[primary]
+    f365 = (info or {}).get("f365", {}) or {}
+    pf_ok = bool((info or {}).get("pf_ok"))
+    result = _make_eval_result(spec, gate, f365)
+    primary_fitness = calc(result)
+    n_pass, fitness_num, weight_total = 0, 0.0, 0.0
+    for _we, _wd, _ww, _wg, winfo in per_window:
+        wr = _make_eval_result(spec, _wg, (winfo or {}).get("f365", {}) or {})
+        if _wg:
+            n_pass += 1
+        fitness_num += _ww * calc(wr)
+        weight_total += _ww
+    consistency = n_pass / float(len(per_window)) if per_window else 0.0
+    aggregate = fitness_num / weight_total if weight_total else primary_fitness
+    if use_exploration:
+        fitness = aggregate
+    else:
+        fitness = aggregate - ga_mod.WINDOW_CONSISTENCY_PENALTY * (1.0 - consistency)
+    return {
+        "spec": spec.to_dict(),
+        "gate_annual": bool(gate),
+        "pnl_365d": result.pnl_365d,
+        "maxdd_365d": result.maxdd_365d,
+        "sharpe_365d": result.sharpe_365d,
+        "pf": result.pf,
+        "pf_ok": pf_ok,
+        "trades_365d": result.trades_365d,
+        "win_rate": result.win_rate,
+        "fitness": fitness,
+        "spec_id": spec.spec_id(),
+        "window_consistency": consistency,
+        "windows_passed": n_pass,
+        "windows_total": len(per_window),
+        "window_detail": [
+            {
+                "days": _wd,
+                "weight": _ww,
+                "pass": bool(_wg),
+                "pnl": round(float(((_w or {}).get("f365", {}) or {}).get("pnl_percent", 0) or 0), 2),
+                "maxdd": round(float(((_w or {}).get("f365", {}) or {}).get("maxdd_pct", 0) or 0), 2),
+            }
+            for _we, _wd, _ww, _wg, _w in per_window
+        ],
+    }
 
 
 def _neighborhood_stats(base_pnl, samples):
