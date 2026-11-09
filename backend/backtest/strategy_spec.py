@@ -782,7 +782,9 @@ def _fuxi_result_to_f365(result, initial_capital: float = 1000.0) -> dict:
     gross_loss = float(sum(-float(getattr(t, "net_pnl_u", 0.0) or 0.0) for t in losses))
     rets = _np.asarray([float(getattr(t, "net_ret", 0.0) or 0.0) for t in trades], dtype=float)
     if len(rets) >= 2 and float(_np.std(rets, ddof=1)) > 1e-12:
-        sharpe = float(_np.mean(rets) / _np.std(rets, ddof=1))
+        # 引擎口徑：逐筆 Sharpe 乘 sqrt(365) 年化（engine.py:1046 同式），
+        # 否則 MIN_SHARPE=0.5 這類年化門檻會把正常的逐筆 SR 0.15 判成不達標。
+        sharpe = float(_np.mean(rets) / _np.std(rets, ddof=1)) * float(_np.sqrt(365.0))
     else:
         sharpe = 0.0
     base = float(initial_capital) if float(initial_capital or 0.0) > 0 else 1000.0
@@ -909,6 +911,9 @@ def evaluate_lgbm_spec(
                 "pf_ok": False, "duel": duel,
             }))
             continue
+        # OOS 評估只看驗證段：runner 在訓練段也會開單，那段利潤是樣本內，
+        # 計入會把 pnl 吹大、consistency 吹成永遠一致。
+        oos_start = split
         runner = FuxiBacktestRunner(
             ctrl, AsymmetricCompoundingRatchet(cfg_bt.initial_capital),
             PerpetualRiskAndSmoothingEngine(), cfg_bt, FeeSchedule(),
@@ -916,15 +921,18 @@ def evaluate_lgbm_spec(
         primary_signals = MetaLabelingEngine(
             x=cfg_lgbm.x, y=cfg_lgbm.y, M=cfg_lgbm.M_bars,
         ).generate_primary_signals(bars)
-        fuxi_out = runner.run(bars, X, primary_signals)
+        fuxi_out = runner.run(bars.iloc[oos_start:], X.iloc[oos_start:],
+                              primary_signals.loc[X.index[oos_start:]])
         f365 = _fuxi_result_to_f365(fuxi_out, cfg_bt.initial_capital)
         pf = f365.get("pf")
         pf_ok = (pf is not None) and (float(pf) > 1.5)
+        # duel 的部署狀態只是 Loop2 機械結果，不代表候選通過門檻。
+        # 首部署無條件建倉，所以只看回測四項硬指標。
         gate_pass = bool(
-            duel.get("status") in ("INITIAL_CHAMPION_DEPLOYED", "CHALLENGER_PROMOTED")
-            and f365["pnl_percent"] >= 20.0
+            f365["pnl_percent"] >= 20.0
             and f365["maxdd_pct"] <= 8.0
             and pf_ok
+            and float(duel.get("chal_dsr", 0.0) or 0.0) >= 0.95
         )
         per_window.append((_w_end, w_days, float(w_weight), gate_pass, {
             "f365": f365, "pf_ok": pf_ok, "duel": duel,

@@ -296,10 +296,12 @@ def handoff_gate(
         list(trade_returns), paths=mc_paths, block_size=mc_block_size, seed=mc_seed
     )
     dsr_pass = bool(dsr.get("available")) and float(dsr.get("probability", 0.0)) >= dsr_min
-    dd95 = float((mc.get("drawdownPercentiles") or {}).get("95", 0.0) or 0.0)
-    dd_pass = bool(mc.get("available")) and abs(dd95) <= max_drawdown_pct
+    # drawdowns 全為負值，升序的 p95 是最樂觀的一端。尾部風險看 p5：
+    # 95% 的路徑都比它好，這才是規格的「第 95 百分位極端最大回撤」。
+    dd_tail = float((mc.get("drawdownPercentiles") or {}).get("5", 0.0) or 0.0)
+    dd_pass = bool(mc.get("available")) and abs(dd_tail) <= max_drawdown_pct
     ruin_prob = float(mc.get("ruinProbability30", 1.0) or 0.0)
-    ruin_pass = bool(mc.get("available")) and ruin_prob < ruin_max_prob
+    ruin_pass = bool(mc.get("available")) and ruin_prob <= ruin_max_prob
     passed = bool(dsr_pass and dd_pass and ruin_pass)
     return {
         "passed": passed,
@@ -307,6 +309,7 @@ def handoff_gate(
         "dsr_pass": dsr_pass,
         "mc": {"available": mc.get("available"), "paths": mc.get("paths"),
                "drawdownPercentiles": mc.get("drawdownPercentiles"),
+               "dd_tail_p5": round(dd_tail, 4),
                "lossProbability": mc.get("lossProbability"),
                "ruin_probability": round(ruin_prob, 6)},
         "dd_pass": dd_pass,
