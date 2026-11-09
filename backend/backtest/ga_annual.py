@@ -9,11 +9,9 @@ import random
 import json
 import hashlib
 import logging
-from typing import Dict, List, Any, Optional, Tuple
-from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
 from copy import deepcopy
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import time
 from backtest.scoring import (  # noqa: F401  重匯出：既有呼叫端不改
     DD_DERIV_AT_LIMIT,
     DD_LIMIT_PCT,

@@ -10,7 +10,6 @@
   7. 交易數不影響 fitness
   8. 放寬後的 gate 門檻值
 """
-import math
 import sys
 from pathlib import Path
 
@@ -23,7 +22,7 @@ from backtest.ga_annual import (
     EXPLORATION_GATE_PENALTY_W, DD_LIMIT_PCT, trade_count_penalty,
     TRADE_COUNT_MIN, TRADE_COUNT_MAX,
     PNL_SCORE_FLOOR_PCT, PNL_SCORE_CEIL_PCT, PNL_SCORE_NEG_FLOOR,
-    PNL_SCORE_SPAN, Genome, EvalResult as _EvalResult,
+    PNL_SCORE_SPAN, Genome,
 )
 
 from dataclasses import dataclass
