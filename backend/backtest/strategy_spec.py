@@ -241,17 +241,24 @@ def validate_spec(spec: StrategySpec) -> List[str]:
         if kind == "lgbm_gate" and "M" in params:
             # v15 執行層約束：M 低於 12h 等價根數時直接判非法，
             # 錯誤字串即判據，不依賴呼叫端記得檢查。
+            # 非數值（None/字串）由 _check_numeric 先報，跳過避免 TypeError
+            # 掩蓋真正的範圍錯誤。
             try:
-                from backtest.lgbm_meta_labeling import min_hold_bars
-            except ImportError:  # pragma: no cover - 非標準路徑退路
-                from backend.backtest.lgbm_meta_labeling import (  # type: ignore
-                    min_hold_bars,
-                )
-            if float(params["M"]) < min_hold_bars():
-                errors.append(
-                    f"{where} (lgbm_gate): M={params['M']} 低於 v15 下限 "
-                    f"{min_hold_bars()} 根（12h / 5m 軸），短持倉不做"
-                )
+                m_val = float(params["M"])
+            except (TypeError, ValueError):
+                m_val = None
+            if m_val is not None:
+                try:
+                    from backtest.lgbm_meta_labeling import min_hold_bars
+                except ImportError:  # pragma: no cover - 非標準路徑退路
+                    from backend.backtest.lgbm_meta_labeling import (  # type: ignore
+                        min_hold_bars,
+                    )
+                if m_val < min_hold_bars():
+                    errors.append(
+                        f"{where} (lgbm_gate): M={params['M']} 低於 v15 下限 "
+                        f"{min_hold_bars()} 根（12h / 5m 軸），短持倉不做"
+                    )
         for fname in _KIND_FACTOR_NAMES[kind]:
             if not _resolvable(fname):
                 errors.append(f"{where} ({kind}): 因子名 {fname!r} 無法解析")
