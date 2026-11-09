@@ -18,8 +18,7 @@ underwater ≤ 30 days, net retention after removing top-5 trades ≥ 50%.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+
 
 import numpy as np
 import pandas as pd
@@ -40,13 +39,8 @@ MAX_TUW_DAYS = 30
 TOP5_MIN_RETENTION = 0.50
 
 
-@dataclass
-class GateResult:
-    passed: bool
-    details: dict
-
-    def as_dict(self) -> dict:
-        return {"passed": self.passed, **self.details}
+    # ------------------------------------------------------------------ #
+    # Gate 1: DSR
 
 
 class ProfitValidationSuite:
@@ -119,10 +113,14 @@ class ProfitValidationSuite:
         trade_returns: np.ndarray,
         cost_per_trade: float,
         multiplier: float = FRICTION_MULTIPLIER,
-        bars_per_year: int = 105_120,  # 5m bars
         trades_per_year: Optional[float] = None,
     ) -> dict:
-        """Re-price every trade at ``multiplier``× cost; check SR and retention."""
+        """Re-price every trade at ``multiplier``× cost; check SR and retention.
+
+        The per-trade SR is scaled by √N with N = ``trades_per_year``. When N is
+        unknown the sample itself is treated as ~1 trade-year, so SR values are
+        comparable across same-sample comparisons but NOT true annualized SR.
+        """
         tr = np.asarray(trade_returns, dtype=float)
         tr = tr[np.isfinite(tr)]
         base_total = float(np.sum(tr))
@@ -134,12 +132,10 @@ class ProfitValidationSuite:
         stressed_total = float(np.sum(stressed))
         retention = stressed_total / base_total if base_total != 0 else 0.0
 
-        # Annualized SR from the per-trade series.
         per_trade = float(np.mean(stressed) / (np.std(stressed, ddof=1) + 1e-12))
         if trades_per_year is None:
-            trades_per_year = float(len(tr))  # treat sample as ~1y when unknown
+            trades_per_year = float(len(tr))  # sample ≈ 1y; see docstring
         sr = per_trade * float(np.sqrt(max(trades_per_year, 1.0)))
-        _ = bars_per_year  # kept for signature parity with intraday annualization
         passed = bool(sr > FRICTION_MIN_SR and retention >= FRICTION_MIN_RETENTION)
         return {"passed": passed, "sr": float(sr), "retention": float(retention),
                 "stressed_total": stressed_total}

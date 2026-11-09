@@ -29,13 +29,13 @@ import pandas as pd
 
 from .features import MultiTimeframeFeaturePipeline
 from .labels import MetaLabelingEngine, build_model_frame
-from .rolling import RollingClosedLoopController
+# §4.2 floor is canonical in rolling (which also owns the controller's
+# revenge-guard semantics); this module re-exports rather than redefining it.
+from .rolling import PASS_REGIME_MEDIAN_SR, RollingClosedLoopController
 from .validation import ProfitValidationSuite
 
 LAMBDA_PENALTY = 1.0
-PASS_REGIME_MEDIAN_SR = 0.5
-# Neighbourhood: multiplicative perturbation of x and y, additive on M.
-DEFAULT_NEIGHBOUR_RATE = 0.10
+DEFAULT_NEIGHBOUR_RATE = 0.10  # ±perturbation for (x, y); M swings ±1 bar
 
 
 @dataclass
@@ -45,6 +45,7 @@ class PlateauResult:
     sigma_sr: float
     score: float
     neighbours: List[Tuple[Dict[str, float], float]] = field(default_factory=list)
+    n_traded: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -53,6 +54,7 @@ class PlateauResult:
             "sigma_sr": self.sigma_sr,
             "score": self.score,
             "n_neighbours": len(self.neighbours),
+            "n_traded": self.n_traded,
         }
 
 
@@ -166,19 +168,22 @@ class ParameterPlateauSearch:
             m = self.evaluate_theta(padj, bars_5m, features, primary_signals)
             scored.append((padj, float(m["sr"]), bool(m.get("traded", False))))
         measured = np.array([s for _, s, t in scored if t], dtype=float)
-        if len(measured) == 0:
+        n_traded = int(len(measured))
+        if n_traded == 0:
             # Nothing in the neighbourhood clears the net-EV gate: no edge
             # measured, so the plateau sits well below the PASS_REGIME floor.
             return PlateauResult(theta=dict(theta), mu_sr=-1.0, sigma_sr=0.0,
-                                 score=-1.0, neighbours=[(p, s) for p, s, _ in scored])
+                                 score=-1.0, neighbours=[(p, s) for p, s, _ in scored],
+                                 n_traded=0)
         mu = float(np.mean(measured))
-        sigma = float(np.std(measured, ddof=1)) if len(measured) > 1 else 0.0
+        sigma = float(np.std(measured, ddof=1)) if n_traded > 1 else 0.0
         return PlateauResult(
             theta=dict(theta),
             mu_sr=mu,
             sigma_sr=sigma,
             score=mu - self.lambd * sigma,
             neighbours=[(p, s) for p, s, _ in scored],
+            n_traded=n_traded,
         )
 
     # ------------------------------------------------------------------ #

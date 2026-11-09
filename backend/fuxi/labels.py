@@ -142,10 +142,14 @@ def build_model_frame(
     features: pd.DataFrame,
     meta: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.Series, np.ndarray, np.ndarray]:
-    """Inner-join feature rows with labels; split out y / w / realized returns."""
+    """Inner-join feature rows with labels; split out y / w / realized returns.
+
+    ``primary_dir`` is deliberately NOT added to ``X``: it is known only at the
+    bar being labelled (ex-post for the model), so treating it as a feature is
+    lookahead. Callers that need it (the backtest runner) read it from ``meta``.
+    """
     idx = features.index.intersection(meta.index)
     X = features.loc[idx].copy()
-    X["primary_dir"] = meta.loc[idx, "primary_dir"]
     y = meta.loc[idx, "meta_label"].astype(int)
     w = meta.loc[idx, "sample_weight"].to_numpy(dtype=float)
     r = meta.loc[idx, "realized_ret"].to_numpy(dtype=float)

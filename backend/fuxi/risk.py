@@ -6,8 +6,18 @@ Sizing pipeline per signal bar::
     × challenger-throttle  →  discrete bucket margin  →  guardrail cap
 
 Fee inputs arrive in **basis points** via ``config.fees.FeeSchedule`` (the repo
-single source of truth). ``expected_loss_pct`` (``x/y``) and ``win_pct``
-(``x``) are fractions. Conversions happen here at the boundary, once.
+single source of truth). ``x`` (take-profit width) and ``x/y`` (stop width) are
+fractions. Conversions happen here at the boundary, once.
+
+Cost model (single definition shared with the simulator):
+
+* entry  = taker + slippage   (market order crosses the book)
+* exit TP = maker             (resting take-profit limit fills passive)
+* exit SL = taker + slippage  (stop is a market order, per HANDOFF guardrails)
+
+This is stricter than spec §5.1's symbolic ``C_entry + C_maker`` because it
+charges the real entry aggressiveness and the SL slippage; the EV gate and the
+backtest therefore agree to the basis point by construction.
 """
 
 from __future__ import annotations
@@ -112,8 +122,29 @@ class PerpetualRiskAndSmoothingEngine:
         return eta_vol, 1.0, "MONTHLY_NORMAL"
 
     # ------------------------------------------------------------------ #
-    # §5.1 net expected value
+    # §5.1 round-trip cost legs — THE single cost definition.
+    # Both the EV gate and the backtest simulator call these, so "what EV
+    # believes" and "what the simulator charges" cannot drift apart.
     # ------------------------------------------------------------------ #
+    def entry_cost_fraction(self) -> float:
+        """Entry leg: market fill pays taker fee + slippage."""
+        return self.fees.taker_fee_bps / 10000.0 + self.fees.slippage_bps / 10000.0
+
+    def exit_cost_fraction(self, is_take_profit: bool) -> float:
+        """Exit leg: TP is a resting maker limit; SL pays taker + slippage."""
+        if is_take_profit:
+            return self.fees.maker_fee_bps / 10000.0
+        return self.fees.taker_fee_bps / 10000.0 + self.fees.slippage_bps / 10000.0
+
+    def round_trip_costs(
+        self, funding_cost: float = 0.0
+    ) -> tuple[float, float]:
+        """``(cost_win, cost_loss)`` for a full round trip, per §5.1."""
+        entry = self.entry_cost_fraction()
+        cost_win = entry + self.exit_cost_fraction(True) + funding_cost
+        cost_loss = entry + self.exit_cost_fraction(False) + funding_cost
+        return cost_win, cost_loss
+
     def net_expected_value(
         self,
         prob_cal: float,
@@ -124,29 +155,26 @@ class PerpetualRiskAndSmoothingEngine:
         expected_funding_counts: int = 1,
     ) -> tuple[float, float, float]:
         """Returns ``(ev, cost_win, cost_loss)`` as fractions of notional."""
-        maker = self.fees.maker_fee_bps / 10000.0
-        taker = self.fees.taker_fee_bps / 10000.0
-        slip = self.fees.slippage_bps / 10000.0
+        if not all(np.isfinite(v) for v in (prob_cal, x, y)):
+            return -1.0, 0.0, 0.0
+        if x <= 0 or y <= 0:
+            return -1.0, 0.0, 0.0
         funding_cost = direction * funding_rate * expected_funding_counts
+        cost_win, cost_loss = self.round_trip_costs(funding_cost)
 
-        cost_win = maker + maker + funding_cost
-        cost_loss = maker + taker + slip + funding_cost
         net_win = x - cost_win
         net_loss = x / y + cost_loss
         if net_win <= 0 or net_loss <= 0:
             return -1.0, cost_win, cost_loss
         ev = prob_cal * net_win - (1.0 - prob_cal) * net_loss
-        return ev, cost_win, cost_loss
+        return float(ev), cost_win, cost_loss
 
     # ------------------------------------------------------------------ #
     # §5.2 liquidation-safe leverage cap
     # ------------------------------------------------------------------ #
     def max_safe_leverage(self, expected_loss_pct: float, funding_cost: float = 0.0) -> float:
         """``z_safe = floor(1 / (x/y + Cost_loss + MMR + buffer))``, min 1."""
-        maker = self.fees.maker_fee_bps / 10000.0
-        taker = self.fees.taker_fee_bps / 10000.0
-        slip = self.fees.slippage_bps / 10000.0
-        cost_loss = maker + taker + slip + funding_cost
+        _, cost_loss = self.round_trip_costs(funding_cost)
         denom = expected_loss_pct + cost_loss + self.mmr + self.liq_buffer
         if denom <= 0:
             return 1.0

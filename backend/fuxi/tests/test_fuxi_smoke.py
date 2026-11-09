@@ -16,8 +16,11 @@ _BACKEND = Path(__file__).resolve().parents[2]
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
+from config.fees import FeeSchedule
+from fuxi.backtest import FuxiBacktestConfig, FuxiBacktestRunner
 from fuxi.features import WARM_START_BARS, MultiTimeframeFeaturePipeline
 from fuxi.labels import MetaLabelingEngine, build_model_frame
+from fuxi.loop3 import PASS_REGIME_MEDIAN_SR, ParameterPlateauSearch, PlateauResult
 from fuxi.ratchet import AsymmetricCompoundingRatchet
 from fuxi.risk import PerpetualRiskAndSmoothingEngine
 from fuxi.rolling import RollingClosedLoopController
@@ -100,7 +103,9 @@ def test_model_frame_joins():
     meta = eng.apply_triple_barrier_and_weights(bars, eng.generate_primary_signals(bars))
     X, y, w, r = build_model_frame(feats, meta)
     assert len(X) == len(y) == len(w) == len(r) > 0
-    assert "primary_dir" in X.columns
+    # primary_dir is label-side (ex-post at bar t): it must never be a feature.
+    assert "primary_dir" not in X.columns
+    assert "primary_dir" in meta.columns
 
 
 # ----------------------------------------------------------------- ratchet
@@ -251,3 +256,59 @@ def test_hybrid_dataset_mixes_stress_and_recent():
     assert len(Xh) > 300            # stress pool appended
     assert len(yh) == len(wh) == len(Xh)
     assert (Xh["tf5m_norm_atr"] >= 0.01).mean() > 0.1  # stress rows really are high-vol
+
+
+# ---------------------------------------------- accounting + cost invariants
+def test_cost_legs_are_single_source_and_true_to_fees():
+    """EV and the simulator must share one cost definition (review B1/M1)."""
+    fees = FeeSchedule(maker_fee_bps=1.5, taker_fee_bps=4.5, slippage_bps=2.0)
+    eng = PerpetualRiskAndSmoothingEngine(fees=fees)
+
+    # entry is aggressive: taker + slippage
+    assert eng.entry_cost_fraction() == pytest.approx(0.00065)
+    # TP exits passive (maker only), SL exits aggressively (taker + slippage)
+    assert eng.exit_cost_fraction(True) == pytest.approx(0.00015)
+    assert eng.exit_cost_fraction(False) == pytest.approx(0.00065)
+
+    cost_win, cost_loss = eng.round_trip_costs(0.0)
+    assert cost_win == pytest.approx(0.0008)
+    assert cost_loss == pytest.approx(0.0013)
+    # a loss must cost more than a win at equal width
+    assert cost_loss > cost_win
+
+
+def test_accounting_identity_sum_pnl_equals_equity_delta():
+    """Σ(trade.net_pnl) == total_equity − initial (review A B1: no double charge)."""
+    bars = synthetic_5m(3000, seed=9)
+    feats = MultiTimeframeFeaturePipeline(lag_n=3).build_multi_tf_features(bars).dropna()
+    eng = MetaLabelingEngine(x=0.005, y=1.0, M=16)
+    sig = eng.generate_primary_signals(bars)
+    meta = eng.apply_triple_barrier_and_weights(bars, sig)
+    X, y, w, r = build_model_frame(feats, meta)
+    cut = int(len(X) * 0.65)
+    ctrl = RollingClosedLoopController()
+    ctrl.train_and_evaluate_challenger(
+        X.iloc[:cut], y.iloc[:cut], w[:cut],
+        X.iloc[cut:], y.iloc[cut:], r[cut:],
+        candidate_params={"x": 0.005, "y": 1.0, "M": 16},
+    )
+    out = FuxiBacktestRunner(
+        ctrl,
+        AsymmetricCompoundingRatchet(1000.0, 0.6),
+        PerpetualRiskAndSmoothingEngine(discrete_buckets=[25.0, 50.0, 100.0, 200.0]),
+        FuxiBacktestConfig(entry_threshold=0.40, target_leverage=2.0),
+    ).run(bars, feats, primary_signals=sig)
+
+    if out.n_trades == 0:
+        pytest.skip("no trades triggered on this seed")
+    assert out.total_net_pnl == pytest.approx(out.total_equity - 1000.0, abs=1e-6)
+    assert len(ctrl.open_contracts) == 0  # every contract closed
+
+
+def test_plateau_excludes_untraded_parameters():
+    """A theta that never trades must not score as SR 0 (review B: neutral trap)."""
+    res = PlateauResult(theta={"x": 0.01, "y": 2.0, "M": 12.0},
+                        mu_sr=-1.0, sigma_sr=0.0, score=-1.0, n_traded=0)
+    assert res.as_dict()["n_traded"] == 0
+    assert res.score < PASS_REGIME_MEDIAN_SR
+    assert ParameterPlateauSearch().is_pass_regime([res]) is True

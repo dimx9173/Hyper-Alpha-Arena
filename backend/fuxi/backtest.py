@@ -83,8 +83,11 @@ class FuxiBacktestResult:
     max_drawdown: float = 0.0
 
     def trade_returns(self) -> np.ndarray:
-        base = self.trades[0].margin if self.trades else 1.0
-        return np.array([t.net_pnl_u / max(base, EPS) for t in self.trades])
+        """Per-trade net return on the notional that was at risk."""
+        return np.array(
+            [t.net_pnl_u / max(t.margin * t.leverage, EPS) for t in self.trades],
+            dtype=float,
+        )
 
     def exit_timestamps_ms(self) -> np.ndarray:
         return np.array([t.exit_time_ms for t in self.trades], dtype=np.int64)
@@ -127,12 +130,9 @@ class FuxiBacktestRunner:
         idx = features.index.intersection(bars_5m.index)
         bars = bars_5m.loc[idx].sort_index()
         feats = features.loc[idx].sort_index()
-        if primary_signals is not None:
-            dirs = primary_signals.reindex(idx).fillna(0).to_numpy(dtype=int)
-        elif "primary_dir" in feats.columns:
-            dirs = feats["primary_dir"].fillna(0).to_numpy(dtype=int)
-        else:
-            raise ValueError("no primary direction: pass primary_signals or include primary_dir")
+        if primary_signals is None:
+            raise ValueError("primary_signals is required (primary_dir is label-side, never a feature)")
+        dirs = primary_signals.reindex(idx).fillna(0).to_numpy(dtype=int)
 
         closes = bars["close"].to_numpy(dtype=float)
         highs = bars["high"].to_numpy(dtype=float)
@@ -198,9 +198,10 @@ class FuxiBacktestRunner:
 
                 if reason is not None:
                     notional = open_pos["margin"] * open_pos["leverage"]
-                    exit_is_maker = (reason == "tp")
-                    fee_frac = taker + (maker if exit_is_maker else taker) + slip
-                    cost = fee_frac * notional
+                    # Full round trip charged exactly once, at close, so the
+                    # identity Σ(trade.net_pnl_u) == Δequity always holds.
+                    exit_cost = self.risk.exit_cost_fraction(reason == "tp")
+                    cost = (open_pos["entry_cost"] + exit_cost) * notional
                     fund_cost = 0.0
                     if self.config.funding_enabled and has_funding:
                         n_marks = max(0, (times_ms[i] - open_pos["entry_ms"]) // FUNDING_INTERVAL_MS)
@@ -218,7 +219,7 @@ class FuxiBacktestRunner:
                         model_id=open_pos["model_id"], entry_time_ms=open_pos["entry_ms"],
                     ))
                     open_pos = None
-                    if cfg.settle_every_bars and (len(trades) % max(cfg.settle_every_bars // 12, 1) == 0):
+                    if cfg.settle_every_bars and (i % cfg.settle_every_bars == 0):
                         _settle_flat()
 
             # ---- champion prices this bar (flat only, one position max) ---- #
@@ -243,15 +244,15 @@ class FuxiBacktestRunner:
                         contract = self.controller.register_new_position(
                             pos_id, int(dirs[i]), entry_px,
                             decision.margin, decision.leverage, i)
-                        # entry cost (taker + slippage) leaves the pool at once
-                        entry_cost = (taker + slip) * decision.margin * decision.leverage
-                        self.ratchet.update_intraday_pnl(-entry_cost)
                         open_pos = {
                             "pos_id": pos_id, "model_id": contract.model_id,
                             "direction": int(dirs[i]), "entry": entry_px,
                             "margin": decision.margin, "leverage": decision.leverage,
                             "tp": contract.tp_price, "sl": contract.sl_price,
                             "open_idx": i, "entry_ms": int(times_ms[i]),
+                            # carried to the close so the entry leg is charged
+                            # exactly once and Σ(net_pnl) == Δequity holds
+                            "entry_cost": self.risk.entry_cost_fraction(),
                         }
 
             equity_curve[i] = self.ratchet.get_status().total_equity
@@ -261,8 +262,12 @@ class FuxiBacktestRunner:
             d = open_pos["direction"]
             gross = (closes[-1] - open_pos["entry"]) / (open_pos["entry"] + EPS) * d
             notional = open_pos["margin"] * open_pos["leverage"]
-            cost = (taker + taker + slip) * notional
-            net_pnl = gross * notional - cost
+            cost = (open_pos["entry_cost"] + self.risk.exit_cost_fraction(False)) * notional
+            fund_cost = 0.0
+            if self.config.funding_enabled and has_funding:
+                n_marks = max(0, (times_ms[-1] - open_pos["entry_ms"]) // FUNDING_INTERVAL_MS)
+                fund_cost = float(d * funding[-1] * n_marks) * notional
+            net_pnl = gross * notional - cost - fund_cost
             self.ratchet.update_intraday_pnl(net_pnl)
             self.controller.close_position(open_pos["pos_id"])
             trades.append(FuxiTrade(
@@ -272,13 +277,14 @@ class FuxiBacktestRunner:
                 gross_ret=float(gross), net_ret=float(net_pnl / max(notional, EPS)),
                 net_pnl_u=float(net_pnl), exit_reason="expiry",
                 model_id=open_pos["model_id"], entry_time_ms=open_pos["entry_ms"]))
+            open_pos = None
             equity_curve[-1] = self.ratchet.get_status().total_equity
 
         _settle_flat()
         final = self.ratchet.get_status()
         curve = pd.Series(equity_curve, index=bars.index)
         peak = curve.cummax()
-        dd = float(((peak - curve) / peak.max()).max()) if len(curve) else 0.0
+        dd = float(((peak - curve) / np.maximum(peak, EPS)).max()) if len(curve) else 0.0
         wins = sum(1 for t in trades if t.net_pnl_u > 0)
         return FuxiBacktestResult(
             trades=trades, equity_curve=curve,

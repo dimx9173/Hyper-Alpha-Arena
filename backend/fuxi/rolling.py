@@ -32,7 +32,8 @@ EPS = 1e-8
 CHALLENGER_EPSILON_MARGIN = 0.0005
 # Losing duel → defensive derate of the Kelly scalar (§4.3).
 CHALLENGER_LOSS_THROTTLE = 0.75
-# §4.2 revenge-overfitting guard: all plateau medians below this → PASS_REGIME.
+# §4.2 revenge-overfitting guard floor. Canonical here because loop3 imports
+# this module (the reverse import would be circular).
 PASS_REGIME_MEDIAN_SR = 0.5
 
 MODEL_ID_PREFIX = "FUXI"

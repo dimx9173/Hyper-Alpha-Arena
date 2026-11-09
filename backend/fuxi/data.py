@@ -63,10 +63,9 @@ def _get(url: str, params: dict, timeout: int = 20, retries: int = 4) -> request
 class BinanceFuxiDataSource:
     """Fetch + cache Binance USDT-M klines, funding, and (recent) OI."""
 
-    def __init__(self, cache_dir: Optional[Path] = None, session: Optional[requests.Session] = None) -> None:
+    def __init__(self, cache_dir: Optional[Path] = None) -> None:
         self.cache_dir = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.session = session
 
     # ------------------------------------------------------------------ #
     # cache helpers
@@ -110,7 +109,6 @@ class BinanceFuxiDataSource:
         interval: str,
         start_ms: int,
         end_ms: int,
-        use_cache: bool = True,
     ) -> pd.DataFrame:
         """Raw paged fetch of ``symbol`` (e.g. ``BTCUSDT``) klines in [start, end)."""
         if interval not in INTERVAL_MS:
@@ -142,7 +140,6 @@ class BinanceFuxiDataSource:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]).set_index(
                 pd.DatetimeIndex([], tz="UTC", name="open_time"))
         df = pd.concat(frames).drop_duplicates("open_time").set_index("open_time").sort_index()
-        _ = use_cache
         return df
 
     def get_klines(
