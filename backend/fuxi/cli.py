@@ -197,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     # ---------------- Loop 2: train champion -------------------------------- #
     eng = MetaLabelingEngine(x=x, y=y, M=int(m))
     meta = eng.apply_triple_barrier_and_weights(bars, signals)
-    X, yv, wv, rv = build_model_frame(features, meta)
+    X, yv, wv, rv, rv_expired = build_model_frame(features, meta)
     report["labels"] = {"rows": int(len(X)), "base_rate": float(yv.mean()) if len(X) else 0.0}
     if len(X) < 300:
         report["verdict"] = "INSUFFICIENT_LABELS"
@@ -219,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
         X.iloc[cut:], yv.iloc[cut:], rv[cut:],
         candidate_params={"x": float(x), "y": float(y), "M": int(m)},
         feature_cols=loop2_feature_cols,
+        val_expired=rv_expired[cut:],
     )
     report["loop2"] = loop2
     probs = ctrl.champion.calibrated_proba(X.iloc[cut:])

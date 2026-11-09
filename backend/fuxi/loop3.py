@@ -145,7 +145,7 @@ class ParameterPlateauSearch:
             features = features[feature_cols]
         eng = MetaLabelingEngine(x=float(theta["x"]), y=float(theta["y"]), M=int(theta["M"]))
         meta = eng.apply_triple_barrier_and_weights(bars_5m, primary_signals)
-        X, y, w, r = build_model_frame(features, meta)
+        X, y, w, r, expired = build_model_frame(features, meta)
         if len(X) < 200:
             return {"sr": 0.0, "ev": 0.0, "n": 0, "traded": False}
 
@@ -160,15 +160,17 @@ class ParameterPlateauSearch:
             candidate_params={"x": float(theta["x"]), "y": float(theta["y"]), "M": int(theta["M"])},
             fees=self.fees,
             seed=self.seed,
+            val_expired=expired[cut:],
         )
         probs = ctrl.champion.calibrated_proba(X.iloc[cut:])
         # Trade only what the model would actually take (p > entry threshold).
         mask = probs > self.entry_threshold
-        # Review F3: winning trades exit at the resting TP (cost_win), losing
-        # trades exit on the stop (cost_loss) — one fee source, both legs.
+        # Review F3/F-A: take-profit exits rest at the maker limit, every other
+        # exit (stop or time) crosses the book — one fee source, both legs.
         cost_win, cost_loss = round_trip_cost_fractions(self.fees)
         gross = np.asarray(r[cut:], dtype=float)[mask]
-        rets = gross - np.where(gross > 0.0, cost_win, cost_loss)
+        gross_expired = np.asarray(expired[cut:], dtype=bool)[mask]
+        rets = gross - np.where(gross > 0.0 & ~gross_expired, cost_win, cost_loss)
         if len(rets) < self.min_trades:
             # A parameter set that cannot clear the net-EV gate has NO measured
             # edge. Scoring it as SR 0.0 would let "never trade" masquerade as

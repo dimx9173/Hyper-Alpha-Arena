@@ -101,7 +101,7 @@ def test_model_frame_joins():
     feats = MultiTimeframeFeaturePipeline(lag_n=2).build_multi_tf_features(bars).dropna()
     eng = MetaLabelingEngine(x=0.02, y=2.0, M=10)
     meta = eng.apply_triple_barrier_and_weights(bars, eng.generate_primary_signals(bars))
-    X, y, w, r = build_model_frame(feats, meta)
+    X, y, w, r, _expired = build_model_frame(feats, meta)
     assert len(X) == len(y) == len(w) == len(r) > 0
     # primary_dir is label-side (ex-post at bar t): it must never be a feature.
     assert "primary_dir" not in X.columns
@@ -222,7 +222,7 @@ def test_challenger_promotes_then_orphan_contract_is_frozen():
     feats = MultiTimeframeFeaturePipeline(lag_n=2).build_multi_tf_features(bars).dropna()
     eng = MetaLabelingEngine(x=0.02, y=2.0, M=10)
     meta = eng.apply_triple_barrier_and_weights(bars, eng.generate_primary_signals(bars))
-    X, y, w, r = build_model_frame(feats, meta)
+    X, y, w, r, _expired = build_model_frame(feats, meta)
 
     cut = int(len(X) * 0.6)
     res1 = ctrl.train_and_evaluate_challenger(
@@ -292,7 +292,7 @@ def test_accounting_identity_sum_pnl_equals_equity_delta():
     eng = MetaLabelingEngine(x=0.005, y=1.0, M=16)
     sig = eng.generate_primary_signals(bars)
     meta = eng.apply_triple_barrier_and_weights(bars, sig)
-    X, y, w, r = build_model_frame(feats, meta)
+    X, y, w, r, _expired = build_model_frame(feats, meta)
     cut = int(len(X) * 0.65)
     ctrl = RollingClosedLoopController()
     ctrl.train_and_evaluate_challenger(
@@ -320,3 +320,18 @@ def test_plateau_excludes_untraded_parameters():
     assert res.as_dict()["n_traded"] == 0
     assert res.score < PASS_REGIME_MEDIAN_SR
     assert ParameterPlateauSearch().is_pass_regime([res]) is True
+
+
+def test_expired_small_win_pays_taker_leg():
+    """Review F-A: a time exit with ret>0 is not a take-profit fill."""
+    from fuxi.risk import round_trip_cost_fractions
+    cost_win, cost_loss = round_trip_cost_fractions(FeeSchedule())
+    rets = np.array([0.0005])
+    mask = np.array([True])
+    idx = pd.DatetimeIndex(["2026-01-01", "2026-01-02"], tz="UTC")
+    net, _ = RollingClosedLoopController._net_trade_rets(
+        rets, mask, None, idx, 365.0, expired=np.array([True]))
+    assert net[0] == pytest.approx(0.0005 - cost_loss)
+    net_win, _ = RollingClosedLoopController._net_trade_rets(
+        rets, mask, None, idx, 365.0, expired=np.array([False]))
+    assert net_win[0] == pytest.approx(0.0005 - cost_win)

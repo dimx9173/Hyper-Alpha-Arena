@@ -208,22 +208,29 @@ class RollingClosedLoopController:
         fees: Optional[FeeSchedule],
         index: pd.Index,
         fallback_ppy: float,
+        expired: Optional[np.ndarray] = None,
     ) -> tuple[np.ndarray, float]:
         """Net returns and annualization unit for the trades a model takes.
 
-        Review F3: a trade that wins exits at its resting take-profit and pays
-        ``cost_win``; a trade that loses exits on the stop and pays ``cost_loss``
-        (taker + slippage). The win/loss label is the sign of the realized
-        return, which is exactly how the labeller assigned ``meta_label``.
+        Review F3: a take-profit exit rests at the maker limit (``cost_win``);
+        a stop-loss exit and a time exit both cross the book (``cost_loss``).
+        Review F-A: the sign of ``realized_ret`` cannot pick the leg, because
+        the labeller marks every time exit as ``meta_label=0`` while its
+        realized return can still be positive (``labels.py:84-109``). Passing
+        ``expired`` takes the conservative leg for those rows instead of
+        charging a maker fee the live path never pays.
 
-        The annualization unit is trades/year implied by the trade timestamp
+        The annualization unit is periods/year implied by the trade timestamp
         span. Only when that span cannot support one (fewer than two exits, or
         every exit on the same instant) does the caller's declared
         ``periods_per_year`` apply.
         """
         selected = np.asarray(realized_rets, dtype=float)[mask]
         cost_win, cost_loss = round_trip_cost_fractions(fees or FeeSchedule())
-        net = selected - np.where(selected > 0.0, cost_win, cost_loss)
+        use_win = selected > 0.0
+        if expired is not None:
+            use_win = use_win & ~np.asarray(expired, dtype=bool)[mask]
+        net = selected - np.where(use_win, cost_win, cost_loss)
         try:
             ppy = infer_periods_per_year(index[mask])
         except (ValueError, IndexError, TypeError):
@@ -244,6 +251,7 @@ class RollingClosedLoopController:
         fees=None,
         seed: int = 42,
         periods_per_year: float = 365.0,
+        val_expired: Optional[np.ndarray] = None,
     ) -> dict:
         """Train a challenger and duel it against the champion on OOS data.
 
@@ -270,7 +278,8 @@ class RollingClosedLoopController:
         chal_probs = challenger.calibrated_proba(X_val)
         chal_mask = chal_probs > entry_threshold
         chal_rets, chal_ppy = self._net_trade_rets(
-            val_realized_rets, chal_mask, fees, X_val.index, periods_per_year
+            val_realized_rets, chal_mask, fees, X_val.index, periods_per_year,
+            expired=val_expired,
         )
         chal_ev = float(np.mean(chal_rets)) if len(chal_rets) > 5 else -0.01
         # DSR must score the trades the challenger would actually take, not the
@@ -299,7 +308,8 @@ class RollingClosedLoopController:
         champ_probs = self.champion.calibrated_proba(X_val)
         champ_mask = champ_probs > entry_threshold
         champ_rets, _ = self._net_trade_rets(
-            val_realized_rets, champ_mask, fees, X_val.index, periods_per_year
+            val_realized_rets, champ_mask, fees, X_val.index, periods_per_year,
+            expired=val_expired,
         )
         champ_ev = float(np.mean(champ_rets)) if len(champ_rets) > 5 else -0.01
 

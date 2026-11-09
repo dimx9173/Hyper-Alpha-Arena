@@ -132,6 +132,7 @@ class MetaLabelingEngine:
                 "realized_ret": realized_ret,
                 "uniqueness": uniqueness,
                 "sample_weight": norm_weights,
+                "expired": t_end_idx == np.arange(n) + self.M,
             },
             index=df.index,
         )
@@ -141,16 +142,19 @@ class MetaLabelingEngine:
 def build_model_frame(
     features: pd.DataFrame,
     meta: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.Series, np.ndarray, np.ndarray]:
+) -> tuple[pd.DataFrame, pd.Series, np.ndarray, np.ndarray, np.ndarray]:
     """Inner-join feature rows with labels; split out y / w / realized returns.
 
     ``primary_dir`` is deliberately NOT added to ``X``: it is known only at the
     bar being labelled (ex-post for the model), so treating it as a feature is
     lookahead. Callers that need it (the backtest runner) read it from ``meta``.
+    The fifth element flags time exits (``expired``), whose live close always
+    crosses the book — review F-A.
     """
     idx = features.index.intersection(meta.index)
     X = features.loc[idx].copy()
     y = meta.loc[idx, "meta_label"].astype(int)
     w = meta.loc[idx, "sample_weight"].to_numpy(dtype=float)
     r = meta.loc[idx, "realized_ret"].to_numpy(dtype=float)
-    return X, y, w, r
+    expired = meta.loc[idx, "expired"].to_numpy(dtype=bool) if "expired" in meta.columns else np.zeros(len(idx), dtype=bool)
+    return X, y, w, r, expired
