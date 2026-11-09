@@ -458,7 +458,7 @@ def annual_validator(
 
 # === EXPLORATION VALIDATOR thresholds (single source of truth) ===
 # 這組門檻原本只寫在 exploration_validator 的參數預設值裡，外部讀不到。
-# 結果 ga_annual.gate_violation 只能用嚴格期常數（trades=20）算違規量，
+# 結果 scoring.gate_violation 只能用嚴格期常數（trades=20）算違規量，
 # 而 GA 實際被 exploration_validator（trades=60）判生死：
 # 實測 12 幣 180 天 run 的冠軍 19 筆交易，fitness 只罰 0.05，
 # exploration gate 卻直接否決。fitness 與 gate 各自最佳化不同目標。

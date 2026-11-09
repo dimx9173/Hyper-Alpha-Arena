@@ -20,7 +20,7 @@ import statistics
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional
 try:
     from services.factor_registry import FACTOR_BY_NAME
 except ImportError:  # pragma: no cover - 非標準路徑下的退路
@@ -536,9 +536,9 @@ def genome_to_spec(genome_dict: Dict[str, Any]) -> StrategySpec:
 #   1. render_strategy_from_spec 對 genome_to_spec 的輸出與
 #      ga_annual.render_strategy byte-identical（已用 4 個基因組含 ICT/RSI
 #      開關組合驗證），因此回測引擎看到的策略碼完全相同。
-#   2. fitness 不重寫，直接呼叫 ga_annual.calculate_fitness /
-#      calculate_exploration_fitness；gate 懲罰也只透過 EvalResult 進入，
-#      所以兩條路徑共享同一份計分程式碼。
+#   2. fitness 不重寫，直接呼叫 scoring.calculate_fitness /
+#      scoring.calculate_exploration_fitness（ga_annual 重匯出同一物件）；
+#      gate 懲罰也只透過 EvalResult 進入，所以兩條路徑共享同一份計分程式碼。
 #   3. EvalResult.genome 型別是 typed Genome（GA 主路徑相依，不可改），
 #      因此 spec 路徑傳入 _SpecGenomeShim（只提供 gate_violation 需要的
 #      portion / leverage），metric 欄位則逐項鏡像 evaluate_individual。
@@ -550,10 +550,12 @@ _GA = None
 
 
 def _load_ga():
-    """延遲載入 ga_annual + ab_validators，回傳共用參照表。
+    """延遲載入 scoring + ga_annual + ab_validators，回傳共用參照表。
 
-    ga_annual 不 import strategy_spec，因此不存在循環相依；延遲只是讓
-    「僅需要型別/渲染」的呼叫端不必付出 ga_annual 的載入成本。
+    fitness 與門檻來自 ``backtest.scoring``；``ga_annual`` 只為
+    ``EvalResult`` 與 ``EXPLORATION_GENS_OVERRIDE`` 而載入。
+    三者皆不 import strategy_spec，因此不存在循環相依；延遲只是讓
+    「僅需要型別/渲染」的呼叫端不必付出載入成本。
     兩處 import 皆指向同一模組物件，所以 GA 端的模組級狀態
     （EXPLORATION_GENS_OVERRIDE 等）是共用的，不是快照。
     """
@@ -563,16 +565,19 @@ def _load_ga():
     try:
         from backtest import ab_validators as _ab
         from backtest import ga_annual as _ga
+        from backtest import scoring as _sc
     except ImportError:  # pragma: no cover - 非標準路徑下的退路
         from backend.backtest import ab_validators as _ab
         from backend.backtest import ga_annual as _ga
+        from backend.backtest import scoring as _sc
     _GA = {
         "annual_validator": _ab.annual_validator,
         "exploration_validator": _ab.exploration_validator,
-        "calculate_fitness": _ga.calculate_fitness,
-        "calculate_exploration_fitness": _ga.calculate_exploration_fitness,
+        "calculate_fitness": _sc.calculate_fitness,
+        "calculate_exploration_fitness": _sc.calculate_exploration_fitness,
         "EvalResult": _ga.EvalResult,
         "ga": _ga,
+        "scoring": _sc,
     }
     return _GA
 
@@ -580,7 +585,7 @@ def _load_ga():
 class _SpecGenomeShim:
     """gate_violation 需要的 genome 介面最小代理。
 
-    ga_annual.gate_violation 只用 result.genome.portion / .leverage 計算
+    scoring.gate_violation 只用 result.genome.portion / .leverage 計算
     實盤可部署性違規項（single_coin_violation）。以屬性代理傳入可讓 spec
     路徑重用同一份計分，而不必把 spec 欄位硬塞進 typed Genome，
     也不必改 EvalResult 的欄位型別。
@@ -631,7 +636,7 @@ def _run_windows(code, symbols, exchange, use_exploration, windows, db):
 def _score_windows(spec, use_exploration, per_window):
     """把 per_window 匯總成 fitness 與對外指標（逐行鏡像 evaluate_individual）。"""
     refs = _load_ga()
-    ga_mod = refs["ga"]
+    sc_mod = refs["scoring"]
     calc = (refs["calculate_exploration_fitness"] if use_exploration
             else refs["calculate_fitness"])
     # 主要視窗 = 權重最高者（同權重取索引最大者），決定對外回報的個體指標。
@@ -657,7 +662,7 @@ def _score_windows(spec, use_exploration, per_window):
         fitness = aggregate
     else:
         fitness = (aggregate
-                   - ga_mod.WINDOW_CONSISTENCY_PENALTY * (1.0 - consistency))
+                   - sc_mod.WINDOW_CONSISTENCY_PENALTY * (1.0 - consistency))
     return {
         "spec": spec.to_dict(),
         "gate_annual": bool(gate),
@@ -909,13 +914,11 @@ def evaluate_lgbm_spec(
         from backtest.lgbm_meta_labeling import (
             MetaLabelConfig,
             build_meta_frame,
-            fit_meta_label_model,
         )
     except ImportError:  # pragma: no cover - 非標準路徑退路
         from backend.backtest.lgbm_meta_labeling import (  # type: ignore
             MetaLabelConfig,
             build_meta_frame,
-            fit_meta_label_model,
         )
     try:
         from fuxi.backtest import FuxiBacktestConfig, FuxiBacktestRunner
@@ -1020,7 +1023,7 @@ def evaluate_lgbm_spec(
         }))
 
     refs = _load_ga()
-    ga_mod = refs["ga"]
+    sc_mod = refs["scoring"]
     calc = (refs["calculate_exploration_fitness"] if use_exploration
             else refs["calculate_fitness"])
     primary = max(range(len(per_window)), key=lambda i: (per_window[i][2], i))
@@ -1044,7 +1047,7 @@ def evaluate_lgbm_spec(
     if use_exploration:
         fitness = aggregate
     else:
-        fitness = aggregate - ga_mod.WINDOW_CONSISTENCY_PENALTY * (1.0 - consistency)
+        fitness = aggregate - sc_mod.WINDOW_CONSISTENCY_PENALTY * (1.0 - consistency)
     return {
         "spec": spec.to_dict(),
         "gate_annual": bool(gate),
