@@ -331,7 +331,9 @@ class PaperBroker:
         fill = self.fee_model.exit_price(mid_price, is_buy=not is_long)
         fee = self.fee_model.fee(pos.size * fill, is_maker=False)
 
-        gross = (fill - pos.entry_price) * pos.size * (1.0 if is_long else -1.0)
+        # size 已帶方向（負 = 空）。再乘方向係數會雙重翻轉，把空單獲利
+        # 算成虧損；空單在 open_short 存在前是死路徑，負 size 才顯現。
+        gross = (fill - pos.entry_price) * pos.size
         net = gross - fee - pos.fees_paid
 
         # 已實現損益入帳。保證金釋放不影響 cash（它從未被扣除）。
@@ -415,7 +417,8 @@ class PaperBroker:
         pos = self.positions[symbol]
         is_long = pos.size >= 0
         fee = self.fee_model.fee(pos.size * price, is_maker=True)  # TP/SL 視為 maker
-        gross = (price - pos.entry_price) * pos.size * (1.0 if is_long else -1.0)
+        # 同 close_position：size 已帶方向，不可再乘方向係數。
+        gross = (price - pos.entry_price) * pos.size
         net = gross - fee - pos.fees_paid
 
         self.cash += gross - fee

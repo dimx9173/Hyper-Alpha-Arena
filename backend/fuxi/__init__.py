@@ -13,6 +13,8 @@ Module map (§ numbers refer to the spec):
 * ``loop3``      §6.2+§4.1 Parameter-plateau search over (N, M, x, y) + feature reselect
 * ``data``       --   Binance USDT-M 5m/15m/30m feed (5m base axis)
 * ``backtest``   --   Bar-by-bar closed-loop runner wiring the above together
+* ``live_state`` §6.1 Live position state machine, exchange reconciliation,
+                     orphan recovery (F10)
 """
 
 from __future__ import annotations
@@ -27,4 +29,5 @@ __all__ = [
     "loop3",
     "data",
     "backtest",
+    "live_state",
 ]
