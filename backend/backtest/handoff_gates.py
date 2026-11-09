@@ -1,25 +1,28 @@
-"""§7 收益驗證三關的純函數實作，供 Handoff Gate 使用。
+"""QuantDinger 統計函數的對帳移植，**不是** Hyper 的上線判準。
 
 移植自 QuantDinger 的 ``strategy_evolution/statistics.py``，逐行保留公式與
 數值語義。移植而非 import，因為 Hyper 與 QD 是兩個獨立部署，執行期不該互相
 依賴。一致性由 ``test_handoff_gates.py`` 的逐筆對帳測試守住（容差 1e-9）。
 
+權威判準在哪裡
+--------------
+上線資格由 ``fuxi.validation.PromotionGate`` 決定，四關（DSR / MC / 摩擦 /
+月度）齊備且共用同一份 FeeSchedule。本模組的 ``deflated_sharpe`` 用逐筆
+尺度，``PromotionGate`` 用年化尺度，同一份資料會得到不同機率，兩者**不可
+互換**。``handoff_gate`` 只在需要與 QD 逐筆對帳時使用，生產路徑不呼叫它。
+
 三個函數
 --------
-``deflated_sharpe``      第一關：降維夏普比率。回答「這個 Sharpe 有多少是
-                         多重試驗選出來的」。
+``deflated_sharpe``      降維夏普比率，QD 口徑（逐筆、未年化）。
 ``probability_of_backtest_overfitting``
-                         組合對稱交叉驗證的過擬合機率。回答「最優參數是不是
-                         只在樣本內最優」。
-``monte_carlo_bootstrap`` 第二關：區塊拔靴壓力測試。回答「換一條路徑，最大
-                         回撤會多深」。
+                         PBO：樣本內最優者在樣本外的排名。
+``monte_carlo_bootstrap`` 區塊拔靴壓力測試，回報末端與回撤分佈。
 
 單位約定
 --------
 * ``returns`` 是逐期小數報酬（0.01 = 1%），不是百分比。
-* ``observed_sharpe`` 必須與 ``returns`` 同一尺度（逐期，未年化）。QD 的呼叫
-  端就是用 ``sample_sharpe(returns)`` 餵進來，本模組保持同一契約。
-* 所有回傳值都是純 dict，可直接序列化進 ledger 或報告。
+* ``observed_sharpe`` 必須與 ``returns`` 同一尺度（逐期，未年化）。
+* 所有回傳值都是純 dict，可直接序列化進報告。
 
 不可用時一律回 ``available: False`` 加 ``reason``，不假造 0 當成「已測量」。
 """

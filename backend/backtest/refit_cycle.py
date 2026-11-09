@@ -207,15 +207,24 @@ def _run_spec_refit(args: argparse.Namespace) -> int:
         generation=1, total_generations=1,
         backtest_days=args.window_days, end_time_ms=end_ms,
     )
+    promo = res.get("promotion") or {}
     print(f"[refit:spec] 候選 gate={res['gate_annual']} "
           f"pnl {res.get('pnl_365d', 0):+.2f}%  trades {res.get('trades_365d')}  "
-          f"fitness {res.get('fitness', 0):+.3f}")
+          f"fitness {res.get('fitness', 0):+.3f}  "
+          f"promotion={promo.get('passed')} "
+          f"(dsr={((promo.get('dsr') or {}).get('dsr') if isinstance(promo.get('dsr'), dict) else '?')})")
+    if not res.get("promote_ok"):
+        # fail-closed：四關任一不通過就不記 promote，只記 reeval 供後續追蹤。
+        # 避免垃圾模型靠回測門檻混進 ledger。
+        print(f"[refit:spec] promote 拒絕：promotion 未通過（{promo.get('reason', 'gate fail')}）")
+        return 1
     led._append({
         "event": "promote", "ts": int(time.time() * 1000),
         "kind": "spec", "spec": spec.to_dict(), "genome": {},
         "genome_id": spec.spec_id(), "period": "5m",
         "window_days": int(args.window_days), "end_time_ms": int(end_ms),
         "metrics": _metrics(res), "fitness": float(res.get("fitness") or 0.0),
+        "promotion": res.get("promotion") or {},
         "run_id": f"refit_spec_{end_ms}", "note": args.note,
     })
     print(f"[refit:spec] promote 完成（{time.time()-t0:.0f}s）：spec {spec.spec_id()}")

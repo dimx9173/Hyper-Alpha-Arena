@@ -800,6 +800,48 @@ def _fuxi_result_to_f365(result, initial_capital: float = 1000.0) -> dict:
     }
 
 
+def _promotion_verdict(winfo) -> dict:
+    """§7 四關的最終上線判決。
+
+    權威實作是 ``fuxi.validation.PromotionGate``，四關全在裡面且共用同一份
+    FeeSchedule。``backtest/handoff_gates.py`` 只保留 QD 對帳用途，不參與
+    這裡的決策。
+
+    樣本不足（少於 2 筆交易或缺時間戳）時回 ``available=False``，呼叫端
+    必須視為未通過，不得當成已測量。
+    """
+    rets = list((winfo or {}).get("trade_returns") or [])
+    stamps = list((winfo or {}).get("trade_exit_ms") or [])
+    if len(rets) < 2 or len(stamps) != len(rets):
+        return {
+            "available": False,
+            "reason": "insufficientTrades",
+            "passed": False,
+            "trades": len(rets),
+        }
+    try:
+        from fuxi.validation import PromotionGate
+    except ImportError:  # pragma: no cover - 非標準路徑退路
+        from backend.fuxi.validation import PromotionGate  # type: ignore
+    import numpy as _np
+
+    try:
+        verdict = PromotionGate().evaluate(
+            _np.asarray(rets, dtype=float),
+            _np.asarray(stamps, dtype=_np.int64),
+        )
+    except ValueError as exc:
+        # 時間戳跨度為 0（全部同一刻出場）無法年化，明確回報而非假造數值。
+        return {
+            "available": False,
+            "reason": f"cannotAnnualize: {exc}",
+            "passed": False,
+            "trades": len(rets),
+        }
+    return {"available": True, **verdict}
+
+
+
 def evaluate_lgbm_spec(
     spec_dict,
     bars_5m,
@@ -892,6 +934,7 @@ def evaluate_lgbm_spec(
                 "f365": {"pnl_percent": 0.0, "maxdd_pct": 100.0, "sharpe": 0.0,
                          "trades": 0, "win": 0.0, "pf": None},
                 "pf_ok": False,
+                "trade_returns": [], "trade_exit_ms": [],
             }))
             continue
         split = max(1, int(len(X) * 0.7))
@@ -909,6 +952,7 @@ def evaluate_lgbm_spec(
                 "f365": {"pnl_percent": 0.0, "maxdd_pct": 100.0, "sharpe": 0.0,
                          "trades": 0, "win": 0.0, "pf": None},
                 "pf_ok": False, "duel": duel,
+                "trade_returns": [], "trade_exit_ms": [],
             }))
             continue
         # OOS 評估只看驗證段：runner 在訓練段也會開單，那段利潤是樣本內，
@@ -936,6 +980,10 @@ def evaluate_lgbm_spec(
         )
         per_window.append((_w_end, w_days, float(w_weight), gate_pass, {
             "f365": f365, "pf_ok": pf_ok, "duel": duel,
+            # PromotionGate 的輸入：逐筆淨報酬（名目口徑）與出場時間戳。
+            # 不在這裡先判，留給 primary 視窗的四關做最終門。
+            "trade_returns": [float(v) for v in fuxi_out.trade_returns()],
+            "trade_exit_ms": [int(v) for v in fuxi_out.exit_timestamps_ms()],
         }))
 
     refs = _load_ga()
@@ -946,6 +994,9 @@ def evaluate_lgbm_spec(
     _w_end, _w_days, _w_weight, gate, info = per_window[primary]
     f365 = (info or {}).get("f365", {}) or {}
     pf_ok = bool((info or {}).get("pf_ok"))
+    # §7 四關只在 promote 決策上生效，不進 fitness：fitness 是搜尋訊號，
+    # gate 是上線資格，兩者混用會讓 GA 用嚴格門檻扼殺探索。
+    promotion = _promotion_verdict(info)
     result = _make_eval_result(spec, gate, f365)
     primary_fitness = calc(result)
     n_pass, fitness_num, weight_total = 0, 0.0, 0.0
@@ -973,6 +1024,10 @@ def evaluate_lgbm_spec(
         "win_rate": result.win_rate,
         "fitness": fitness,
         "spec_id": spec.spec_id(),
+        # 上線資格：四關全過才算。與 gate_annual（回測門檻）分開回報，
+        # 呼叫端不得只看 gate_annual 就 promote。
+        "promotion": promotion,
+        "promote_ok": bool(promotion.get("passed")),
         "window_consistency": consistency,
         "windows_passed": n_pass,
         "windows_total": len(per_window),
