@@ -799,6 +799,28 @@ def _fuxi_result_to_f365(result, initial_capital: float = 1000.0) -> dict:
         "maxdd": float(getattr(result, "max_drawdown", 0.0) or 0.0),
     }
 
+def _slice_window(bars, w_end, w_days):
+    """按 (end_time_ms, days) 切 5m 視窗。
+
+    bars 是 DatetimeIndex（UTC）的 DataFrame。w_end 為 None 時取整段尾部；
+    否則視窗右界為 w_end，左界為右界減 w_days 天。左界早於資料開頭時從
+    開頭切起，不回空。
+    """
+    import pandas as _pd
+
+    if w_days is None or float(w_days) <= 0:
+        return bars.iloc[0:0]
+    if w_end is None:
+        start = bars.index.max() - _pd.Timedelta(days=float(w_days))
+        return bars.loc[bars.index > start]
+    right = _pd.to_datetime(int(w_end), unit="ms", utc=True)
+    start = right - _pd.Timedelta(days=float(w_days))
+    frame = bars.loc[(bars.index > start) & (bars.index <= right)]
+    if len(frame) == 0 and len(bars) > 0:
+        # 右界早於全部資料：回最近的一段，避免視窗靜默全空。
+        frame = bars.iloc[-min(len(bars), int(float(w_days) * 288)):]
+    return frame
+
 
 def _promotion_verdict(winfo) -> dict:
     """§7 四關的最終上線判決。
@@ -927,7 +949,18 @@ def evaluate_lgbm_spec(
             entry_threshold=threshold,
         )
         symbol = list(per_symbol.keys())[0]
-        bars = per_symbol[symbol]
+        full = per_symbol[symbol]
+        # 多視窗按 (end, days) 切段：每個視窗只看自己的資料，
+        # 否則各視窗跑出逐字相同的結果，consistency 恆 0/1 且含樣本內利潤。
+        bars = _slice_window(full, _w_end, w_days)
+        if len(bars) == 0:
+            per_window.append((_w_end, w_days, float(w_weight), False, {
+                "f365": {"pnl_percent": 0.0, "maxdd_pct": 100.0, "sharpe": 0.0,
+                         "trades": 0, "win": 0.0, "pf": None},
+                "pf_ok": False,
+                "trade_returns": [], "trade_exit_ms": [],
+            }))
+            continue
         X, y, w, realized, expired = build_meta_frame(bars, cfg_lgbm)
         if len(X) == 0:
             per_window.append((_w_end, w_days, float(w_weight), False, {
