@@ -125,6 +125,7 @@ class ProfitValidationSuite:
                 "n": T,
                 "years": 0.0,
                 "periods_per_year": ppy,
+                "short_sample": True,
             }
 
         sr_unit = float(np.mean(r) / np.std(r, ddof=1))

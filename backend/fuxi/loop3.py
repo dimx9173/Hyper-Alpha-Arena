@@ -170,7 +170,7 @@ class ParameterPlateauSearch:
         cost_win, cost_loss = round_trip_cost_fractions(self.fees)
         gross = np.asarray(r[cut:], dtype=float)[mask]
         gross_expired = np.asarray(expired[cut:], dtype=bool)[mask]
-        rets = gross - np.where(gross > 0.0 & ~gross_expired, cost_win, cost_loss)
+        rets = gross - np.where((gross > 0.0) & ~gross_expired, cost_win, cost_loss)
         if len(rets) < self.min_trades:
             # A parameter set that cannot clear the net-EV gate has NO measured
             # edge. Scoring it as SR 0.0 would let "never trade" masquerade as

@@ -290,7 +290,12 @@ class RollingClosedLoopController:
             num_trials=self.dsr_trials,
             trials_sharpe_std=self.dsr_trials_sharpe_std,
         )
+        # Review F-H: a sub-year validation window cannot support an annual
+        # DSR (years = span/365 < 1 forces dsr 0). Report it as an explicit
+        # insufficient-window condition instead of letting 0.0 masquerade as
+        # "the challenger failed the bar".
         chal_dsr = float(dsr_info["dsr"])
+        chal_short = bool(dsr_info.get("short_sample", False))
 
         if self.champion is None:
             self.champion = challenger
@@ -328,11 +333,13 @@ class RollingClosedLoopController:
                 "chal_ev": chal_ev,
                 "champ_ev": champ_ev,
                 "chal_dsr": chal_dsr,
+                "short_sample": chal_short,
                 "orphan_positions_locked": len(self.open_contracts),
             }
-
         # A losing duel derates Kelly to 0.75 (§4.3) and leaves the PASS_REGIME
-        # latch exactly as Loop 3 set it (review F4).
+        # latch exactly as Loop 3 set it (review F4). A short validation
+        # window (review F-H) cannot clear an annual DSR by construction, so
+        # say so instead of reporting a 0.0 that reads as "failed the bar".
         self.kelly_penalty_scalar = CHALLENGER_LOSS_THROTTLE
         return {
             "status": "CHAMPION_RETAINED_WITH_THROTTLE",
@@ -340,6 +347,7 @@ class RollingClosedLoopController:
             "chal_ev": chal_ev,
             "champ_ev": champ_ev,
             "chal_dsr": chal_dsr,
+            "short_sample": chal_short,
             "kelly_penalty_scalar": self.kelly_penalty_scalar,
         }
 
