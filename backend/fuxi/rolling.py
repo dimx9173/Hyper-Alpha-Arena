@@ -4,9 +4,10 @@ Loop 1 (every 5m close): inference only — lives in ``backtest.py``.
 Loop 2 (every 7/14d): freeze ``(features, N/M/x/y)``, retrain LGBM weights +
 Isotonic on the hybrid 70/30 dataset, produce a challenger, duel it against
 the champion on the OOS window.
-Loop 3 (every 30d or PSI > 0.25): feature-subset reselect + ``(N,M,x,y)``
+Loop 3 (every 30d): feature-subset reselect + ``(N,M,x,y)``
 plateau search via ``J(θ) = μ_SR − λ·σ_SR``; ``PASS_REGIME`` sleep when every
-plateau median falls below 0.5 (§4.2 revenge-overfitting guard).
+plateau's max mean **annualized** Sharpe falls below 0.5 (§4.2
+revenge-overfitting guard, review F4).
 
 Orphan isolation (§4.3): every open position carries its birth
 ``PositionContract`` (model id, TP/SL, expiry). A champion swap never rewrites
@@ -24,7 +25,10 @@ import numpy as np
 import pandas as pd
 from sklearn.isotonic import IsotonicRegression
 
-from .validation import ProfitValidationSuite
+from config.fees import FeeSchedule  # noqa: E402
+
+from .risk import round_trip_cost_fractions  # noqa: E402
+from .validation import ProfitValidationSuite, infer_periods_per_year  # noqa: E402
 
 EPS = 1e-8
 
@@ -32,8 +36,9 @@ EPS = 1e-8
 CHALLENGER_EPSILON_MARGIN = 0.0005
 # Losing duel → defensive derate of the Kelly scalar (§4.3).
 CHALLENGER_LOSS_THROTTLE = 0.75
-# §4.2 revenge-overfitting guard floor. Canonical here because loop3 imports
-# this module (the reverse import would be circular).
+# §4.2 revenge-overfitting guard floor, in ANNUALIZED Sharpe units (same scale
+# as the §7 friction gate's ``sr``; review F4). Canonical here because loop3
+# imports this module (the reverse import would be circular).
 PASS_REGIME_MEDIAN_SR = 0.5
 
 MODEL_ID_PREFIX = "FUXI"
@@ -77,8 +82,8 @@ class RollingClosedLoopController:
         self,
         stress_ratio: float = 0.30,
         dsr_threshold: float = 0.95,
-        dsr_trials: int = 30,
-        dsr_trials_sharpe_std: float = 0.20,
+        dsr_trials: int = 100,
+        dsr_trials_sharpe_std: float = 0.5,
     ) -> None:
         if not 0.0 <= stress_ratio < 1.0:
             raise ValueError("stress_ratio ρ must be in [0, 1)")
@@ -109,6 +114,16 @@ class RollingClosedLoopController:
     def _next_model_id(self) -> str:
         self._model_seq += 1
         return f"{MODEL_ID_PREFIX}_C{self._model_seq:04d}_{uuid.uuid4().hex[:6]}"
+
+    def set_pass_regime(self, value: bool) -> None:
+        """§4.2 latch: Loop 3 (or its caller) decides whether the regime sleeps.
+
+        Review F4: ``pass_regime`` used to be written only inside the duel,
+        which meant a caller could compute a PASS verdict and have the very
+        next champion deploy silently re-arm trading. The controller exposes
+        this setter so the decision outlives ordinary Loop-2 churn.
+        """
+        self.pass_regime = bool(value)
 
     # ------------------------------------------------------------------ #
     # §4.2 hybrid anti-amnesia dataset
@@ -186,6 +201,35 @@ class RollingClosedLoopController:
         calibrator.fit(np.asarray(cal_raw, dtype=float), y_train.iloc[split:].to_numpy(dtype=float))
         return booster, calibrator
 
+    @staticmethod
+    def _net_trade_rets(
+        realized_rets: np.ndarray,
+        mask: np.ndarray,
+        fees: Optional[FeeSchedule],
+        index: pd.Index,
+        fallback_ppy: float,
+    ) -> tuple[np.ndarray, float]:
+        """Net returns and annualization unit for the trades a model takes.
+
+        Review F3: a trade that wins exits at its resting take-profit and pays
+        ``cost_win``; a trade that loses exits on the stop and pays ``cost_loss``
+        (taker + slippage). The win/loss label is the sign of the realized
+        return, which is exactly how the labeller assigned ``meta_label``.
+
+        The annualization unit is trades/year implied by the trade timestamp
+        span. Only when that span cannot support one (fewer than two exits, or
+        every exit on the same instant) does the caller's declared
+        ``periods_per_year`` apply.
+        """
+        selected = np.asarray(realized_rets, dtype=float)[mask]
+        cost_win, cost_loss = round_trip_cost_fractions(fees or FeeSchedule())
+        net = selected - np.where(selected > 0.0, cost_win, cost_loss)
+        try:
+            ppy = infer_periods_per_year(index[mask])
+        except (ValueError, IndexError, TypeError):
+            ppy = float(fallback_ppy)
+        return net, ppy
+
     def train_and_evaluate_challenger(
         self,
         X_train: pd.DataFrame,
@@ -197,8 +241,9 @@ class RollingClosedLoopController:
         candidate_params: Dict[str, float],
         feature_cols: Optional[List[str]] = None,
         entry_threshold: float = 0.55,
-        fee_per_trade: float = 0.0010,
+        fees=None,
         seed: int = 42,
+        periods_per_year: float = 365.0,
     ) -> dict:
         """Train a challenger and duel it against the champion on OOS data.
 
@@ -224,12 +269,15 @@ class RollingClosedLoopController:
 
         chal_probs = challenger.calibrated_proba(X_val)
         chal_mask = chal_probs > entry_threshold
-        chal_rets = np.asarray(val_realized_rets, dtype=float)[chal_mask] - fee_per_trade
+        chal_rets, chal_ppy = self._net_trade_rets(
+            val_realized_rets, chal_mask, fees, X_val.index, periods_per_year
+        )
         chal_ev = float(np.mean(chal_rets)) if len(chal_rets) > 5 else -0.01
         # DSR must score the trades the challenger would actually take, not the
         # whole validation window (which includes bars it correctly skips).
         dsr_info = ProfitValidationSuite.compute_deflated_sharpe_ratio(
             chal_rets,
+            periods_per_year=chal_ppy,
             num_trials=self.dsr_trials,
             trials_sharpe_std=self.dsr_trials_sharpe_std,
         )
@@ -238,7 +286,9 @@ class RollingClosedLoopController:
         if self.champion is None:
             self.champion = challenger
             self.kelly_penalty_scalar = 1.0
-            self.pass_regime = False
+            # Review F4: a champion deployment resets the throttle but must
+            # NOT clear a PASS_REGIME verdict — that latch is Loop 3's decision
+            # and outlives Loop-2 churn.
             return {
                 "status": "INITIAL_CHAMPION_DEPLOYED",
                 "active_id": self.champion.model_id,
@@ -248,7 +298,9 @@ class RollingClosedLoopController:
 
         champ_probs = self.champion.calibrated_proba(X_val)
         champ_mask = champ_probs > entry_threshold
-        champ_rets = np.asarray(val_realized_rets, dtype=float)[champ_mask] - fee_per_trade
+        champ_rets, _ = self._net_trade_rets(
+            val_realized_rets, champ_mask, fees, X_val.index, periods_per_year
+        )
         champ_ev = float(np.mean(champ_rets)) if len(champ_rets) > 5 else -0.01
 
         if (
@@ -269,6 +321,8 @@ class RollingClosedLoopController:
                 "orphan_positions_locked": len(self.open_contracts),
             }
 
+        # A losing duel derates Kelly to 0.75 (§4.3) and leaves the PASS_REGIME
+        # latch exactly as Loop 3 set it (review F4).
         self.kelly_penalty_scalar = CHALLENGER_LOSS_THROTTLE
         return {
             "status": "CHAMPION_RETAINED_WITH_THROTTLE",

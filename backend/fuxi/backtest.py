@@ -34,7 +34,7 @@ from config.fees import FeeSchedule  # noqa: E402
 
 from .labels import MetaLabelingEngine  # noqa: E402
 from .ratchet import AsymmetricCompoundingRatchet  # noqa: E402
-from .risk import MIN_EV_THRESHOLD, PerpetualRiskAndSmoothingEngine  # noqa: E402
+from .risk import MIN_EV_THRESHOLD, PerpetualRiskAndSmoothingEngine, cost_leg_entry, cost_leg_exit  # noqa: E402
 from .rolling import RollingClosedLoopController  # noqa: E402
 
 EPS = 1e-8
@@ -141,9 +141,7 @@ class FuxiBacktestRunner:
         has_funding = "funding_rate" in bars.columns
         funding = bars["funding_rate"].fillna(0.0).to_numpy(dtype=float) if has_funding else np.zeros(len(bars))
 
-        maker = self.fees.maker_fee_bps / 10000.0
-        taker = self.fees.taker_fee_bps / 10000.0
-        slip = self.fees.slippage_bps / 10000.0
+        entry_cost = cost_leg_entry(self.fees)
 
         X = feats[champ.feature_cols] if all(c in feats.columns for c in champ.feature_cols) else feats
         try:
@@ -200,8 +198,8 @@ class FuxiBacktestRunner:
                     notional = open_pos["margin"] * open_pos["leverage"]
                     # Full round trip charged exactly once, at close, so the
                     # identity Σ(trade.net_pnl_u) == Δequity always holds.
-                    exit_cost = self.risk.exit_cost_fraction(reason == "tp")
-                    cost = (open_pos["entry_cost"] + exit_cost) * notional
+                    exit_cost = cost_leg_exit(self.fees, reason == "tp")
+                    cost = (entry_cost + exit_cost) * notional
                     fund_cost = 0.0
                     if self.config.funding_enabled and has_funding:
                         n_marks = max(0, (times_ms[i] - open_pos["entry_ms"]) // FUNDING_INTERVAL_MS)
@@ -252,7 +250,7 @@ class FuxiBacktestRunner:
                             "open_idx": i, "entry_ms": int(times_ms[i]),
                             # carried to the close so the entry leg is charged
                             # exactly once and Σ(net_pnl) == Δequity holds
-                            "entry_cost": self.risk.entry_cost_fraction(),
+                            "entry_cost": entry_cost,
                         }
 
             equity_curve[i] = self.ratchet.get_status().total_equity
@@ -262,7 +260,7 @@ class FuxiBacktestRunner:
             d = open_pos["direction"]
             gross = (closes[-1] - open_pos["entry"]) / (open_pos["entry"] + EPS) * d
             notional = open_pos["margin"] * open_pos["leverage"]
-            cost = (open_pos["entry_cost"] + self.risk.exit_cost_fraction(False)) * notional
+            cost = (entry_cost + cost_leg_exit(self.fees, False)) * notional
             fund_cost = 0.0
             if self.config.funding_enabled and has_funding:
                 n_marks = max(0, (times_ms[-1] - open_pos["entry_ms"]) // FUNDING_INTERVAL_MS)

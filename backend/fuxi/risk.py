@@ -48,6 +48,36 @@ DEFAULT_MONTHLY_DD_TOLERANCE = 0.08
 MIN_EV_THRESHOLD = 0.0015  # δ_min: net-EV gate per trade
 
 
+# ---------------------------------------------------------------------- #
+# §5.1 round-trip cost legs — THE single cost definition (review F3).
+# The EV gate, the backtest simulator, the challenger duel, the Loop-3
+# plateau search and the §7 friction gate all price trades through these
+# functions, so a fee change can never leave one caller charging 8bp while
+# another charges 13bp.
+# ---------------------------------------------------------------------- #
+def cost_leg_entry(fees: FeeSchedule) -> float:
+    """Entry leg: market fill pays taker fee + slippage."""
+    return fees.taker_fee_bps / 10000.0 + fees.slippage_bps / 10000.0
+
+
+def cost_leg_exit(fees: FeeSchedule, is_take_profit: bool) -> float:
+    """Exit leg: TP is a resting maker limit; SL pays taker + slippage."""
+    if is_take_profit:
+        return fees.maker_fee_bps / 10000.0
+    return fees.taker_fee_bps / 10000.0 + fees.slippage_bps / 10000.0
+
+
+def round_trip_cost_fractions(
+    fees: FeeSchedule, funding_cost: float = 0.0
+) -> tuple[float, float]:
+    """``(cost_win, cost_loss)`` fractions of notional for a full round trip."""
+    entry = cost_leg_entry(fees)
+    return (
+        entry + cost_leg_exit(fees, True) + funding_cost,
+        entry + cost_leg_exit(fees, False) + funding_cost,
+    )
+
+
 @dataclass
 class SizingDecision:
     margin: float
@@ -128,22 +158,17 @@ class PerpetualRiskAndSmoothingEngine:
     # ------------------------------------------------------------------ #
     def entry_cost_fraction(self) -> float:
         """Entry leg: market fill pays taker fee + slippage."""
-        return self.fees.taker_fee_bps / 10000.0 + self.fees.slippage_bps / 10000.0
+        return cost_leg_entry(self.fees)
 
     def exit_cost_fraction(self, is_take_profit: bool) -> float:
         """Exit leg: TP is a resting maker limit; SL pays taker + slippage."""
-        if is_take_profit:
-            return self.fees.maker_fee_bps / 10000.0
-        return self.fees.taker_fee_bps / 10000.0 + self.fees.slippage_bps / 10000.0
+        return cost_leg_exit(self.fees, is_take_profit)
 
     def round_trip_costs(
         self, funding_cost: float = 0.0
     ) -> tuple[float, float]:
         """``(cost_win, cost_loss)`` for a full round trip, per §5.1."""
-        entry = self.entry_cost_fraction()
-        cost_win = entry + self.exit_cost_fraction(True) + funding_cost
-        cost_loss = entry + self.exit_cost_fraction(False) + funding_cost
-        return cost_win, cost_loss
+        return round_trip_cost_fractions(self.fees, funding_cost)
 
     def net_expected_value(
         self,
@@ -225,6 +250,9 @@ class PerpetualRiskAndSmoothingEngine:
 
         if self.buckets:
             valid = [b for b in self.buckets if b <= raw_margin]
+            # Spec §5.4: Margin = max{g ∈ G | g ≤ W_base·f_final}. Sub-tier
+            # sizing therefore maps to 0 — the F8 dead zone was cured by giving
+            # the ladder a 5u bottom rung (cli.BUCKETS), not by bypassing it.
             final_margin = float(max(valid)) if valid else 0.0
         else:
             final_margin = float(raw_margin)
@@ -232,7 +260,7 @@ class PerpetualRiskAndSmoothingEngine:
         # Deploy guardrail: single-coin notional may not exceed MAX_SINGLE_COIN.
         if total_equity > 0:
             cap_margin = MAX_SINGLE_COIN * total_equity / max(actual_leverage, EPS)
-            if final_margin * 1.0 > cap_margin and self.buckets:
+            if final_margin > cap_margin and self.buckets:
                 valid = [b for b in self.buckets if b <= min(raw_margin, cap_margin)]
                 final_margin = float(max(valid)) if valid else 0.0
             else:

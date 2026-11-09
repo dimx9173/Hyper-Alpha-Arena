@@ -133,7 +133,7 @@
 | :------------------- | :---------------------------- | :------------------------------------------------------------------------------------------------ | :------------------------------------- |
 | **Loop 1: 高頻推論與對帳** | 每根 5m K 線收盤                  | 執行交易所 API 狀態對帳（Reconciliation）、更新特徵快取、由當前衛冕者模型（Champion）計算 $\hat{p}_{\text{cal}, t}$ 並執行訂單與強平檢查。 | 確保零延遲執行並防止斷線導致本地與交易所部位脫節。             |
 | **Loop 2: 中頻權重滾動**  | 每 7 天或 14 天定時                | **凍結特徵子集與超參數** $(N,M,x,y)$，利用「混合抽樣抗遺忘視窗」重新訓練 LightGBM 樹權重與 Isotonic 校準器，生成挑戰者模型（Challenger）。     | 適應近期市場微結構與波動尺度，避免交易風格劇烈擺盪。            |
-| **Loop 3: 低頻結構重構**  | 每 30 天 或 $\text{PSI} > 0.25$ | 重新執行 48 指標去共線性與 SHAP 篩選，並透過高原目標函數 $J(\theta)$ 重新搜尋最佳超參數組合 $\theta^*$。                            | 應對宏觀市場狀態（Regime）切換與因子衰退（Alpha Decay）。 |
+| **Loop 3: 低頻結構重構**  | 每 30 天（PSI 觸發器已移除：尚無分佈契約與計算器，落地前僅定時觸發，見 F9） | 重新執行 48 指標去共線性與 SHAP 篩選，並透過高原目標函數 $J(\theta)$ 重新搜尋最佳超參數組合 $\theta^*$。                            | 應對宏觀市場狀態（Regime）切換與因子衰退（Alpha Decay）。 |
 
 
 ### 4.2 混合抽樣抗遺忘視窗 (Hybrid Anti-Amnesia Training Window)
@@ -145,7 +145,7 @@ $$
 $$
 
 - **近期連續視窗** $\mathcal{D}_{\text{recent}}$**（佔** $70\%$**）**：取最近 $W_{\text{recent}}$ 天（如 60\~90 天）的連續樣本，捕捉最新盤口動能。
-- **歷史極端壓力記憶庫** $\mathcal{D}_{\text{stress}}$**（佔** $30\%$**）**：自過去 1\~2 年歷史資料庫中，篩選相對波動率 $F_{\text{ATR}, t}$ 處於前 $5\%$ 分位數（閃崩、插針、單邊軋空）的獨立行情片段進行分層抽樣，強制模型始終保有對黑天鵝尾部風險的辨識力。
+- **歷史極端壓力記憶庫** $\mathcal{D}_{\text{stress}}$**（佔** $30\%$**）**：自過去 1\~2 年歷史資料庫中，篩選相對波動率 $F_{\text{ATR}, t}$ 處於最高 $5\%$（$\ge 95$ 分位數，閃崩、插針、單邊軋空）的獨立行情片段進行分層抽樣，強制模型始終保有對黑天鵝尾部風險的辨識力。
 - **報復性過擬合熔斷（Revenge Overfitting Guard）**：在 Loop 3 搜尋超參數時，若所有候選參數高原的中位數夏普 $\max_{\theta} \mu_{\text{SR}}(\theta) < 0.5$，判定當前市場處於無趨勢噪音期，系統直接進入 **`PASS_REGIME`（全系統空倉休眠狀態）**，嚴禁強行挑出扭曲參數硬做。
 
 ### 4.3 衛冕者-挑戰者交接閘門與孤兒持倉隔離 (Champion-Challenger Gate &amp; Orphan Isolation)
@@ -272,10 +272,10 @@ $$
    $$
 2. **第二關：蒙地卡羅路徑重抽樣壓力測試 (Monte Carlo Trade Reshuffling,** $B=10,000$**)**：
    - 第 95 百分位極端最大回撤：$\text{Quantile}_{0.95}(\text{MDD}) \le 20\%$；破產機率（跌破 $-30\%$）$< 0.5\%$。
-3. **第三關：交易摩擦敏感度壓力測試 (Friction Sensitivity Stress Test)**：
+3. **第三關：交易摩擦敏感度壓力測試（Friction Sensitivity Stress Test, F1/F3：輸入為年化 SR，成本經 FeeSchedule 分腿）**：
    - 在 $1.5\times$ 雙邊摩擦成本下，年化夏普比率仍須 $> 1.0$ 且淨利留存率 $\ge 50\%$。
-4. **第四關：月度滾動體感與利潤集中度指標 (Monthly Consistency &amp; Concentration)**：
-   - 勝率月份佔比 $\in [65\%, 85\%]$、最長水下恢復期 $\text{Max TUW} \le 30\text{ 天}$、扣除 Top-5 獲利交易後之淨利留存率 $\ge 50\%$。
+4. **第四關：月度滾動體感與利潤集中度指標（Monthly Consistency &amp; Concentration, F2：勝率月份佔比單邊 $\ge 65\%$，刪 $85\%$ 上限；樣本 $< 3$ 個月只報 reason 不強判）**：
+   - 勝率月份佔比 $\ge 65\%$（單邊，無上界）、最長水下恢復期 $\text{Max TUW} \le 30\text{ 天}$、扣除 Top-5 獲利交易後之淨利留存率 $\ge 50\%$。
 
 ---
 
@@ -575,7 +575,7 @@ class RollingClosedLoopController:
     """
     管理混合抽樣抗遺忘視窗、Champion-Challenger 自動評估晉升與孤兒持倉隔離
     """
-    def __init__(self, stress_ratio: float = 0.30, dsr_threshold: float = 0.90):
+    def __init__(self, stress_ratio: float = 0.30, dsr_threshold: float = 0.95):
         self.stress_ratio = stress_ratio
         self.dsr_threshold = dsr_threshold
         self.champion_model: Optional[lgb.LGBMClassifier] = None
@@ -687,8 +687,8 @@ class RollingClosedLoopController:
         champ_active_rets = val_realized_rets[champ_probs > 0.55] - 0.0010
         champ_ev = float(np.mean(champ_active_rets)) if len(champ_active_rets) > 5 else -0.01
 
-        # 晉升條件：挑戰者期望收益 > 0 且優於衛冕者 (或 DSR 顯著達標)
-        if chal_ev > 0.0 and (chal_ev >= champ_ev or chal_dsr >= self.dsr_threshold):
+        # 晉升條件（F12：與 §4.3 公式及 rolling.py 實作一致的三重 AND）
+        if chal_dsr >= self.dsr_threshold and chal_ev > 0.0 and chal_ev >= champ_ev + 0.0005:
             prev_id = self.champion_id
             self.champion_model = chal_clf
             self.champion_calibrator = chal_iso
@@ -969,7 +969,7 @@ if __name__ == "__main__":
     r_model = meta_df.loc[common_idx, 'realized_ret'].values
 
     # 2. 初始化滾動閉環控制器與非對稱棘輪資金池
-    rolling_ctrl = RollingClosedLoopController(stress_ratio=0.30, dsr_threshold=0.85)
+    rolling_ctrl = RollingClosedLoopController(stress_ratio=0.30, dsr_threshold=0.95)
     ratchet_vault = AsymmetricCompoundingRatchet(initial_capital=1000.0, reinvest_ratio=0.60)
     risk_engine = PerpetualRiskAndSmoothingEngine(
         kelly_c=0.35, max_cap=0.50, discrete_buckets=[100.0, 200.0, 500.0, 1000.0]

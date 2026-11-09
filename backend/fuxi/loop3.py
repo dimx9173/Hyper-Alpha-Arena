@@ -22,20 +22,43 @@ Loop-3 also reselects the feature subset: correlation pre-prune (threshold
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
+from config.fees import FeeSchedule
+
 from .features import MultiTimeframeFeaturePipeline
 from .labels import MetaLabelingEngine, build_model_frame
+from .risk import round_trip_cost_fractions
 # §4.2 floor is canonical in rolling (which also owns the controller's
 # revenge-guard semantics); this module re-exports rather than redefining it.
 from .rolling import PASS_REGIME_MEDIAN_SR, RollingClosedLoopController
-from .validation import ProfitValidationSuite
+from .validation import ProfitValidationSuite, infer_periods_per_year
 
 LAMBDA_PENALTY = 1.0
 DEFAULT_NEIGHBOUR_RATE = 0.10  # ±perturbation for (x, y); M swings ±1 bar
+
+# 5m bars per year: 365d × 24h × 12 bars/h (review F4: annualized SR units).
+BARS_PER_5M_YEAR = 365 * 288
+
+
+def annualize_sharpe(
+    sr_per_trade: float, n_trades: int, window_bars: int,
+    bars_per_year: int = BARS_PER_5M_YEAR,
+) -> float:
+    """Scale a per-trade Sharpe to the annual units the PASS_REGIME floor uses.
+
+    Generic helper (review F4): the bar-count form of per-year scaling. The
+    live Loop-3 ``sr`` line itself reuses Gate-1's ``sr_unit * sqrt(ppy)``
+    inline so plateau scoring and DSR share one annualization; this helper is
+    the documented conversion for callers that only know trade counts.
+    """
+    if n_trades <= 0 or window_bars <= 0 or bars_per_year <= 0:
+        return 0.0
+    years = float(window_bars) / float(bars_per_year)
+    return float(sr_per_trade) * float(np.sqrt(float(n_trades) / max(years, 1e-12)))
 
 
 @dataclass
@@ -85,7 +108,9 @@ class ParameterPlateauSearch:
         lambd: float = LAMBDA_PENALTY,
         neighbour_rate: float = DEFAULT_NEIGHBOUR_RATE,
         dsr_threshold: float = 0.95,
-        fee_per_trade: float = 0.0008,
+        dsr_trials: int = 100,
+        dsr_trials_std: float = 0.5,
+        fees: Optional[FeeSchedule] = None,
         seed: int = 42,
         entry_threshold: float = 0.55,
         min_trades: int = 20,
@@ -93,7 +118,9 @@ class ParameterPlateauSearch:
         self.lambd = float(lambd)
         self.neighbour_rate = float(neighbour_rate)
         self.dsr_threshold = float(dsr_threshold)
-        self.fee_per_trade = float(fee_per_trade)
+        self.dsr_trials = int(dsr_trials)
+        self.dsr_trials_std = float(dsr_trials_std)
+        self.fees: FeeSchedule = fees or FeeSchedule()
         self.seed = int(seed)
         self.entry_threshold = float(entry_threshold)
         self.min_trades = int(min_trades)
@@ -106,8 +133,16 @@ class ParameterPlateauSearch:
         features: pd.DataFrame,
         primary_signals: pd.Series,
         train_frac: float = 0.70,
+        feature_cols: Optional[List[str]] = None,
     ) -> Dict[str, float]:
         """Fit a champion at θ on the train slice, score its OOS trade returns."""
+        if feature_cols is not None:
+            # Review F5: Loop 3 freezes the kept subset; every θ is scored on
+            # exactly those columns so no stray feature leaks back into search.
+            missing = [c for c in feature_cols if c not in features.columns]
+            if missing:
+                raise ValueError(f"kept subset has {len(missing)} column(s) missing from features")
+            features = features[feature_cols]
         eng = MetaLabelingEngine(x=float(theta["x"]), y=float(theta["y"]), M=int(theta["M"]))
         meta = eng.apply_triple_barrier_and_weights(bars_5m, primary_signals)
         X, y, w, r = build_model_frame(features, meta)
@@ -123,12 +158,17 @@ class ParameterPlateauSearch:
             X.iloc[:cut], y.iloc[:cut], w[:cut],
             X.iloc[cut:], y.iloc[cut:], r[cut:],
             candidate_params={"x": float(theta["x"]), "y": float(theta["y"]), "M": int(theta["M"])},
+            fees=self.fees,
             seed=self.seed,
         )
         probs = ctrl.champion.calibrated_proba(X.iloc[cut:])
         # Trade only what the model would actually take (p > entry threshold).
         mask = probs > self.entry_threshold
-        rets = np.asarray(r[cut:], dtype=float)[mask] - self.fee_per_trade
+        # Review F3: winning trades exit at the resting TP (cost_win), losing
+        # trades exit on the stop (cost_loss) — one fee source, both legs.
+        cost_win, cost_loss = round_trip_cost_fractions(self.fees)
+        gross = np.asarray(r[cut:], dtype=float)[mask]
+        rets = gross - np.where(gross > 0.0, cost_win, cost_loss)
         if len(rets) < self.min_trades:
             # A parameter set that cannot clear the net-EV gate has NO measured
             # edge. Scoring it as SR 0.0 would let "never trade" masquerade as
@@ -140,9 +180,22 @@ class ParameterPlateauSearch:
                 "traded": False,
             }
 
-        sr = float(np.mean(rets) / (np.std(rets, ddof=1) + 1e-12))
+        # These are per-trade returns, so the annualization unit is trades/year.
+        oos_index = X.iloc[cut:].index
+        try:
+            ppy = infer_periods_per_year(oos_index[mask])
+        except ValueError:
+            # Every selected exit shares one instant: scale the OOS bar rate by
+            # the observed trades-per-bar ratio instead of guessing a constant.
+            ppy = infer_periods_per_year(oos_index) * len(rets) / max(len(oos_index), 1)
+
+        sr_unit = float(np.mean(rets) / (np.std(rets, ddof=1) + 1e-12))
+        sr = float(sr_unit * np.sqrt(ppy))
         dsr = ProfitValidationSuite.compute_deflated_sharpe_ratio(
-            rets, num_trials=30, trials_sharpe_std=0.2
+            rets,
+            periods_per_year=ppy,
+            num_trials=self.dsr_trials,
+            trials_sharpe_std=self.dsr_trials_std,
         )
         return {
             "sr": sr,
@@ -160,12 +213,14 @@ class ParameterPlateauSearch:
         features: pd.DataFrame,
         primary_signals: pd.Series,
         include_self: bool = True,
+        feature_cols: Optional[List[str]] = None,
     ) -> PlateauResult:
         """J(θ) = μ_SR − λ·σ_SR over θ and its neighbourhood."""
         points = ([theta] if include_self else []) + _neighbourhood(theta, self.neighbour_rate)
         scored: List[Tuple[Dict[str, float], float]] = []
         for padj in points:
-            m = self.evaluate_theta(padj, bars_5m, features, primary_signals)
+            m = self.evaluate_theta(padj, bars_5m, features, primary_signals,
+                                    feature_cols=feature_cols)
             scored.append((padj, float(m["sr"]), bool(m.get("traded", False))))
         measured = np.array([s for _, s, t in scored if t], dtype=float)
         n_traded = int(len(measured))
@@ -194,11 +249,13 @@ class ParameterPlateauSearch:
         features: pd.DataFrame,
         primary_signals: pd.Series,
         progress: bool = False,
+        feature_cols: Optional[List[str]] = None,
     ) -> Tuple[PlateauResult, List[PlateauResult]]:
         """Score every candidate plateau; return best + all (ordered by score)."""
         results: List[PlateauResult] = []
         for i, theta in enumerate(candidates):
-            res = self.score_plateau(theta, bars_5m, features, primary_signals)
+            res = self.score_plateau(theta, bars_5m, features, primary_signals,
+                                     feature_cols=feature_cols)
             results.append(res)
             if progress:
                 print(
@@ -212,7 +269,7 @@ class ParameterPlateauSearch:
     # ------------------------------------------------------------------ #
     @staticmethod
     def is_pass_regime(results: Sequence[PlateauResult], floor: float = PASS_REGIME_MEDIAN_SR) -> bool:
-        """§4.2: every plateau median SR below the floor → sleep, do not trade."""
+        """§4.2: every plateau median SR (annualized) below the floor → sleep."""
         if not results:
             return True
         return max(r.mu_sr for r in results) < floor
@@ -230,6 +287,38 @@ def default_parameter_grid() -> List[Dict[str, float]]:
         for y in (1.0, 1.5, 2.0, 3.0, 4.0):
             for m in (12, 24, 48, 72):
                 out.append({"x": float(x), "y": float(y), "M": float(m)})
+    return out
+
+
+def stratified_grid_sample(
+    grid: Sequence[Dict[str, float]], n: int, seed: int = 7
+) -> List[Dict[str, float]]:
+    """Stratified sample of the parameter grid, one tier per ``x`` (review F6).
+
+    The old ``grid[:8]`` slice took all 8 samples from ``x = 0.4%`` — the
+    width where the ~0.08% round trip dominates — so Loop 3 under-reported
+    realizable edge and over-triggered PASS_REGIME. Strata are the distinct
+    ``x`` values; each receives ``n // n_strata`` picks (first strata take the
+    remainder) with a deterministic rotation by ``seed`` so the sample is
+    reproducible without a caller-supplied RNG.
+    """
+    items = list(grid)
+    if n <= 0:
+        raise ValueError(f"loop3 sample size must be positive, got {n}")
+    if n >= len(items):
+        return list(items)
+    tiers: Dict[float, List[Dict[str, float]]] = {}
+    for t in items:
+        tiers.setdefault(float(t["x"]), []).append(t)
+    keys = sorted(tiers)
+    base, rem = divmod(n, len(keys))
+    out: List[Dict[str, float]] = []
+    for i, k in enumerate(keys):
+        tier = tiers[k]
+        take = base + (1 if i < rem else 0)
+        start = (seed + i) % len(tier)
+        for j in range(take):
+            out.append(tier[(start + j) % len(tier)])
     return out
 
 

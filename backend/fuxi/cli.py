@@ -38,20 +38,35 @@ from fuxi.loop3 import (  # noqa: E402
     ParameterPlateauSearch,
     default_parameter_grid,
     reselect_features,
+    stratified_grid_sample,
 )
 from fuxi.ratchet import AsymmetricCompoundingRatchet  # noqa: E402
 from fuxi.risk import PerpetualRiskAndSmoothingEngine  # noqa: E402
 from fuxi.rolling import RollingClosedLoopController  # noqa: E402
 from fuxi.validation import PromotionGate  # noqa: E402
 
-BUCKETS = [25.0, 50.0, 100.0, 200.0, 500.0, 1000.0]
+# Bottom bucket 5u: with the old 25u floor a 794u account capped at 0.2 Kelly
+# could never reach the ladder and silently traded nothing (review F8).
+# Spec §G Discrete Grid keeps the same ladder; the risk engine now falls back
+# to the raw Kelly fraction below the smallest tier.
+BUCKETS = [5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0]
+# Loop-3 sampling default: 24 draws = 4 per x-tier over 6 width strata, so the
+# search covers the whole (x, y, M) box instead of the first x-slice (F6).
+DEFAULT_LOOP3_SAMPLES = 24
+# §4.2 latch verdict text. Compared by identity at the end of main().
+PASS_REGIME_VERDICT = "PASS_REGIME — 無可交易邊際，全系統空倉休眠"
 
 
 def synthetic_bars(days: int, seed: int = 7) -> pd.DataFrame:
     n = days * 288
     rng = np.random.default_rng(seed)
     idx = pd.date_range("2026-01-01", periods=n, freq="5min", tz="UTC")
-    regime = np.repeat(rng.choice([-1, 0, 1], size=max(1, n // 200)), 200)[:n]
+    regime = np.repeat(
+        # Ceil, don't floor: without the +199 the 8640th row of days=30 has
+        # nowhere to come from and np.repeat broadcasts against a short
+        # array (review F7: `days * 288` rows guaranteed for every input).
+        rng.choice([-1, 0, 1], size=max(1, (n + 199) // 200)), 200
+    )[:n]
     ret = regime * 0.00035 + rng.normal(0, 0.0022, n)
     close = 1000.0 * np.exp(np.cumsum(ret))
     high = close * (1.0 + np.abs(rng.normal(0, 0.0016, n)))
@@ -100,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--entry-threshold", type=float, default=0.55)
     ap.add_argument("--target-leverage", type=float, default=3.0)
     ap.add_argument("--train-frac", type=float, default=0.70)
-    ap.add_argument("--loop3-samples", type=int, default=8)
+    ap.add_argument("--loop3-samples", type=int, default=DEFAULT_LOOP3_SAMPLES)
     ap.add_argument("--initial-capital", type=float, default=1000.0)
     ap.add_argument("--reinvest-ratio", type=float, default=0.60)
     ap.add_argument("--json", action="store_true")
@@ -125,23 +140,59 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---------------- Loop 3 (optional): plateau search + feature reselect ---- #
     x, y, m = args.x, args.y, args.hold_bars
+    # One controller for the whole run: Loop 3 sets its PASS_REGIME latch and
+    # Loop 1 then honours it (`backtest.run` refuses to open a position while
+    # the latch is set) — review F4.
+    ctrl = RollingClosedLoopController(dsr_threshold=0.95)
     if args.mode == "loop3":
+        # F14: clamp a positive sample count instead of slicing to [] — an
+        # empty candidate list used to crash inside search().
+        grid = default_parameter_grid()
+        if args.loop3_samples <= 0 or args.loop3_samples > len(grid):
+            print(
+                f"invalid --loop3-samples {args.loop3_samples}: "
+                f"must be in [1, {len(grid)}]",
+                file=sys.stderr,
+            )
+            return 2
         eng = MetaLabelingEngine(x=x, y=y, M=m)
         meta = eng.apply_triple_barrier_and_weights(bars, signals)
         kept = reselect_features(features, meta, top_k=24)
         report["reselect_features"] = kept
-        sample = default_parameter_grid()[: args.loop3_samples]
+        # Review F5: the search scores θ on exactly the kept subset (Loop 3
+        # freezes the feature subset) and Loop 2 trains the same subset below.
+        # `features` itself stays full so the simulator can still price ATR.
+        sample = stratified_grid_sample(grid, args.loop3_samples)
         search = ParameterPlateauSearch(entry_threshold=args.entry_threshold)
-        best, allres = search.search(sample, bars, features, signals, progress=True)
+        best, allres = search.search(sample, bars, features, signals,
+                                     progress=not args.json,
+                                     feature_cols=kept)
         report["loop3"] = {
             "best": best.as_dict(),
-            "pass_regime": search.is_pass_regime(allres),
+            "pass_regime": ParameterPlateauSearch.is_pass_regime(allres),
             "candidates": [r.as_dict() for r in allres],
         }
-        if search.is_pass_regime(allres):
-            report["verdict"] = "PASS_REGIME — 無可交易邊際，全系統空倉休眠"
-        else:
-            x, y, m = best.theta["x"], best.theta["y"], int(best.theta["M"])
+        if ParameterPlateauSearch.is_pass_regime(allres):
+            # Review F4: Loop 3 owns the latch. Set it on the live controller
+            # before any dueling so the PASS verdict survives champion deploys,
+            # and early-return with a Loop-3-only report: a sleeping regime has
+            # no models, no trades, and nothing for downstream gates to score.
+            ctrl.set_pass_regime(True)
+            report["verdict"] = PASS_REGIME_VERDICT
+            report["pass_regime"] = True
+            report["n_loop3_candidates"] = len(allres)
+            if args.json:
+                print(json.dumps(report, indent=2, default=str))
+            else:
+                print("=" * 72)
+                print("伏羲滾動量化 Loop 3 結構重構")
+                print(f"candidates {len(allres)}  verdict {PASS_REGIME_VERDICT}")
+                print("=" * 72)
+            return 0
+        # Loop 3 measured a tradable plateau: clear the latch explicitly so a
+        # stale sleep state from an earlier cycle cannot block this one.
+        ctrl.set_pass_regime(False)
+        x, y, m = best.theta["x"], best.theta["y"], int(best.theta["M"])
 
     # ---------------- Loop 2: train champion -------------------------------- #
     eng = MetaLabelingEngine(x=x, y=y, M=int(m))
@@ -154,11 +205,20 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     cut = int(len(X) * args.train_frac)
-    ctrl = RollingClosedLoopController(dsr_threshold=0.95)
+    # `ctrl` is the run's controller: Loop 3 already latched its sleep state,
+    # and the duel below now feeds it without recreating it (review F4/F5).
+    # Loop 3 ran: the frozen subset fed the search, so assert it feeds dueling
+    # too — the champion must be trained on exactly `kept` (review F5).
+    loop2_feature_cols = kept if args.mode == "loop3" else None
+    if args.mode == "loop3":
+        missing = [c for c in kept if c not in X.columns]
+        assert not missing, f"kept subset missing from model frame: {missing}"
+        report["loop2_feature_cols"] = list(kept)
     loop2 = ctrl.train_and_evaluate_challenger(
         X.iloc[:cut], yv.iloc[:cut], wv[:cut],
         X.iloc[cut:], yv.iloc[cut:], rv[cut:],
         candidate_params={"x": float(x), "y": float(y), "M": int(m)},
+        feature_cols=loop2_feature_cols,
     )
     report["loop2"] = loop2
     probs = ctrl.champion.calibrated_proba(X.iloc[cut:])
@@ -195,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---------------- §7 four validation gates ------------------------------ #
     if out.n_trades >= 10:
-        gate = PromotionGate(cost_per_trade=0.0008).evaluate(
+        gate = PromotionGate().evaluate(
             out.trade_returns(), out.exit_timestamps_ms()
         )
         report["validation"] = gate
@@ -230,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"Gate4 win_share {v['monthly']['win_share']:.3f} tuw {v['monthly']['max_tuw_days']:.1f}d")
         print(f"VERDICT: {report['verdict']}")
         print("=" * 72)
-    return 0 if report.get("verdict") in ("PROMOTE", "PASS_REGIME — 無可交易邊際，全系統空倉休眠") else 1
+    return 0 if report.get("verdict") in ("PROMOTE", PASS_REGIME_VERDICT) else 1
 
 
 if __name__ == "__main__":

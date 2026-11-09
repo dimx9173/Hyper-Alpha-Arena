@@ -174,16 +174,22 @@ def test_liquidation_guard_caps_leverage():
 def test_dsr_noise_is_not_significant():
     rng = np.random.default_rng(3)
     noise = rng.normal(0.0, 0.01, 400)
-    info = ProfitValidationSuite.compute_deflated_sharpe_ratio(noise, num_trials=100)
+    info = ProfitValidationSuite.compute_deflated_sharpe_ratio(
+        noise, periods_per_year=365.0, num_trials=100
+    )
     assert 0.0 <= info["dsr"] <= 1.0
     assert info["dsr"] < 0.95
 
 def test_dsr_strong_signal_passes():
     rng = np.random.default_rng(4)
-    # per-trade SR ≈ 1.0 (mean 0.004 / sd 0.004) must clear the K=10 null (0.787)
-    edge = rng.normal(0.004, 0.004, 600)
-    info = ProfitValidationSuite.compute_deflated_sharpe_ratio(edge, num_trials=10)
-    assert info["sr_est"] > info["sr_null"]
+    # Five years of daily returns with per-trade SR ~0.27 annualize to ~5.2 at
+    # PPY 365, clearing the K=10 null (0.79) by a wide margin → dsr > 0.95.
+    # The unit scale is explicit: without periods_per_year this call raises.
+    edge = rng.normal(0.0032, 0.012, 365 * 5)
+    info = ProfitValidationSuite.compute_deflated_sharpe_ratio(
+        edge, periods_per_year=365.0, num_trials=10
+    )
+    assert info["sr_ann"] > info["sr_null"]
     assert info["dsr"] > 0.95
 
 
@@ -194,7 +200,9 @@ def test_monte_carlo_and_friction_gates():
     assert 0.0 <= mc["mdd_95th"] <= 1.0
     assert 0.0 <= mc["risk_of_ruin"] <= 1.0
 
-    fr = ProfitValidationSuite.friction_sensitivity(rets, cost_per_trade=0.0008)
+    fr = ProfitValidationSuite.friction_sensitivity(
+        rets, cost_loss=0.0013, periods_per_year=252.0
+    )
     assert "passed" in fr and 0.0 <= fr["retention"] <= 2.0
 
 
