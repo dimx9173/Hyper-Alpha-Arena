@@ -20,7 +20,8 @@ sys.path.insert(0, str(_BACKEND))
 from backtest.ga_annual import (
     _pnl_score, dd_penalty_score, pf_score, gate_violation, calculate_fitness,
     calculate_exploration_fitness, GATE_PENALTY_W, GATE_VIOLATION_CAP,
-    EXPLORATION_GATE_PENALTY_W, DD_LIMIT_PCT,
+    EXPLORATION_GATE_PENALTY_W, DD_LIMIT_PCT, trade_count_penalty,
+    TRADE_COUNT_MIN, TRADE_COUNT_MAX,
     PNL_SCORE_FLOOR_PCT, PNL_SCORE_CEIL_PCT, PNL_SCORE_NEG_FLOOR,
     PNL_SCORE_SPAN, Genome, EvalResult as _EvalResult,
 )
@@ -143,11 +144,14 @@ print(f"      A 剛過 gate  -> {fa:.4f}")
 print(f"      B 遠超 gate  -> {fb:.4f}")
 check("A（過 gate）fitness 高於 B（不合格）", fa > fb, f"A={fa:.4f} B={fb:.4f}")
 check("沒有 -1000 斷崖", fb > -1000.0, f"got {fb}")
-# 精確驗證：fitness == base - 200 * min(violation, CAP)
+# 精確驗證：fitness == base - trade_penalty - W * min(violation, CAP)
+# 2026-10-07 加入交易頻率懲罰後，舊斷言（只有 base - W*violation）少了一項，
+# 在 28 筆交易時固定差 trade_count_penalty(28)=0.16。補上該項才是完整公式。
 _base_b = (0.40 * _pnl_score(B.pnl_365d) + 0.30 * dd_penalty_score(B.maxdd_365d)
            + 0.20 * min(B.sharpe_365d / 1.0, 2.0) + 0.10 * pf_score(B.pf))
-check("fitness = base - 200*violation（公式可重現）",
-      approx(fb, _base_b - GATE_PENALTY_W * min(gate_violation(B), GATE_VIOLATION_CAP), 1e-9),
+check("fitness = base - trade_penalty - W*min(violation, CAP)（公式可重現）",
+      approx(fb, _base_b - trade_count_penalty(B.trades_365d)
+             - GATE_PENALTY_W * min(gate_violation(B), GATE_VIOLATION_CAP), 1e-9),
       f"got {fb}")
 
 # 深層違規不可並排（否則等於重建舊版 -1000 的平坦地景）
@@ -258,17 +262,21 @@ check("4 筆個體 探索期 fitness 高於 1 筆個體", _f4 > _f1, f"{_f4:.3f}
 # 懲罰必須與 base 同量綱（W=1.0），因此差距是同量級而非數百倍
 check("交易數不足在探索期有可見懲罰（差距 > 0.2）", abs(_f20 - _f4) > 0.2,
       f"差距 {abs(_f20-_f4):.2f}")
-# 懲罰項本身必須等於 0.5 * 嚴格期權重 * violation 差；
-# base 分數因 pf/dd/sharpe 不同會有落差，必須先扣除才算得到。
+# 探索期 fitness 的完整分解必須可重現：
+#   base - trade_count_penalty - EXPLORATION_GATE_PENALTY_W * min(viol_expl, CAP)
+# 舊斷言用嚴格期 violation（gate_violation(r)）且漏掉交易懲罰項，因此恆差一段；
+# 現行實作明確以 exploration 門檻計算違規量（見 calculate_exploration_fitness
+# 2026-11-01 註解），斷言必須跟著用 'exploration' 階段。
 def _base(r):
     return (0.40 * _pnl_score(r.pnl_365d) + 0.30 * dd_penalty_score(r.maxdd_365d)
             + 0.20 * min(r.sharpe_365d / 1.0, 2.0) + 0.10 * pf_score(r.pf))
-_pen4 = _f4 - _base(_m4)
-_pen1 = _f1 - _base(_m1)
-check("探索期懲罰 = 嚴格期一半 × violation",
-      approx(_pen4 - _pen1,
-             0.5 * GATE_PENALTY_W * (gate_violation(_m1) - gate_violation(_m4)), 1e-6),
-      f"{_pen4-_pen1:.4f} vs {0.5*GATE_PENALTY_W*(gate_violation(_m1)-gate_violation(_m4)):.4f}")
+def _expl(r):
+    return (_base(r) - trade_count_penalty(r.trades_365d)
+            - EXPLORATION_GATE_PENALTY_W * min(
+                gate_violation(r, "exploration"), GATE_VIOLATION_CAP))
+check("探索期 fitness = base - 交易懲罰 - 探索權重×viol_expl（分解可重現）",
+      all(approx(f, _expl(r), 1e-9) for r, f in ((_m20, _f20), (_m4, _f4), (_m1, _f1))),
+      f"{[_f20-_expl(_m20), _f4-_expl(_m4), _f1-_expl(_m1)]}")
 check("嚴格期懲罰 = 完整權重 × violation（探索期為其一半）",
       approx(EXPLORATION_GATE_PENALTY_W * 2, GATE_PENALTY_W, 1e-9),
       f"{EXPLORATION_GATE_PENALTY_W} vs {GATE_PENALTY_W}")
@@ -340,23 +348,43 @@ check("舊權重 200 會違反上界（回歸防護）", 200.0 > 5 * _base_span,
 
 print()
 print("=" * 72)
-print("7. 交易數沒有獨立評分項，僅作為 gate 門檻")
+print("7. 交易頻率約束：樣本量需達 TRADE_COUNT_MIN（60），上限 150（2026-10-07）")
 print("=" * 72)
+# 2026-10-07 修正：舊語義「達 20 筆門檻後與交易數無關」已作廢。
+# 舊版不納入評分是錯的——Round 7 的 PnL 22.53% 只靠 35 筆交易撐著，
+# 擾動後中位 −17.55%。該語義的最後殘留是下方的 `len(below) == 4` 斷言，
+# 它暗含「20 筆以下只有門檻保護」，而現行實作在 60 筆以下都施加連續懲罰。
 base = R(pnl_365d=30.0, maxdd_365d=6.0, sharpe_365d=1.5, pf=1.8,
          trades_365d=20, win_rate=50.0)
-# 達到 20 筆下限之後，交易數不再影響探索期 fitness（沒有「越多越好」的額外獎勵）
-fvals = set()
-for t in (20, 30, 50, 100, 500, 730):
+# 落在 [TRADE_COUNT_MIN, TRADE_COUNT_MAX] 帶內時交易懲罰為 0 -> fitness 恆定。
+# 但注意 exploration gate 的 trades 門檻是 EXPLORATION_TRADES=60，
+# 所以整個帶內同時違規量為 0：下方斷言同時鎖住懲罰與 gate 兩層。
+check("TRADE_COUNT_MIN=60、TRADE_COUNT_MAX=150（本節斷言的基準）",
+      TRADE_COUNT_MIN == 60 and TRADE_COUNT_MAX == 150,
+      f"got {TRADE_COUNT_MIN}/{TRADE_COUNT_MAX}")
+inband = set()
+for t in (60, 80, 100, 120, 150):
     base.trades_365d = t
-    fvals.add(round(calculate_exploration_fitness(base), 10))
-check("達 20 筆門檻後，探索期 fitness 與交易數無關", len(fvals) == 1,
-      f"got {len(fvals)} distinct")
-# 低於門檻時仍受 gate 懲罰（這是門檻保護，不是評分項）
-below = set()
-for t in (19, 15, 10, 0):
+    inband.add(round(calculate_exploration_fitness(base), 10))
+check("交易數落在 [60, 150] 帶內時，探索期 fitness 與交易數無關", len(inband) == 1,
+      f"got {len(inband)} distinct")
+# 帶外兩側都受懲罰（樣本不足 | 成本侵蝕），單調遠離帶內值
+def _expl_fitness_at(t):
     base.trades_365d = t
-    below.add(round(calculate_exploration_fitness(base), 10))
-check("低於 20 筆門檻時仍受懲罰（門檻保護）", len(below) == 4, f"got {len(below)} distinct")
+    return calculate_exploration_fitness(base)
+_flat = _expl_fitness_at(100)
+check("帶下（59 筆）低於帶內值", _expl_fitness_at(59) < _flat,
+      f"{_expl_fitness_at(59):.4f} vs {_flat:.4f}")
+check("帶上（151 筆）低於帶內值", _expl_fitness_at(151) < _flat,
+      f"{_expl_fitness_at(151):.4f} vs {_flat:.4f}")
+check("帶下交易越少扣越多（59 > 20 > 0）",
+      _expl_fitness_at(59) > _expl_fitness_at(20) > _expl_fitness_at(0),
+      f"{_expl_fitness_at(59):.3f} {_expl_fitness_at(20):.3f} {_expl_fitness_at(0):.3f}")
+check("嚴格期同樣受交易頻率懲罰（60 == 100，59 低於 60）",
+      calculate_fitness(R(30.0, 6.0, 1.5, 1.8, 60, 50.0))
+      == calculate_fitness(R(30.0, 6.0, 1.5, 1.8, 100, 50.0))
+      and calculate_fitness(R(30.0, 6.0, 1.5, 1.8, 59, 50.0))
+      < calculate_fitness(R(30.0, 6.0, 1.5, 1.8, 60, 50.0)))
 
 print()
 print("=" * 72)
@@ -535,8 +563,23 @@ check("視窗終點以迴圈變數傳入 validator",
       "end_time_ms=w_end" in _ga_src and "backtest_days=w_days" in _ga_src)
 check("runner 新增 --end-time-ms 且整輪共用一個值",
       '"--end-time-ms"' in _src and "Fixed backtest window end_time_ms=" in _src)
-check("runner 把 end_time_ms 與 windows 傳給每個 worker",
-      "args.backtest_days, end_time_ms, windows)" in _src)
+# 原本用字串比對 "args.backtest_days, end_time_ms, windows)"，但該 call 後來
+# 追加了 kline_period 參數，字串剛好不再匹配（行為正確、斷言過時）。
+# 改用 AST 取實際位置參數，鎖住「同一組視窗參數傳給每個 worker」這件事本身。
+import ast as _ast
+_submit_args = None
+for _node in _ast.walk(_ast.parse(_src)):
+    if (isinstance(_node, _ast.Call) and isinstance(_node.func, _ast.Attribute)
+            and _node.func.attr == "submit" and _node.args
+            and getattr(_node.args[0], "id", None) == "evaluate_individual"):
+        _submit_args = [_ast.unparse(a) for a in _node.args[1:]]
+check("runner 找到 executor.submit(evaluate_individual, ...) 呼叫", _submit_args is not None)
+check("runner 把 end_time_ms、windows 與 kline_period 傳給每個 worker",
+      _submit_args is not None
+      and "end_time_ms" in _submit_args and "windows" in _submit_args
+      and "args.kline_period" in _submit_args
+      and "args.backtest_days" in _submit_args,
+      f"got {_submit_args}")
 
 print()
 print("=" * 72)
