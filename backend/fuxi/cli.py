@@ -42,7 +42,7 @@ from fuxi.loop3 import (  # noqa: E402
 )
 from fuxi.ratchet import AsymmetricCompoundingRatchet  # noqa: E402
 from fuxi.risk import PerpetualRiskAndSmoothingEngine  # noqa: E402
-from fuxi.rolling import RollingClosedLoopController  # noqa: E402
+from fuxi.rolling import RollingClosedLoopController, TrainedModel  # noqa: E402
 from fuxi.validation import PromotionGate  # noqa: E402
 
 # Bottom bucket 5u: with the old 25u floor a 794u account capped at 0.2 Kelly
@@ -119,6 +119,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--initial-capital", type=float, default=1000.0)
     ap.add_argument("--reinvest-ratio", type=float, default=0.60)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--model-dir", default=None,
+                    help="冠軍模型目錄：存在 meta.json 則重啟恢復（跳過重訓），否則訓練後落盤")
     args = ap.parse_args(argv)
 
     bars = _load_bars(args)
@@ -194,12 +196,23 @@ def main(argv: list[str] | None = None) -> int:
         ctrl.set_pass_regime(False)
         x, y, m = best.theta["x"], best.theta["y"], int(best.theta["M"])
 
-    # ---------------- Loop 2: train champion -------------------------------- #
+    # ---------------- Loop 2: 冠軍恢復或訓練 -------------------------------- #
     eng = MetaLabelingEngine(x=x, y=y, M=int(m))
     meta = eng.apply_triple_barrier_and_weights(bars, signals)
     X, yv, wv, rv, rv_expired = build_model_frame(features, meta)
     report["labels"] = {"rows": int(len(X)), "base_rate": float(yv.mean()) if len(X) else 0.0}
-    if len(X) < 300:
+    # 重啟語意：--model-dir 內已有 meta.json，代表上一個進程已把冠軍
+    # （booster + isotonic + 參數）落盤。這裡直接載回同一份模型：model_id
+    # 不變、不重訓，並把凱利節流歸零，讓恢復後第一根就按完整注碼定價。
+    # 沒有存檔（無 --model-dir 或空目錄）才走原本的訓練路徑。
+    model_dir = Path(args.model_dir) if args.model_dir else None
+    resumed = None
+    if model_dir is not None and (model_dir / "meta.json").is_file():
+        resumed = TrainedModel.load(model_dir)
+        ctrl.champion = resumed
+        ctrl.kelly_penalty_scalar = 1.0
+        report["model_resumed"] = {"model_id": resumed.model_id, "dir": str(model_dir)}
+    if resumed is None and len(X) < 300:
         report["verdict"] = "INSUFFICIENT_LABELS"
         print(json.dumps(report, indent=2, default=str))
         return 3
@@ -214,13 +227,25 @@ def main(argv: list[str] | None = None) -> int:
         missing = [c for c in kept if c not in X.columns]
         assert not missing, f"kept subset missing from model frame: {missing}"
         report["loop2_feature_cols"] = list(kept)
-    loop2 = ctrl.train_and_evaluate_challenger(
-        X.iloc[:cut], yv.iloc[:cut], wv[:cut],
-        X.iloc[cut:], yv.iloc[cut:], rv[cut:],
-        candidate_params={"x": float(x), "y": float(y), "M": int(m)},
-        feature_cols=loop2_feature_cols,
-        val_expired=rv_expired[cut:],
-    )
+    if resumed is not None:
+        # 恢復路徑沒有 challenger 對決：冠軍就是存檔那一份，狀態照實回報，
+        # 讓後續輸出與訓練路徑同構（同樣有 status / active_id 兩個欄位）。
+        loop2 = {"status": "MODEL_RESUMED", "active_id": resumed.model_id}
+    else:
+        loop2 = ctrl.train_and_evaluate_challenger(
+            X.iloc[:cut], yv.iloc[:cut], wv[:cut],
+            X.iloc[cut:], yv.iloc[cut:], rv[cut:],
+            candidate_params={"x": float(x), "y": float(y), "M": int(m)},
+            feature_cols=loop2_feature_cols,
+            val_expired=rv_expired[cut:],
+        )
+        if model_dir is not None:
+            # 首次訓練：把冠軍落盤，下個進程帶同一個 --model-dir 就能恢復。
+            ctrl.champion.save(model_dir)
+            report["model_saved"] = {
+                "model_id": ctrl.champion.model_id,
+                "dir": str(model_dir),
+            }
     report["loop2"] = loop2
     probs = ctrl.champion.calibrated_proba(X.iloc[cut:])
     report["p_cal"] = {

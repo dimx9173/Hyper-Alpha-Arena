@@ -46,7 +46,7 @@ from fuxi.risk import (  # noqa: E402
     MIN_EV_THRESHOLD,
     PerpetualRiskAndSmoothingEngine,
 )
-from fuxi.rolling import RollingClosedLoopController  # noqa: E402
+from fuxi.rolling import RollingClosedLoopController, TrainedModel  # noqa: E402
 
 EPS = 1e-8
 
@@ -118,6 +118,7 @@ def run_paper_symbol(
     risk: Optional[PerpetualRiskAndSmoothingEngine] = None,
     config: Optional[FuxiBacktestConfig] = None,
     machine: Optional[PositionStateMachine] = None,
+    model_dir: Optional[str] = None,
 ) -> PaperLoopResult:
     """單一 symbol、單一冠軍的逐根紙上單循環。
 
@@ -127,6 +128,19 @@ def run_paper_symbol(
     """
     cfg = config or FuxiBacktestConfig()
     champ = controller.champion
+    if champ is None and model_dir is not None:
+        # 重啟語意：呼叫端（例如服務重啟後只拿到舊 champion 契約）沒有記憶體
+        # 內的冠軍，但給了一個落盤目錄，就從那目錄把同一份模型載回來，而不是
+        # 直接失敗。載入失敗仍維持原本的 ValueError（附上載入錯誤原文），
+        # 因為「有給目錄但讀不到」是設定錯誤，不該靜默降級成空倉。
+        try:
+            controller.champion = TrainedModel.load(Path(model_dir))
+            champ = controller.champion
+        except Exception as exc:  # noqa: BLE001 - 任何載入失敗都要轉成清楚錯誤
+            raise ValueError(
+                "controller has no champion — train one first (Loop 2); "
+                f"load from {model_dir} failed: {exc}"
+            ) from exc
     if champ is None:
         raise ValueError("controller has no champion — train one first (Loop 2)")
     if primary_signals is None:
