@@ -215,8 +215,23 @@ def _run_spec_refit(args: argparse.Namespace) -> int:
           f"(dsr={((promo.get('dsr') or {}).get('dsr') if isinstance(promo.get('dsr'), dict) else '?')})")
     if not res.get("promote_ok"):
         # fail-closed：四關任一不通過就不記 promote，只記 reeval 供後續追蹤。
-        # 避免垃圾模型靠回測門檻混進 ledger。
-        print(f"[refit:spec] promote 拒絕：promotion 未通過（{promo.get('reason', 'gate fail')}）")
+        # 避免垃圾模型靠回測門檻混進 ledger。拒絕原因列出具體卡關，
+        # 而非泛用字串（便於輪次間追蹤是哪一關在擋）。
+        failed = []
+        _dsr = promo.get("dsr") if isinstance(promo.get("dsr"), dict) else {}
+        _mc = promo.get("monte_carlo") if isinstance(promo.get("monte_carlo"), dict) else {}
+        _fr = promo.get("friction") if isinstance(promo.get("friction"), dict) else {}
+        _mo = promo.get("monthly") if isinstance(promo.get("monthly"), dict) else {}
+        if not (_dsr.get("dsr", 0.0) >= 0.95):
+            failed.append(f"dsr={_dsr.get('dsr', 0.0):.3f}")
+        if not (_mc.get("mdd_95th", 1.0) <= 0.20 and _mc.get("risk_of_ruin", 1.0) < 0.005):
+            failed.append(f"mc95={_mc.get('mdd_95th', 1.0):.3f}")
+        if not _fr.get("passed", False):
+            failed.append("friction")
+        if not _mo.get("passed", False):
+            failed.append(f"monthly({_mo.get('reason', 'fail')})")
+        why = ",".join(failed) if failed else "gate fail"
+        print(f"[refit:spec] promote 拒絕：promotion 未通過（{why}）")
         return 1
     led._append({
         "event": "promote", "ts": int(time.time() * 1000),
