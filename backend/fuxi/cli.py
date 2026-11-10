@@ -121,6 +121,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--model-dir", default=None,
                     help="冠軍模型目錄：存在 meta.json 則重啟恢復（跳過重訓），否則訓練後落盤")
+    ap.add_argument("--paper", action="store_true",
+                    help="紙上單循環：以 run_paper_symbol 逐根驅動狀態機，而非回測 runner")
+    ap.add_argument("--state-dir", default=None,
+                    help="狀態機持久化目錄：存在 machine.json 則恢復，結束時落盤")
     args = ap.parse_args(argv)
 
     bars = _load_bars(args)
@@ -256,28 +260,86 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     # ---------------- Loop 1: backtest the champion ------------------------- #
-    runner = FuxiBacktestRunner(
-        ctrl,
-        AsymmetricCompoundingRatchet(args.initial_capital, args.reinvest_ratio),
-        PerpetualRiskAndSmoothingEngine(discrete_buckets=BUCKETS),
-        FuxiBacktestConfig(
-            initial_capital=args.initial_capital,
-            reinvest_ratio=args.reinvest_ratio,
-            entry_threshold=args.entry_threshold,
-            target_leverage=args.target_leverage,
-        ),
-    )
-    out = runner.run(bars, features, primary_signals=signals)
-    report["loop1"] = {
-        "trades": out.n_trades,
-        "win_rate": out.win_rate,
-        "net_pnl": out.total_net_pnl,
-        "max_drawdown": out.max_drawdown,
-        "equity": out.total_equity,
-        "active_pool": out.active_pool,
-        "reserve_vault": out.reserve_vault,
-        "open_contracts": len(ctrl.open_contracts),
-    }
+    if args.paper:
+        # 紙上單循環：逐根驅動狀態機，而非回測 runner。延遲匯入 services
+        # 依賴，避免拖進回測路徑。
+        from fuxi.live_state import PaperBrokerAdapter, PositionStateMachine
+        from fuxi.paper_loop import run_paper_symbol
+        from services.paper_broker import PaperBroker
+
+        adapter = PaperBrokerAdapter(PaperBroker(initial_capital=args.initial_capital))
+        # --state-dir 持久化狀態機：存在 machine.json 則恢復，結束時落盤，
+        # 下一次運行從上次的倉位狀態繼續。
+        state_dir = Path(args.state_dir) if args.state_dir else None
+        machine_path = state_dir / "machine.json" if state_dir is not None else None
+        machine = None
+        restored = False
+        if machine_path is not None and machine_path.is_file():
+            try:
+                machine = PositionStateMachine.from_dict(
+                    adapter, json.loads(machine_path.read_text()))
+                restored = True
+            except Exception as exc:  # noqa: BLE001 - 損壞的狀態檔不該靜默丟倉
+                print(f"machine restore failed ({exc})，改用全新狀態機",
+                      file=sys.stderr)
+                machine = None
+        if machine is None:
+            machine = PositionStateMachine(adapter, symbol=args.symbol)
+        out = run_paper_symbol(
+            bars, features, primary_signals=signals,
+            controller=ctrl, broker=adapter, symbol=args.symbol,
+            ratchet=AsymmetricCompoundingRatchet(args.initial_capital,
+                                                 args.reinvest_ratio),
+            risk=PerpetualRiskAndSmoothingEngine(discrete_buckets=BUCKETS),
+            config=FuxiBacktestConfig(
+                initial_capital=args.initial_capital,
+                reinvest_ratio=args.reinvest_ratio,
+                entry_threshold=args.entry_threshold,
+                target_leverage=args.target_leverage,
+            ),
+            machine=machine,
+            model_dir=args.model_dir,
+        )
+        if machine_path is not None:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            machine_path.write_text(json.dumps(out.machine, indent=2, default=str))
+        report["loop1"] = {
+            "trades": out.n_trades,
+            "n_trades": out.n_trades,
+            "win_rate": out.win_rate,
+            "net_pnl": out.total_net_pnl,
+            "max_drawdown": out.max_drawdown,
+            "equity": out.total_equity,
+            "active_pool": out.active_pool,
+            "reserve_vault": out.reserve_vault,
+            "open_contracts": len(ctrl.open_contracts),
+            "final_state": out.final_state,
+            "restored": restored,
+            "paper": True,
+        }
+    else:
+        runner = FuxiBacktestRunner(
+            ctrl,
+            AsymmetricCompoundingRatchet(args.initial_capital, args.reinvest_ratio),
+            PerpetualRiskAndSmoothingEngine(discrete_buckets=BUCKETS),
+            FuxiBacktestConfig(
+                initial_capital=args.initial_capital,
+                reinvest_ratio=args.reinvest_ratio,
+                entry_threshold=args.entry_threshold,
+                target_leverage=args.target_leverage,
+            ),
+        )
+        out = runner.run(bars, features, primary_signals=signals)
+        report["loop1"] = {
+            "trades": out.n_trades,
+            "win_rate": out.win_rate,
+            "net_pnl": out.total_net_pnl,
+            "max_drawdown": out.max_drawdown,
+            "equity": out.total_equity,
+            "active_pool": out.active_pool,
+            "reserve_vault": out.reserve_vault,
+            "open_contracts": len(ctrl.open_contracts),
+        }
 
     # ---------------- §7 four validation gates ------------------------------ #
     if out.n_trades >= 10:
