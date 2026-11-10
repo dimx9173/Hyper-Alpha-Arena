@@ -277,16 +277,29 @@ class PositionStateMachine:
         self.pending_bars = 0
         self.state = LiveState.IDLE
 
-    def _close_remote(self, mark: float, reason: str) -> None:
+    def _close_remote(self, mark: float, reason: str) -> Optional[Dict[str, Any]]:
+        """交易所遠端平倉，並把回傳帶回來——到期平倉的記帳就靠它。
+
+        呼叫前 ``market_close`` 的回傳是被丟棄的：TP/SL 走 ``check_exits``
+        的回傳記帳，到期卻沒有任何人接住它，倉平了、帳沒記。現在回傳
+        結果並寫進 ``position_closed`` 事件，驅動器從事件尾就能記帳。
+        """
         try:
-            self.broker.market_close(self.symbol, float(mark), reason)
+            res = self.broker.market_close(self.symbol, float(mark), reason)
         except Exception as exc:
             self._log("close_failed", {"reason": reason, "error": str(exc)})
-            return
-        self._enter_cooldown(reason=reason)
+            return None
+        if isinstance(res, dict):
+            res = dict(res)
+            res.setdefault("exit_reason", reason)
+        self._enter_cooldown(reason=reason, close_result=res if isinstance(res, dict) else None)
+        return res if isinstance(res, dict) else None
 
-    def _enter_cooldown(self, reason: str) -> None:
-        self._log("position_closed", {"reason": reason})
+    def _enter_cooldown(self, reason: str, close_result: Optional[Dict[str, Any]] = None) -> None:
+        payload: Dict[str, Any] = {"reason": reason}
+        if close_result is not None:
+            payload["close"] = close_result
+        self._log("position_closed", payload)
         self.contract = None
         self.order_id = None
         self.cooldown_left = self.cooldown_bars

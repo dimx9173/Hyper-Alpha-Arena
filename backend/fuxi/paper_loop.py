@@ -258,8 +258,15 @@ def run_paper_symbol(
             _book(list(exits), int(times_ms[i]))
 
         # ---- 3. 對帳 + 狀態推進（到期平倉在此發生） ---- #
+        n_events_before = len(sm.events)
         sm.tick(float(closes[i]))
-
+        if log is None:
+            # tick 內到期平倉的 market_close 回傳寫在 position_closed 事件裡；
+            # 這裡從事件尾撈出來走同一條 _book。TP/SL 已在步驟 2 記過，
+            # 以 open_meta 是否已清來防重記（_book 記完即清）。
+            for ev in sm.events[n_events_before:]:
+                if ev.get("event") == "position_closed" and isinstance(ev.get("close"), dict):
+                    _book([ev["close"]], int(times_ms[i]))
         # ---- 4. 空倉才定價進場 ---- #
         if sm.state is LiveState.IDLE and dirs[i] != 0 and not controller.pass_regime:
             row = feats.iloc[i : i + 1]
