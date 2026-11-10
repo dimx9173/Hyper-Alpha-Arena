@@ -152,6 +152,18 @@ def run_paper_symbol(
 
     rat = ratchet or AsymmetricCompoundingRatchet(cfg.initial_capital, cfg.reinvest_ratio)
     risk_engine = risk or PerpetualRiskAndSmoothingEngine()
+    # 傳入的 machine 若綁在另一個 broker 實例上，run_paper_symbol 內會把
+    # exits（broker.check_exits / get_positions）記在傳入的 broker 帳上，
+    # 而 fills（sm.tick / sm.submit_order）記在 machine.broker 帳上——
+    # 同一筆倉位兩頭記在不同帳，會計恆等式各自成立但數字是錯的。
+    # 必須是同一個實例才允許繼續；修法是把同一個 broker 傳給兩邊。
+    if machine is not None and machine.broker is not broker:
+        raise ValueError(
+            "machine.broker is not broker: exits (broker.check_exits/get_positions) "
+            "and fills (machine.tick/submit_order) would land on two different "
+            "accounts. Pass the same broker instance to both "
+            "(e.g. machine = PositionStateMachine(broker, symbol=symbol))."
+        )
     sm = machine or PositionStateMachine(broker, symbol=symbol)
 
     idx = features.index.intersection(bars_5m.index)
