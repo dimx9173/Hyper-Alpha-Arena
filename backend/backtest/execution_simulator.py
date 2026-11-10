@@ -12,6 +12,8 @@ import logging
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 
+from config.fees import FeeSchedule
+
 from .virtual_account import VirtualAccount, VirtualPosition
 from .models import BacktestTradeRecord
 
@@ -42,18 +44,50 @@ class ExecutionSimulator:
 
     def __init__(
         self,
-        slippage_percent: float = 0.05,
-        fee_rate: float = 0.035,
+        slippage_percent: Optional[float] = None,
+        fee_rate: Optional[float] = None,
+        maker_fee_rate: Optional[float] = None,
+        realistic_tpsl: bool = True,
+        fee_schedule: Optional[FeeSchedule] = None,
     ):
         """
         Initialize execution simulator.
 
         Args:
-            slippage_percent: Default slippage in percent (0.05 = 0.05%)
-            fee_rate: Trading fee rate in percent (0.035 = 0.035%)
+            slippage_percent: Default slippage in percent (legacy; converted
+                once here via ``FeeSchedule.from_percent``).
+            fee_rate: Trading fee rate in percent, taker (legacy).
+            maker_fee_rate: Maker fee rate in percent, TP limit (legacy).
+            realistic_tpsl: TP needs close-confirm, SL pays taker (default True)
+            fee_schedule: Single source of truth. When given, legacy percent
+                args must be None; the schedule's bps values are used as-is.
         """
-        self.slippage_percent = slippage_percent
-        self.fee_rate = fee_rate
+        if fee_schedule is not None:
+            if slippage_percent is not None or fee_rate is not None or maker_fee_rate is not None:
+                raise ValueError("pass either fee_schedule or legacy percent args, not both")
+            self.fees = fee_schedule
+        else:
+            self.fees = FeeSchedule.from_percent(
+                maker_fee_pct=maker_fee_rate if maker_fee_rate is not None else 0.02,
+                taker_fee_pct=fee_rate if fee_rate is not None else 0.035,
+                slippage_pct=slippage_percent if slippage_percent is not None else 0.05,
+            )
+        self.realistic_tpsl = realistic_tpsl
+
+    @property
+    def slippage_percent(self) -> float:
+        """Legacy percent-unit view (``percent = bps / 100``)."""
+        return self.fees.slippage_bps / 100.0
+
+    @property
+    def fee_rate(self) -> float:
+        """Legacy percent-unit taker view."""
+        return self.fees.taker_fee_bps / 100.0
+
+    @property
+    def maker_fee_rate(self) -> float:
+        """Legacy percent-unit maker view."""
+        return self.fees.maker_fee_bps / 100.0
 
     def calculate_execution_price(
         self,
@@ -88,19 +122,23 @@ class ExecutionSimulator:
         self,
         notional: float,
         fee_rate: Optional[float] = None,
+        is_maker: bool = False,
     ) -> float:
         """
         Calculate trading fee.
 
         Args:
             notional: Trade notional value (size * price)
-            fee_rate: Override fee rate
+            fee_rate: Legacy override fee rate in percent (deprecated; when
+                given it is converted once here, not at call sites).
+            is_maker: Use the schedule's maker rate when no override given.
 
         Returns:
             Fee amount
         """
-        rate = fee_rate if fee_rate is not None else self.fee_rate
-        return notional * rate / 100
+        if fee_rate is not None:
+            return abs(notional) * fee_rate / 100
+        return self.fees.fee(notional, is_maker=is_maker)
 
     def check_tp_sl_triggers(
         self,
@@ -257,11 +295,19 @@ class ExecutionSimulator:
                 trigger_price = order.trigger_price
 
                 # Check trigger condition using kline high/low
+                # PRP-P1-2: TP needs close-confirm (影線碰不算成交), SL keeps wick trigger
+                close = kline.get("close", 0) or 0
                 if order.order_type == "take_profit":
-                    if pos.side == "long" and high >= trigger_price:
-                        should_trigger = True
-                    elif pos.side == "short" and low <= trigger_price:
-                        should_trigger = True
+                    if self.realistic_tpsl:
+                        if pos.side == "long" and close >= trigger_price:
+                            should_trigger = True
+                        elif pos.side == "short" and close <= trigger_price:
+                            should_trigger = True
+                    else:
+                        if pos.side == "long" and high >= trigger_price:
+                            should_trigger = True
+                        elif pos.side == "short" and low <= trigger_price:
+                            should_trigger = True
                 elif order.order_type == "stop_loss":
                     if pos.side == "long" and low <= trigger_price:
                         should_trigger = True
@@ -270,8 +316,10 @@ class ExecutionSimulator:
 
                 if should_trigger:
                     # Execute at trigger price (not kline close)
+                    # PRP-P0-1: SL market penalty x3 slip (穿價保證成交但多付滑點)
                     close_side = "sell" if pos.side == "long" else "buy"
-                    executed_price, _ = self.calculate_execution_price(trigger_price, close_side)
+                    eff_slip = self.slippage_percent * 3 if order.order_type == "stop_loss" else self.slippage_percent
+                    executed_price, _ = self.calculate_execution_price(trigger_price, close_side, slippage_pct=eff_slip)
 
                     # Use actual close size (min of order size and remaining position)
                     actual_close_size = min(order.size, pos.size)
@@ -280,8 +328,9 @@ class ExecutionSimulator:
                         continue
 
                     # Calculate fee for actual close size
+                    # PRP-P1-2: TP maker fee, SL taker fee
                     notional = actual_close_size * executed_price
-                    fee = self.calculate_fee(notional)
+                    fee = self.calculate_fee(notional, is_maker=(order.order_type == "take_profit"))
 
                     # Partial close position
                     pnl = account.partial_close_position(
@@ -395,11 +444,29 @@ class ExecutionSimulator:
                         trigger_type, pool_name, triggered_signals
                     )
                 # If opposite direction, close existing first (full close)
-                self._execute_close(
+                # and stash the close trade so the engine can collect both
+                close_trade = self._execute_close(
                     account, symbol, current_price, timestamp,
                     trigger_type, pool_name, triggered_signals, "Reverse position",
                     target_portion=1.0
                 )
+                open_trade = self._execute_open(
+                    account, decision, current_price, timestamp,
+                    trigger_type, pool_name, triggered_signals
+                )
+                if close_trade is not None:
+                    # stash for engine loop (supports both old and new engine paths)
+                    self._last_close_trade = close_trade  # type: ignore
+                    # if open failed, still return the close so it is not lost
+                    if open_trade is None:
+                        return close_trade
+                    # return both via a tuple-like container; engine will unpack
+                    # keep backward compat: attach close as attribute on open
+                    try:
+                        open_trade._close_trade = close_trade  # type: ignore
+                    except Exception:
+                        pass
+                return open_trade
 
             return self._execute_open(
                 account, decision, current_price, timestamp,

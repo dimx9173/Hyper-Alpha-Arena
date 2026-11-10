@@ -362,17 +362,37 @@ def update_account_strategy(
     else:
         trigger_interval = 150
 
-    strategy = upsert_strategy(
-        db,
-        account_id=account_id,
-        price_threshold=price_threshold,
-        trigger_interval=trigger_interval,
-        enabled=payload.enabled,
-        scheduled_trigger_enabled=payload.scheduled_trigger_enabled,
-        signal_pool_id=payload.signal_pool_id,  # Deprecated: for backward compatibility
-        signal_pool_ids=payload.signal_pool_ids,  # New: list of pool IDs
-        exchange=payload.exchange,
-    )
+    if payload.scheduled_trigger_enabled:
+        try:
+            from services.ai_decision_service import get_max_kline_period_seconds, get_max_kline_period_label, _build_trigger_interval_error
+            from database.models import PromptTemplate
+            binding = db.query(AccountPromptBinding).filter(AccountPromptBinding.account_id == account_id, AccountPromptBinding.is_deleted != True).first()  # type: ignore[attr-defined]
+            if binding is not None:
+                template = db.query(PromptTemplate).filter(PromptTemplate.id == binding.prompt_template_id, PromptTemplate.is_deleted == "false").first()  # type: ignore[attr-defined]
+                if template is not None and getattr(template, "template_text", None):
+                    max_sec = get_max_kline_period_seconds(str(template.template_text))  # type: ignore[arg-type]
+                    if max_sec is not None and trigger_interval <= max_sec:
+                        label = get_max_kline_period_label(str(template.template_text)) or str(max_sec)  # type: ignore[arg-type]
+                        raise HTTPException(status_code=400, detail=_build_trigger_interval_error(trigger_interval, max_sec, label))
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    try:
+        strategy = upsert_strategy(
+            db,
+            account_id=account_id,
+            price_threshold=price_threshold,
+            trigger_interval=trigger_interval,
+            enabled=payload.enabled,
+            scheduled_trigger_enabled=payload.scheduled_trigger_enabled,
+            signal_pool_id=payload.signal_pool_id,  # Deprecated: for backward compatibility
+            signal_pool_ids=payload.signal_pool_ids,  # New: list of pool IDs
+            exchange=payload.exchange,
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
 
     # Reload strategies after update
     hyper_strategy_manager._load_strategies()

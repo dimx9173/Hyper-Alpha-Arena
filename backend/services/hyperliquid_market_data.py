@@ -6,7 +6,7 @@ import logging
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 import time
-
+import threading
 from services.exchanges.symbol_mapper import SymbolMapper
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,7 @@ class HyperliquidClient:
                 }
             })
             self._disable_hip3_markets()
+            self._disable_spot_markets()
 
             # Pre-load markets to avoid ~3s delay on first API call
             # Markets are cached in the exchange instance
@@ -86,8 +87,88 @@ class HyperliquidClient:
             self.exchange.fetch_hip3_markets = _skip_hip3_markets.__get__(self.exchange, type(self.exchange))
             logger.info("HIP3 market fetch disabled for market data client")
 
+    def _disable_spot_markets(self) -> None:
+        # CCXT 4.5.11 fetch_markets hardcodes swap+spot; HL spotMeta returns
+        # string token indexes (e.g. ['1','0']) so safe_integer(list,0) is None
+        # and `base + '/' + quote` crashes with NoneType. We only trade perps,
+        # so override instance fetch_markets to swap-only (same result the
+        # options.fetchMarkets.types=['swap'] config intended but CCXT ignores).
+        try:
+            swap_only = self.exchange.fetch_swap_markets.__get__(self.exchange, type(self.exchange))
+            def _fetch_markets_swap_only(exchange_self, params=None):
+                return swap_only(params or {})
+            self.exchange.fetch_markets = _fetch_markets_swap_only.__get__(self.exchange, type(self.exchange))
+            logger.info("Spot market fetch disabled for market data client (swap-only)")
+        except Exception as e:
+            logger.debug(f"Unable to disable spot markets: {e}")
+
+    # 批量價格快取（2026-10-03 新增）
+    #
+    # 問題：策略掃 20 個標的，每個標的要一次 fetch_ticker + 一次 candleSnapshot。
+    #       40+ 次 API 呼叫會撞上 Hyperliquid 的 rate limit（429），結果是
+    #       策略看不到大部分標的，決策品質嚴重劣化。
+    #
+    # 解法：Hyperliquid 的 allMids 端點一次回傳全部合約的最新價（3278 個標的，
+    #       單次請求）。用它做批次填充，cache 60 秒。
+    #       單次 allMids + 20 次 candleSnapshot = 21 次請求，比原本少一半，
+    #       而且價格部分完全不會觸發 rate limit。
+    _batch_price_cache: Dict[str, Dict[str, Any]] = {}
+    _batch_price_lock = threading.Lock()
+    BATCH_PRICE_TTL_SEC = 60
+
+    def _refresh_batch_prices(self) -> Dict[str, float]:
+        """用 allMids 一次取回全部價格。失敗時回傳空 dict（不影響既有流程）。"""
+        now = time.time()
+        with self._batch_price_lock:
+            cached = self._batch_price_cache.get("data")
+            ts = self._batch_price_cache.get("ts", 0)
+            if cached is not None and (now - ts) < self.BATCH_PRICE_TTL_SEC:
+                return cached
+
+        try:
+            import requests
+            url = "https://api.hyperliquid.xyz/info"   # 批次價格固定用 mainnet
+            resp = requests.post(url, json={"type": "allMids"}, timeout=20)
+            resp.raise_for_status()
+            raw = resp.json()
+            prices = {k: float(v) for k, v in raw.items()
+                      if isinstance(v, (str, int, float)) and v not in (None, "")}
+            if prices:
+                with self._batch_price_lock:
+                    self._batch_price_cache["data"] = prices
+                    self._batch_price_cache["ts"] = now
+                logger.debug(f"[Hyperliquid] batch prices refreshed: {len(prices)} symbols")
+            return prices
+        except Exception as e:
+            logger.warning(f"[Hyperliquid] batch price refresh failed: {e}")
+            return self._batch_price_cache.get("data") or {}
+
+    def _cached_last_price(self, symbol: str) -> Optional[float]:
+        """先查批次快取，miss 才走逐筆 API。"""
+        prices = self._batch_price_cache.get("data")
+        if not prices:
+            prices = self._refresh_batch_prices()
+        if prices:
+            px = prices.get(symbol)
+            if px is None and symbol.endswith("USDC"):
+                px = prices.get(symbol[:-4])
+            if px is not None:
+                return float(px)
+        return None
+
+    @classmethod
+    def invalidate_batch_price_cache(cls) -> None:
+        """測試或手動刷新時呼叫。"""
+        with cls._batch_price_lock:
+            cls._batch_price_cache.clear()
+
     def get_last_price(self, symbol: str) -> Optional[float]:
         """Get the last price for a symbol"""
+        # 批次快取優先：避免逐標的呼叫觸發 rate limit
+        cached = self._cached_last_price(symbol)
+        if cached is not None:
+            return cached
+
         try:
             if SymbolMapper.is_hip3_symbol(symbol):
                 ticker = self.get_ticker_data(symbol)

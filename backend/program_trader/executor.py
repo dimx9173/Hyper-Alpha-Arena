@@ -3,7 +3,8 @@ Sandbox executor for Program Trader.
 Safely executes strategy code with restricted environment.
 """
 
-import ast
+import os
+import sys
 import math
 import time as pytime
 from typing import Dict, Any, Optional, List
@@ -15,6 +16,10 @@ import traceback
 
 from .models import Strategy, MarketData, Decision, ActionType
 from .validator import validate_strategy_code
+
+# 策略碼執行結果快取：exec + 類別實例化佔每次 trigger 70%+ 時間。
+# 同一份程式碼在整個回測中不變，重複 exec 是純粹浪費。
+# 以程式碼字串為 key（字數組合本身就是唯一 ID）；有界 LRU 防止長期服務積累。
 
 
 @dataclass
@@ -40,6 +45,7 @@ class ExecutionTimeoutError(Exception):
 SAFE_BUILTINS = {
     # Required for class definition
     "__build_class__": __builtins__["__build_class__"] if isinstance(__builtins__, dict) else getattr(__builtins__, "__build_class__"),
+    "__import__": __builtins__["__import__"] if isinstance(__builtins__, dict) else getattr(__builtins__, "__import__"),
     "__name__": "__main__",
     # Basic types and functions
     "abs": abs,
@@ -70,6 +76,49 @@ SAFE_BUILTINS = {
     "None": None,
     "print": print,  # For debugging
 }
+
+import hashlib as _hashlib
+from collections import OrderedDict as _OrderedDict
+
+_EXEC_CACHE_MAX = 512
+_exec_cache: "OrderedDict[str, type]" = _OrderedDict()
+
+
+def _cached_strategy_class(code: str) -> type:
+    """Return the Strategy subclass compiled from `code`.
+
+    Result is memoized. `exec(code)` is pure wrt code content, so
+    memoization cannot change the backtest semantics.
+    """
+    h = _hashlib.sha256(code.encode()).hexdigest()
+    cached = _exec_cache.get(h)
+    if cached is not None:
+        _exec_cache.move_to_end(h)
+        return cached
+
+    restricted_globals = {
+        "__builtins__": SAFE_BUILTINS,
+        "math": type("math", (), SAFE_MATH)(),
+        "time": type("time", (), SAFE_TIME)(),
+        "MarketData": MarketData,
+        "Decision": Decision,
+        "ActionType": ActionType,
+        "log": lambda *a, **k: None,
+    }
+    exec(code, restricted_globals)
+    cls = None
+    for name, obj in restricted_globals.items():
+        if isinstance(obj, type) and name not in ("MarketData", "Decision", "ActionType"):
+            if hasattr(obj, "should_trade"):
+                cls = obj
+                break
+    if cls is None:
+        raise ValueError("No valid strategy class found in code")
+
+    _exec_cache[h] = cls
+    if len(_exec_cache) > _EXEC_CACHE_MAX:
+        _exec_cache.popitem(last=False)
+    return cls
 
 # Safe math functions
 SAFE_MATH = {
@@ -142,13 +191,42 @@ class SandboxExecutor:
                 result_holder["error"] = f"Execution error: {str(e)}\n{traceback.format_exc()}"
 
         if self._thread_pool:
-            # Backtest mode: reuse pool thread to avoid thread creation overhead
+            # Backtest mode: reuse pool thread to avoid thread creation overhead.
+            # Runaway strategy code (infinite loops such as `while True`) would
+            # otherwise wedge the single-slot pool forever: future.cancel() cannot
+            # stop a running future, and a timed-out future.result() leaves the
+            # worker stuck. Interrupt every worker thread that is currently inside
+            # this module's sandbox frame (the strategy loop is nested deeper, so
+            # match by filename rather than by top-level frame name).
             future = self._thread_pool.submit(run_sandbox)
             try:
                 future.result(timeout=self.timeout_seconds)
             except Exception:
-                # Timeout or other error - future may still be running
-                pass
+                base = os.path.basename(__file__)
+                for tid, frm in sys._current_frames().items():
+                    f = frm
+                    while f is not None:
+                        if os.path.basename(f.f_code.co_filename) == base and \
+                                f.f_code.co_name in ("run_sandbox", "_execute_in_sandbox"):
+                            try:
+                                _raise_timeout_in_thread(tid)
+                            except Exception:
+                                pass
+                            break
+                        f = f.f_back
+                try:
+                    future.result(timeout=1.0)
+                except Exception:
+                    pass
+                # Timed out: result_holder was never filled. Report failure rather
+                # than falling through to the success path below.
+                return ExecutionResult(
+                    success=False,
+                    decision=None,
+                    error=f"Execution timed out after {self.timeout_seconds}s",
+                    execution_time_ms=(time.time() - start_time) * 1000,
+                    logs=self._execution_logs,
+                )
         else:
             # Real-time mode: create dedicated thread (no concurrency limit)
             execution_thread = threading.Thread(target=run_sandbox, daemon=True)
@@ -206,22 +284,7 @@ class SandboxExecutor:
             "log": self._log,
         }
 
-        # Execute code to define the class
-        exec(code, restricted_globals)
-
-        # Find the strategy class
-        strategy_class = None
-        for name, obj in restricted_globals.items():
-            if isinstance(obj, type) and name not in ("MarketData", "Decision", "ActionType"):
-                # Check if it has should_trade method
-                if hasattr(obj, "should_trade"):
-                    strategy_class = obj
-                    break
-
-        if not strategy_class:
-            raise ValueError("No valid strategy class found in code")
-
-        # Instantiate and run
+        strategy_class = _cached_strategy_class(code)
         strategy = strategy_class()
         if hasattr(strategy, "init"):
             strategy.init(params)

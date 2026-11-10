@@ -117,7 +117,7 @@ class Decision:
     - take_profit_price: trigger price for profit taking
     - stop_loss_price: trigger price for loss protection
     - tp_execution: "market" | "limit" (default: "limit")
-    - sl_execution: "market" | "limit" (default: "limit")
+    - sl_execution: "market" | "limit" (default: "market")
     """
     # Always required
     operation: str  # "buy" | "sell" | "hold" | "close"
@@ -136,7 +136,7 @@ class Decision:
     take_profit_price: Optional[float] = None
     stop_loss_price: Optional[float] = None
     tp_execution: str = "limit"  # "market" | "limit"
-    sl_execution: str = "limit"  # "market" | "limit"
+    sl_execution: str = "market"  # "market" | "limit" (PRP-P0-1: SL default market, 穿價保證成交)
 
     def to_dict(self) -> Dict[str, Any]:
         return {

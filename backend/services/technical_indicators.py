@@ -44,10 +44,14 @@ def calculate_indicators(kline_data: List[Dict[str, Any]], indicators: List[str]
 
         for indicator in indicators:
             try:
-                if indicator == 'EMA20':
+                if indicator == 'EMA12':
+                    results['EMA12'] = _calculate_ema(df, 12)
+                elif indicator == 'EMA20':
                     results['EMA20'] = _calculate_ema(df, 20)
                 elif indicator == 'EMA50':
                     results['EMA50'] = _calculate_ema(df, 50)
+                elif indicator == 'EMA55':
+                    results['EMA55'] = _calculate_ema(df, 55)
                 elif indicator == 'EMA100':
                     results['EMA100'] = _calculate_ema(df, 100)
                 elif indicator == 'MA5':
@@ -58,20 +62,42 @@ def calculate_indicators(kline_data: List[Dict[str, Any]], indicators: List[str]
                     results['MA20'] = _calculate_sma(df, 20)
                 elif indicator == 'MACD':
                     results['MACD'] = _calculate_macd(df)
-                elif indicator == 'RSI14':
-                    results['RSI14'] = _calculate_rsi(df, 14)
-                elif indicator == 'RSI7':
-                    results['RSI7'] = _calculate_rsi(df, 7)
+                elif indicator.startswith('RSI'):
+                    # Generic RSI: RSI7, RSI14, RSI21, etc.
+                    try:
+                        period = int(indicator[3:])
+                        results[indicator] = _calculate_rsi(df, period)
+                    except ValueError:
+                        logger.warning(f"Unknown indicator: {indicator}")
                 elif indicator == 'BOLL':
                     results['BOLL'] = _calculate_bollinger_bands(df)
                 elif indicator == 'ATR14':
                     results['ATR14'] = _calculate_atr(df, 14)
+                elif indicator.startswith('DONCHIAN'):
+                    period = int(indicator.replace('DONCHIAN', '')) if indicator != 'DONCHIAN' else 55
+                    results[indicator] = _calculate_donchian(df, period)
                 elif indicator == 'VWAP':
                     results['VWAP'] = _calculate_vwap(df)
                 elif indicator == 'STOCH':
                     results['STOCH'] = _calculate_stochastic(df)
+                elif indicator.startswith('EMA'):
+                    # Generic EMA: EMA12, EMA15, EMA45, EMA200, etc.
+                    try:
+                        period = int(indicator[3:])
+                        results[indicator] = _calculate_ema(df, period)
+                    except ValueError:
+                        logger.warning(f"Unknown indicator: {indicator}")
+                elif indicator.startswith('MA'):
+                    # Generic MA: MA5, MA10, MA20, MA200, etc.
+                    try:
+                        period = int(indicator[2:])
+                        results[indicator] = _calculate_sma(df, period)
+                    except ValueError:
+                        logger.warning(f"Unknown indicator: {indicator}")
                 elif indicator == 'OBV':
                     results['OBV'] = _calculate_obv(df)
+                elif indicator.startswith('ICT'):
+                    results[indicator] = _calculate_ict(df, indicator)
                 else:
                     logger.warning(f"Unknown indicator: {indicator}")
 
@@ -84,6 +110,83 @@ def calculate_indicators(kline_data: List[Dict[str, Any]], indicators: List[str]
     except Exception as e:
         logger.error(f"Error in calculate_indicators: {e}")
         return {}
+
+
+def _calculate_ict(df: pd.DataFrame, indicator: str) -> Dict[str, Any]:
+    """计算 ICT / SMC 价格结构指标。
+
+    indicator 命名（策略端用 data.get_indicator(symbol, "<name>", period)）：
+
+      ICT              → 完整 payload（swings / structure / OB / FVG / sweeps / PD / OTE）
+      ICT_STRUCTURE    → 仅结构方向与最后一个事件
+      ICT_OTE          → 仅 confluence 打分（GA 最常用这个）
+      ICT_FVG          → 未填补的 FVG 列表
+      ICT_ORDERBLOCK   → 未回补的 Order Block 列表
+
+    可在名称后加 "_<left>" 覆盖 swing 确认根数，例如 ICT_OTE_3。
+    """
+    from services.ict_smc_indicators import (
+        compute_ict, detect_structure, optimal_trade_entry, find_fvgs, find_order_blocks,
+    )
+
+    # 从 df 还原成 ict_smc_indicators 需要的 dict 序列
+    kl = [
+        {
+            "open": float(r.open), "high": float(r.high),
+            "low": float(r.low), "close": float(r.close),
+            "volume": float(r.volume),
+        }
+        for r in df.itertuples()
+    ]
+
+    name = indicator
+    left = right = 5
+    parts = name.split("_")
+    # 允许 ICT_<SUB>_<left> 形式覆盖确认根数
+    if parts[-1].isdigit():
+        try:
+            left = right = int(parts[-1])
+            name = "_".join(parts[:-1])
+        except ValueError:
+            pass
+
+    try:
+        if name == "ICT_STRUCTURE":
+            st = detect_structure(kl, left, right)
+            last = st["events"][-1] if st.get("events") else None
+            return {
+                "value": 1.0 if st.get("dir") == "up" else (-1.0 if st.get("dir") == "down" else 0.0),
+                "direction": st.get("dir"),
+                "last_event": last,
+                "event_count": len(st.get("events", [])),
+            }
+
+        if name == "ICT_OTE":
+            ote = optimal_trade_entry(kl, left, right)
+            return ote
+
+        if name == "ICT_FVG":
+            gaps = [f for f in find_fvgs(kl) if not f["filled"]]
+            return {
+                "value": len(gaps),
+                "count": len(gaps),
+                "nearest": gaps[0] if gaps else None,
+            }
+
+        if name == "ICT_ORDERBLOCK":
+            st = detect_structure(kl, left, right)
+            blocks = [b for b in find_order_blocks(kl, st, left, right) if not b["mitigated"]]
+            return {
+                "value": len(blocks),
+                "count": len(blocks),
+                "nearest": blocks[0] if blocks else None,
+            }
+
+        # 默认 = 完整 payload
+        return compute_ict(kl, swing_left=left, swing_right=right)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ICT indicator %s failed: %s", indicator, exc)
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 def _calculate_ema(df: pd.DataFrame, period: int) -> List[float]:
@@ -123,8 +226,9 @@ def _calculate_macd(df: pd.DataFrame) -> Dict[str, List[float]]:
 def _calculate_rsi(df: pd.DataFrame, period: int) -> List[float]:
     """计算相对强弱指数"""
     rsi = ta.rsi(df['close'], length=period)
+    if rsi is None:
+        return []
     return rsi.fillna(50).tolist()  # RSI默认值设为50
-
 
 def _calculate_bollinger_bands(df: pd.DataFrame, period: int = 20, std: float = 2) -> Dict[str, List[float]]:
     """计算布林带"""
@@ -190,8 +294,24 @@ def _calculate_bollinger_bands(df: pd.DataFrame, period: int = 20, std: float = 
         return None
 
 
+
+def _calculate_donchian(df: pd.DataFrame, period: int = 55) -> Dict[str, List[float]]:
+    """計算唐奇安通道"""
+    upper = ta.donchian(df['high'], df['low'], lower_length=period, upper_length=period)
+    if upper is None:
+        return {'upper': [], 'middle': [], 'lower': []}
+    # pandas_ta returns columns: DCL_period_period, DCM_period_period, DCU_period_period
+    dc_lower = upper[f'DCL_{period}_{period}']
+    dc_middle = upper[f'DCM_{period}_{period}']
+    dc_upper = upper[f'DCU_{period}_{period}']
+    return {
+        'upper': dc_upper.fillna(0).tolist(),
+        'middle': dc_middle.fillna(0).tolist(),
+        'lower': dc_lower.fillna(0).tolist(),
+    }
+
+
 def _calculate_atr(df: pd.DataFrame, period: int) -> List[float]:
-    """计算平均真实波幅"""
     atr = ta.atr(df['high'], df['low'], df['close'], length=period)
     if atr is None:
         return []

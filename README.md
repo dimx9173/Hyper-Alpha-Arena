@@ -14,6 +14,20 @@
 [![English](https://img.shields.io/badge/Lang-English-blue)](https://www.akooi.com/docs/)
 [![中文](https://img.shields.io/badge/语言-中文-red)](https://www.akooi.com/docs/zh/)
 
+## Strategy Core: A Rolling Loop, Not a Holy Grail
+
+**There is no permanent strategy.** No parameter set stays optimal forever — market structure changes, and any deployed strategy is only the best-looking snapshot as of that moment.
+
+This project's goal is therefore not "find the best strategy" but **build a system that keeps learning and self-correcting**:
+
+```
+Train → Iterate (GA search) → Trade (testnet) → Review (backtest vs live) → repeat
+```
+
+The loop has no exit condition. Success means the system keeps running and keeps correcting itself — not that it found a permanent edge.
+
+📄 **[STRATEGY_CORE.md](./STRATEGY_CORE.md)** — the loop in detail: stage definitions, risk guardrails, the Annual Gate, current deployment status, and the gap analysis driving the next iteration.
+
 ## Overview
 
 Hyper Alpha Arena is a production-ready AI trading platform where Large Language Models (LLMs) autonomously execute cryptocurrency trading strategies. Inspired by [nof1 Alpha Arena](https://nof1.ai), this platform enables AI models like GPT-5, Claude, and Deepseek to make intelligent trading decisions based on real-time market data and execute trades automatically.

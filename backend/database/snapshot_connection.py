@@ -9,10 +9,29 @@ from sqlalchemy.exc import OperationalError
 import os
 import logging
 
+def _normalize_db_url(url: str) -> str:
+    """Force the psycopg2 driver for bare postgresql:// URLs.
+
+    SQLAlchemy 2.1 changed the default driver for ``postgresql://`` from
+    psycopg2 to psycopg (v3). This project pins ``psycopg2-binary`` in
+    pyproject.toml and does not install psycopg v3, so a bare URL raises
+    ``ModuleNotFoundError: No module named 'psycopg'`` on SQLAlchemy >= 2.1
+    while working fine on 2.0.x. Naming the driver explicitly makes the code
+    independent of that default.
+    """
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg2://" + url[len("postgresql://"):]
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg2://" + url[len("postgres://"):]
+    return url
+
+
 logger = logging.getLogger(__name__)
 
+
 # Snapshot database URL from environment or default
-SNAPSHOT_DATABASE_URL = os.environ.get('SNAPSHOT_DATABASE_URL', "postgresql://alpha_user:alpha_pass@localhost/alpha_snapshots")
+SNAPSHOT_DATABASE_URL = _normalize_db_url(os.environ.get(
+    'SNAPSHOT_DATABASE_URL', "postgresql+psycopg2://alpha_user:alpha_pass@localhost/alpha_snapshots"))
 
 # Reuse the same pool tuning knobs as the primary database
 POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "20"))

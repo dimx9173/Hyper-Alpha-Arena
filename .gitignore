@@ -334,3 +334,32 @@ prompts/
 # Internal docs (not for public repo)
 docs/*.md
 backend/scripts/
+
+# Backtest iteration outputs (ephemeral, auto-generated)
+backend/backtest/iterate_run_*.log
+backend/backtest/iteration_log_*.jsonl.bak*
+
+# Backtest artifacts: symlinks to local cold-data (absolute paths, machine-specific)
+backend/backtest/iteration_log*.jsonl
+backend/backtest/summary.json
+backend/backtest/summary_top30_relaxed.json
+backend/backtest/round_codes
+backend/backtest/*.bak*
+backend/backtest/*.bak2
+backend/backtest/*.pre_adjust
+backend/backtest/best_code_top30*.py
+backend/backtest/*_candidate.py
+
+# GA annual run artifacts (ephemeral per-run output: generated strategies, meta, summaries)
+backend/backtest/best_code_annual_ga*.py
+backend/backtest/best_code_ga*.py
+backend/backtest/best_code_paper*.py
+backend/backtest/ga_*.meta.json
+backend/backtest/summary_annual_ga*.json
+
+# Machine-specific symlink into pCloud cold storage
+cold-data
+
+# Local scratch/debug scripts with hardcoded absolute paths
+test_worker.py
+test_worker_fixed.py

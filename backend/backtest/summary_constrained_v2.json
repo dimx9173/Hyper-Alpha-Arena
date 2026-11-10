@@ -1,0 +1,25 @@
+{
+  "rounds": 10,
+  "completed": 10,
+  "passed": 0,
+  "best_sharpe": -9.0,
+  "best_pf": null,
+  "best_any_sharpe": 0.21531632997614322,
+  "best_any_pf": 1.4351029154176727,
+  "best_any_round": 7,
+  "best_code_path": "backtest/best_code_constrained_v2.py",
+  "log_file": "backtest/iteration_log_constrained_v2.jsonl",
+  "exchange": "hyperliquid",
+  "symbols": [
+    "BTC",
+    "ETH",
+    "SOL",
+    "HYPE",
+    "DOGE",
+    "SUI",
+    "ARB",
+    "AVAX",
+    "BNB",
+    "NEAR"
+  ]
+}

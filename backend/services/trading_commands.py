@@ -45,7 +45,7 @@ from config.settings import BINANCE_DAILY_QUOTA_LIMIT
 
 logger = logging.getLogger(__name__)
 
-AI_TRADING_SYMBOLS: List[str] = ["BTC"]  # Paper trading deprecated, keep minimal
+AI_TRADING_SYMBOLS: List[str] = ["BTC", "ETH", "SOL", "HYPE", "DOGE", "SUI", "ARB", "AVAX", "BNB", "NEAR"]
 ORACLE_PRICE_DEVIATION_LIMIT_PERCENT = 1.0
 
 

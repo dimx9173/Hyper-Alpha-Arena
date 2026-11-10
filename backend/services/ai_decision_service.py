@@ -40,6 +40,19 @@ SUPPORTED_SYMBOLS: Dict[str, str] = {
     "BNB": "Binance Coin",
 }
 
+KLINE_PERIOD_SECONDS: Dict[str, int] = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "2h": 7200,
+    "4h": 14400,
+    "8h": 28800,
+    "12h": 43200,
+    "1d": 86400,
+}
+
 
 class SafeDict(dict):
     def __missing__(self, key):  # type: ignore[override]
@@ -2831,6 +2844,45 @@ def _parse_kline_indicator_variables(template_text: str) -> Dict[str, Dict[str, 
 
     logger.info(f"Parsed {len(grouped)} groups of K-line/indicator/flow/market-data variables")
     return grouped
+
+
+def get_max_kline_period_seconds(template_text: str) -> Optional[int]:
+    if not template_text:
+        return None
+    grouped = _parse_kline_indicator_variables(template_text)
+    max_sec: Optional[int] = None
+    for (_symbol, period), info in grouped.items():
+        if info.get("klines") is None:
+            continue
+        sec = KLINE_PERIOD_SECONDS.get(period)
+        if sec is None:
+            continue
+        if max_sec is None or sec > max_sec:
+            max_sec = sec
+    return max_sec
+
+
+def get_max_kline_period_label(template_text: str) -> Optional[str]:
+    if not template_text:
+        return None
+    grouped = _parse_kline_indicator_variables(template_text)
+    max_sec: Optional[int] = None
+    max_label: Optional[str] = None
+    for (_symbol, period), info in grouped.items():
+        if info.get("klines") is None:
+            continue
+        sec = KLINE_PERIOD_SECONDS.get(period)
+        if sec is None:
+            continue
+        if max_sec is None or sec > max_sec:
+            max_sec = sec
+            max_label = period
+    return max_label
+
+
+def _build_trigger_interval_error(trigger_interval: int, max_seconds: int, period_label: str) -> str:
+    suggested = max_seconds + 100
+    return f"trigger_interval ({trigger_interval}s) must be greater than K-line period ({period_label} = {max_seconds}s); suggested >= {suggested}s"
 
 
 def _parse_factor_variables(template_text: str) -> List[tuple]:

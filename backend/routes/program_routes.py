@@ -527,7 +527,11 @@ def test_run_program(request: TestRunRequest, db: Session = Depends(get_db)):
 
     # Step 3: Execute in sandbox
     try:
-        executor = SandboxExecutor(timeout_seconds=5)
+        # 策略會逐一掃過所有標的並各拉一次 market_data + klines。
+        # 實測冷啟動 6.8s（快取命中後 0.0s），原本的 5s 會在掃到一半時
+        # 被砍斷，preview/test-run 永遠看不到完整決策。
+        # 實際執行路徑走 execute_strategy()，預設就是 60s，這裡要對齊。
+        executor = SandboxExecutor(timeout_seconds=60)
         result = executor.execute(request.code, market_data, params={})
 
         execution_time = (time.time() - start_time) * 1000
@@ -1229,18 +1233,23 @@ def preview_run_binding(binding_id: int, db: Session = Depends(get_db)):
 
     # Get wallet for this AI Trader based on current global environment
     global_environment = get_global_trading_mode(db)
-    wallet = db.query(HyperliquidWallet).filter(
-        HyperliquidWallet.account_id == binding.account_id,
-        HyperliquidWallet.is_active == "true",
-        HyperliquidWallet.environment == global_environment
-    ).first()
 
-    if not wallet:
-        return PreviewRunResponse(
-            success=False,
-            error=f"No active {global_environment} wallet found for this AI Trader",
-            execution_time_ms=(time.time() - start_time) * 1000
-        )
+    # paper 模式不需要鏈上錢包 —— 資金與持倉都在本地 PaperBroker。
+    # 2026-10-04：原本在這裡直接擋下，導致 paper 模式無法 preview。
+    wallet = None
+    if global_environment != "paper":
+        wallet = db.query(HyperliquidWallet).filter(
+            HyperliquidWallet.account_id == binding.account_id,
+            HyperliquidWallet.is_active == "true",
+            HyperliquidWallet.environment == global_environment
+        ).first()
+
+        if not wallet:
+            return PreviewRunResponse(
+                success=False,
+                error=f"No active {global_environment} wallet found for this AI Trader",
+                execution_time_ms=(time.time() - start_time) * 1000
+            )
 
     # Determine trigger context from binding config
     trigger_symbol = "BTC"  # Default
@@ -1293,6 +1302,20 @@ def preview_run_binding(binding_id: int, db: Session = Depends(get_db)):
                 environment=binance_wallet.environment or "testnet"
             )
             environment = binance_wallet.environment or "testnet"
+        elif global_environment == "paper":
+            # paper 模式：用 PaperBroker，行情走 mainnet（與回測的 binance 同源）。
+            # 沒有鏈上錢包，所以 wallet 是 None，不能取 wallet.environment。
+            from services.paper_trading_client import PaperTradingClient
+            from services.program_execution_service import PAPER_STATE_PATH
+
+            _acct = db.query(Account).filter(Account.id == binding.account_id).first()
+            _capital = float(_acct.initial_capital or 10000.0) if _acct else 10000.0
+            trading_client = PaperTradingClient(
+                account_id=binding.account_id,
+                state_path=PAPER_STATE_PATH,
+                initial_capital=_capital,
+            )
+            environment = "mainnet"
         else:
             # Default to Hyperliquid
             trading_client = get_hyperliquid_client(
@@ -1392,7 +1415,9 @@ def preview_run_binding(binding_id: int, db: Session = Depends(get_db)):
             except:
                 pass
 
-        executor = SandboxExecutor(timeout_seconds=5)
+        # 對齊實際執行路徑的 60s。5s 會在掃標的的過程中逾時，
+        # 導致 preview 看不到決策（實測冷啟動需 6.8s）。
+        executor = SandboxExecutor(timeout_seconds=60)
         result = executor.execute(program.code, market_data, params=params)
 
         execution_time = (time.time() - start_time) * 1000

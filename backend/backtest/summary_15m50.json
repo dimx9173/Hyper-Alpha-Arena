@@ -1,0 +1,29 @@
+{
+  "rounds": 50,
+  "completed": 50,
+  "passed": 0,
+  "best_sharpe": -9.0,
+  "best_pf": null,
+  "best_any_sharpe": 0.4493471682210875,
+  "best_any_pf": 3.6300352429871183,
+  "best_any_round": 16,
+  "best_code_path": "backtest/best_code_15m50b.py",
+  "log_file": "backtest/iteration_log_15m50b.jsonl",
+  "exchange": "hyperliquid",
+  "symbols": [
+    "BTC",
+    "ETH",
+    "SOL",
+    "HYPE",
+    "DOGE",
+    "SUI",
+    "ARB",
+    "AVAX",
+    "BNB",
+    "NEAR",
+    "LINK",
+    "UNI",
+    "AAVE",
+    "TAO"
+  ]
+}

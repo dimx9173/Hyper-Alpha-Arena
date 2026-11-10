@@ -189,24 +189,69 @@ class DataProvider:
             # Use same API as AI Trader: get_kline_data()
             # Fetch more candles for indicator calculation, return requested count
             fetch_count = max(count, 100)  # At least 100 for indicator accuracy
-            raw_data = get_kline_data(
-                symbol=symbol,
-                market=self._get_market_param(),
-                period=period,
-                count=fetch_count,
-                environment=self.environment,
-                persist=False  # Don't block on DB write
-            )
+            try:
+                raw_data = get_kline_data(
+                    symbol=symbol,
+                    market=self._get_market_param(),
+                    period=period,
+                    count=fetch_count,
+                    environment=self.environment,
+                    persist=False  # Don't block on DB write
+                )
+            except Exception as _env_err:
+                # testnet raises instead of returning [] for some symbols
+                # (e.g. ZEC/XRP/ENA/UNI/LINK/CRV/ZORA); fall through to mainnet
+                import logging as _logging_env
+                _logging_env.getLogger(__name__).info(
+                    f"get_klines {symbol} {period} {self.environment} raised: "
+                    f"{str(_env_err)[:120]} -> fallback mainnet"
+                )
+                raw_data = None
+            # Fallback: testnet kline coverage is incomplete or stale (flat
+            # candles, timestamps hours old). K-lines are direction/indicator
+            # inputs only, so fall back to mainnet klines when the configured
+            # environment returns too few fresh candles.
+            def _fresh_count(rows):
+                try:
+                    import time as _time
+                    now = _time.time()
+                    n = 0
+                    for r in rows or []:
+                        ts = r.get('timestamp', 0) or 0
+                        if ts > 1e12:
+                            ts = ts / 1000
+                        if now - ts < 6 * 3600 and (r.get('close') or 0) > 0:
+                            n += 1
+                    return n
+                except Exception:
+                    return len(rows or [])
+            if self.environment != "mainnet" and _fresh_count(raw_data) < 30:
+                try:
+                    import logging as _logging
+                    _logging.getLogger(__name__).info(
+                        f"get_klines fallback to mainnet for {symbol} {period}: "
+                        f"{len(raw_data) if raw_data else 0} -> retry"
+                    )
+                    raw_data = get_kline_data(
+                        symbol=symbol,
+                        market=self._get_market_param(),
+                        period=period,
+                        count=fetch_count,
+                        environment="mainnet",
+                        persist=False,
+                    )
+                except Exception:
+                    pass
             if raw_data:
                 # Convert to Kline objects, take last 'count' candles
                 all_klines = [
                     Kline(
-                        timestamp=int(row.get('timestamp', 0)),
-                        open=float(row.get('open', 0)),
-                        high=float(row.get('high', 0)),
-                        low=float(row.get('low', 0)),
-                        close=float(row.get('close', 0)),
-                        volume=float(row.get('volume', 0)),
+                        timestamp=int(row.get('timestamp', 0) or 0),
+                        open=float(row.get('open') or 0),
+                        high=float(row.get('high') or 0),
+                        low=float(row.get('low') or 0),
+                        close=float(row.get('close') or 0),
+                        volume=float(row.get('volume') or 0),
                     )
                     for row in raw_data
                 ]

@@ -262,7 +262,7 @@ def test_llm_connection(
             model=model,
             messages=[{"role": "user", "content": "Hi"}],
             api_format=api_format,
-            max_tokens=10,
+            max_tokens=64,
         )
 
         response = requests.post(url, headers=headers, json=payload, timeout=30)

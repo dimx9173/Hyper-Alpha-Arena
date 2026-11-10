@@ -4,6 +4,7 @@ Validates strategy code for syntax, security, and template compliance.
 """
 
 import ast
+from collections import OrderedDict
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
@@ -163,7 +164,31 @@ class CodeValidator:
         return errors, warnings
 
 
+# validate() 是純函式：輸出只由 code 決定，沒有其他輸入也沒有外部狀態。
+# 但回測會對同一份程式碼呼叫它幾萬次（每個 trigger 一次），每次都重跑
+# 完整的 ast.parse + 兩次 ast.walk。實測 8000 個 trigger 裡這佔 61% 的時間。
+# 依程式碼內容快取：同一份字串直接重用結果，不同字串自然不會撞。
+#
+# 只快取有界的數量，避免長期服務累積無限記憶體。
+_VALIDATE_CACHE: "OrderedDict[str, ValidationResult]" = OrderedDict()
+_VALIDATE_CACHE_MAX = 256
+
+
 def validate_strategy_code(code: str) -> ValidationResult:
-    """Convenience function to validate strategy code."""
+    """Convenience function to validate strategy code.
+
+    Results are memoized by code content. `validate()` is a pure function of
+    `code`, so this only skips recomputation -- it cannot change the outcome.
+    """
+    cached = _VALIDATE_CACHE.get(code)
+    if cached is not None:
+        _VALIDATE_CACHE.move_to_end(code)
+        return cached
+
     validator = CodeValidator()
-    return validator.validate(code)
+    result = validator.validate(code)
+
+    _VALIDATE_CACHE[code] = result
+    if len(_VALIDATE_CACHE) > _VALIDATE_CACHE_MAX:
+        _VALIDATE_CACHE.popitem(last=False)
+    return result

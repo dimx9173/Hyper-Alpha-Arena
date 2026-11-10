@@ -117,13 +117,20 @@ def get_global_trading_mode(db: Session) -> str:
     Get global Hyperliquid trading mode from system config
 
     Returns:
-        "testnet" or "mainnet", defaults to "testnet" if not configured
+        "paper"    -> 用 Hyperliquid mainnet 行情，但資金與持倉完全本地計算。
+                      2026-10-03 新增。解決 testnet 與 binance/mainnet 價格結構
+                      不一致的問題（testnet ZEC = 138.65，mainnet = 1305.25，
+                      差 9.4 倍），回測用 binance 資料時 testnet 績效無法預測。
+        "testnet" -> 真的在 testnet 鏈上下單（測試幣）
+        "mainnet" -> 真的在 mainnet 鏈上下單（真錢）
+
+    預設為 "testnet"（安全性考量：不會意外動用真錢）。
     """
     config = db.query(SystemConfig).filter(
         SystemConfig.key == "hyperliquid_trading_mode"
     ).first()
 
-    if config and config.value in ["testnet", "mainnet"]:
+    if config and config.value in ["paper", "testnet", "mainnet"]:
         return config.value
 
     # Default to testnet for safety

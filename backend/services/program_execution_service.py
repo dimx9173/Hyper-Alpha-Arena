@@ -10,6 +10,7 @@ Architecture:
 
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -39,9 +40,15 @@ from database.models import (
 from program_trader.executor import execute_strategy
 from program_trader.models import MarketData, ActionType
 from program_trader.data_provider import DataProvider
+from config.guardrails import MAX_TOTAL_LEVERAGE, MAX_SINGLE_COIN, MAX_CLUSTER, CLUSTER
 from config.settings import BINANCE_DAILY_QUOTA_LIMIT
+from backtest.ab_validators import exploration_validator
 
 logger = logging.getLogger(__name__)
+
+# Paper mode state file. Lives in /app/data because that's the volume mount,
+# so the paper account survives container restarts.
+PAPER_STATE_PATH = os.environ.get("PAPER_STATE_PATH", "/app/data/paper_state.json")
 
 
 class ProgramExecutionService:
@@ -70,6 +77,91 @@ class ProgramExecutionService:
         self._cache_refresh_interval = 60  # Refresh cache every 60 seconds
         self._daily_quota_limit = BINANCE_DAILY_QUOTA_LIMIT
         logger.info("[ProgramExecution] Service initialized")
+
+    GATE_RECHECK_HOURS = 24
+
+    def _check_performance_gate(self, db, binding: AccountProgramBinding) -> bool:
+        """Run performance gate validator for the bound program.
+
+        - If gate_status == 'fail', binding is stopped (scheduled_trigger_enabled=False).
+        - If last_gate_check_at > 24h, re-run exploration_validator.
+        - Caches result on binding; 'fail' persists until program is replaced.
+        Returns True if gate passes (or pending/unknown), False if gate fails.
+        """
+        from datetime import timedelta
+        now = datetime.now(timezone.utc)
+
+        # Fast path: already failed gate -> stop binding
+        if binding.gate_status == "fail":
+            logger.warning(
+                f"[ProgramExecution] Binding {binding.id} gate_status=fail, "
+                "deactivating scheduled trigger"
+            )
+            binding.scheduled_trigger_enabled = False
+            db.commit()
+            return False
+
+        # Skip revalidation if cached within 24h
+        if binding.gate_status == "pass" and binding.last_gate_check_at:
+            age = now - _as_utc(binding.last_gate_check_at)
+            if age < timedelta(hours=self.GATE_RECHECK_HOURS):
+                return True
+
+        # Run exploration validator (relaxed thresholds for new/active programs)
+        try:
+            program = db.query(TradingProgram).filter(TradingProgram.id == binding.program_id).first()
+            if not program or not program.code:
+                logger.warning(f"[ProgramExecution] Binding {binding.id}: program not found or no code")
+                binding.gate_status = "fail"
+                binding.last_gate_check_at = now
+                db.commit()
+                return False
+            logger.info(f"[ProgramExecution] Binding {binding.id}: running exploration_validator...")
+            # Only validate on the symbol this binding actually trades
+            # (binding has signal_pool_ids which can be used to infer symbols, or fall back to BTC)
+            symbols = ["BTC"]
+            if binding.signal_pool_ids:
+                try:
+                    from database.models import SignalPool
+                    pool_ids = json.loads(binding.signal_pool_ids)
+                    if pool_ids:
+                        pool = db.query(SignalPool).filter(SignalPool.id == pool_ids[0]).first()
+                        if pool and pool.symbols:
+                            ps = pool.symbols
+                            if isinstance(ps, str):
+                                ps = json.loads(ps)
+                            if ps:
+                                symbols = ps
+                except Exception:
+                    pass
+
+            passed, details = exploration_validator(
+                db, program.code, max_triggers=8000, backtest_days=365,
+                symbols=symbols
+            )
+
+            if passed:
+                binding.gate_status = "pass"
+                logger.info(f"[ProgramExecution] Binding {binding.id}: gate PASSED")
+            else:
+                binding.gate_status = "fail"
+                binding.scheduled_trigger_enabled = False
+                logger.warning(
+                    f"[ProgramExecution] Binding {binding.id}: gate FAILED, "
+                    f"stopping binding. Details: {details}"
+                )
+
+            binding.last_gate_check_at = now
+            db.commit()
+            return passed
+
+        except Exception as e:
+            logger.error(f"[ProgramExecution] Binding {binding.id}: gate check error: {e}")
+            # On error, keep previous status but don't recheck for 24h
+            binding.last_gate_check_at = now
+            db.commit()
+            return binding.gate_status == "pass"
+
 
     def _is_premium_user(self, db) -> bool:
         """Check if current logged-in user is a premium member"""
@@ -262,6 +354,10 @@ class ProgramExecutionService:
                 logger.warning(f"[ProgramExecution] Binding {binding_id} not found or inactive")
                 return
 
+            # Performance gate: stop binding if validator fails (cached 24h)
+            if not self._check_performance_gate(db, binding):
+                return
+
             # Build minimal pool/trigger context for scheduled execution
             pool = {
                 "pool_id": None,
@@ -365,6 +461,39 @@ class ProgramExecutionService:
                         logger.warning(f"[ProgramExecution] Failed to create Binance trading client: {e}")
                 # Get leverage settings from BinanceWallet
                 leverage_settings = self._get_binance_leverage_settings(db, account.id, environment or "mainnet")
+            elif environment == "paper":
+                # Paper mode: Hyperliquid mainnet 行情 + 本地計算帳戶。
+                # 不簽名、不廣播任何交易，只更新 /app/data/paper_state.json。
+                #
+                # 為什麼需要這個模式（2026-10-03 實測）：
+                #   Hyperliquid testnet 與 binance/mainnet 的價格結構不同。
+                #   ZEC 在 testnet 是 138.65，在 mainnet/binance 是約 1305（差 9.4 倍）。
+                #   回測用 binance 資料、在 testnet 執行 → 回測績效無法預測實盤。
+                #   paper 模式行情走 mainnet（與 binance 一致），資金走本地計算。
+                try:
+                    from services.paper_trading_client import PaperTradingClient
+                    from services.paper_broker import FeeModel
+
+                    state_path = PAPER_STATE_PATH
+                    cap = self._get_paper_capital(db, account.id)
+                    trading_client = PaperTradingClient(
+                        account_id=account.id,
+                        state_path=state_path,
+                        initial_capital=cap,
+                        environment="mainnet",
+                    )
+                    # 每次觸發先掃 TP/SL —— 鏈上没有掛單，本地必須自己判定
+                    closed = trading_client.check_exits()
+                    if closed:
+                        logger.info(
+                            "[ProgramExecution] paper mode: closed %d position(s) for account %s: %s",
+                            len(closed), account.id,
+                            [(c["symbol"], c["reason"], round(c["net_pnl"], 4)) for c in closed],
+                        )
+                except Exception as e:
+                    logger.error(f"[ProgramExecution] Failed to create paper trading client: {e}", exc_info=True)
+
+                leverage_settings = {"max_leverage": 5, "default_leverage": 1}
             else:
                 # Use Hyperliquid trading client (default)
                 if environment and wallet_address:
@@ -378,9 +507,13 @@ class ProgramExecutionService:
             max_leverage = leverage_settings["max_leverage"]
             default_leverage = leverage_settings["default_leverage"]
 
+            # paper 模式的行情來自 mainnet，所以 data provider 也必須用 mainnet，
+            # 否則 get_price/get_klines 會去 testnet 拿與回測不一致的價格。
+            data_env = "mainnet" if environment == "paper" else (environment or "mainnet")
+
             # Build MarketData with trading client (enable query recording for analysis)
             data_provider = DataProvider(
-                db, account.id, environment or "mainnet", trading_client,
+                db, account.id, data_env, trading_client,
                 record_queries=True, exchange=exchange
             )
             market_data = self._build_market_data(
@@ -391,7 +524,7 @@ class ProgramExecutionService:
                 triggered_signals=triggered_signals,
                 trigger_type=trigger_type,
                 signal_source_type="wallet_tracking" if isinstance(pool.get("wallet_event"), dict) else None,
-                environment=environment or "mainnet",
+                environment=data_env,
                 max_leverage=max_leverage,
                 default_leverage=default_leverage,
             )
@@ -409,10 +542,41 @@ class ProgramExecutionService:
                     params.update(override)
                 except:
                     pass
-
             # Execute strategy
             result = execute_strategy(program.code, market_data, params)
 
+            # JEV pre-trade gate: veto entry decisions before quota/log/order.
+            # - hold/None decisions bypass the gate (no-op).
+            # - unconfigured (no JEV_API_KEY) → fail open.
+            # - rejected → rewrite decision to hold, keep reason traceable,
+            #   so _log_execution records jev_entry_rejected instead of the
+            #   original entry signal, and _handle_decision never fires.
+            try:
+                from backtest.jev_gate import build_jev_state, evaluate_gate
+
+                gate_candidate = result.decision if result.success else None
+                gate_op = (
+                    gate_candidate.operation.lower()
+                    if gate_candidate is not None and hasattr(gate_candidate, "operation")
+                    else ""
+                )
+                if gate_op and gate_op != "hold":
+                    jev_state = build_jev_state(gate_candidate, market_data)
+                    allowed, jev_reason, jev_conf, jev_checks = evaluate_gate(jev_state)
+                    if not allowed:
+                        orig = f"{gate_candidate.operation}/{gate_candidate.symbol}"
+                        gate_candidate.operation = "hold"
+                        gate_candidate.reason = (
+                            f"{jev_reason} (vetoed {orig}: {gate_candidate.reason or ''})"
+                        ).strip()
+                        logger.info(
+                            f"[ProgramExecution] Binding {binding.id} JEV veto: "
+                            f"{orig} -> hold ({jev_reason}, conf={jev_conf}, "
+                            f"checks={[c.get('name') + '=' + str(c.get('result')) for c in jev_checks]})"
+                        )
+            except Exception as jev_err:
+                # Gate itself must never break execution: fail open.
+                logger.warning(f"[ProgramExecution] JEV gate error (fail open): {jev_err}")
             # Determine if this is an actual trade (buy/sell/close) that needs quota check
             quota_exceeded = False
             quota_info = {}
@@ -463,6 +627,25 @@ class ProgramExecutionService:
                         db, log_id, order_result, binding, result.decision,
                         wallet_address, environment or "mainnet", exchange=exchange
                     )
+                    # 2026-09-30：log 在下單前就寫成 success=True。當 _handle_decision
+                    # 走了提前 return（無錢包 / 無價格 / TP-SL 驗證失敗 / 風控跳過），
+                    # order_result 是 None 且 log 不會被改，於是留下一筆「成功」但
+                    # 從未下單的假紀錄。實測遠端 id 165/166 就是這樣：
+                    # success=true 但 order_id/tp_order_id/sl_order_id 皆 NULL。
+                    # 這裡補一次對帳 —— 非 hold 卻沒有任何訂單 ID，一律改為未執行。
+                    try:
+                        _chk = db.query(ProgramExecutionLog).filter(
+                            ProgramExecutionLog.id == log_id).first()
+                        if _chk is not None and _chk.success is True and not _chk.hyperliquid_order_id:
+                            _chk.success = False
+                            _chk.error_message = (
+                                (_chk.error_message or "")
+                                + " [not executed: no order submitted, decision aborted before order placement]")
+                            db.commit()
+                            logger.info(f"[ProgramExecution] Log {log_id} marked failed: "
+                                        f"{op} decision produced no order id")
+                    except Exception as _reconcile_err:
+                        logger.warning(f"[ProgramExecution] order reconciliation failed: {_reconcile_err}")
 
         except Exception as e:
             logger.error(f"[ProgramExecution] Error executing binding {binding_id}: {e}")
@@ -495,6 +678,20 @@ class ProgramExecutionService:
                 HyperliquidWallet.is_active == "true"
             ).first()
             return wallet.wallet_address if wallet else None
+
+    def _get_paper_capital(self, db, account_id: int) -> float:
+        """Paper 模式的初始資金。
+
+        用帳戶的 initial_capital，讓 paper 帳戶的可投資金額與真實帳戶設定一致。
+        讀不到時退回 10000（與前端預設相同）。
+        """
+        try:
+            account = db.query(Account).filter(Account.id == account_id).first()
+            if account is not None and account.initial_capital:
+                return float(account.initial_capital)
+        except Exception as e:
+            logger.warning(f"[ProgramExecution] failed to read paper capital: {e}")
+        return 10000.0
 
     def _get_binance_leverage_settings(self, db, account_id: int, environment: str) -> dict:
         """Get leverage settings from BinanceWallet."""
@@ -727,6 +924,33 @@ class ProgramExecutionService:
             logger.error(f"[ProgramExecution] Failed to log execution: {e}")
             return None
 
+    # 2026-09-30 PRP-P1-4 修正：portfolio guard / cooldown 跳過時原本直接
+    # `return None`，呼叫端 (行 462) 無法區分「風控跳過」與「訂單送出後失敗」，
+    # 於是 _update_log_with_order 一律記成 "[Order execution failed]"。
+    # 實測：已部署策略 portion=0.28 leverage=3 -> notional 0.84x equity，
+    # 必然超過 single-coin cap 0.4，100% 被擋下，180 筆執行紀錄沒有任何一筆
+    # 真正成交，卻顯示 138 筆 success。改為帶明確 skip_reason 的結構化回傳。
+    SKIP_REASONS = {
+        "exposure_cap": "skipped: total exposure cap (2x equity)",
+        "single_coin_cap": "skipped: single-coin cap (40% equity)",
+        "cluster_cap": "skipped: cluster cap (60% equity)",
+        "daily_loss_fuse": "skipped: daily loss fuse (-5% equity)",
+        "same_direction_cooldown": "skipped: same-direction add cooldown (4h)",
+    }
+
+    @classmethod
+    def _skip_result(cls, reason_key: str, detail: str = "") -> Dict[str, Any]:
+        """Build a structured 'skipped by risk guard' result.
+
+        Returned instead of bare None so the caller can log the real reason
+        instead of a misleading generic order failure.
+        """
+        return {
+            "__skipped__": True,
+            "reason": cls.SKIP_REASONS.get(reason_key, f"skipped: {reason_key}"),
+            "detail": detail,
+        }
+
     def _update_log_with_order(
         self,
         db,
@@ -742,6 +966,20 @@ class ProgramExecutionService:
         try:
             log = db.query(ProgramExecutionLog).filter(ProgramExecutionLog.id == log_id).first()
             if not log:
+                return
+
+            # 2026-09-30：風控跳過不是訂單失敗。
+            # order_result 帶 __skipped__ 時代表執行服務主動跳過（未送出訂單），
+            # 必須記錄真實原因，不能記成 "[Order execution failed]"。
+            if isinstance(order_result, dict) and order_result.get("__skipped__"):
+                log.success = False
+                log.error_message = (log.error_message or "") + " " + order_result.get("reason", "skipped")
+                detail = order_result.get("detail") or ""
+                if detail:
+                    log.error_message += f" ({detail})"
+                db.commit()
+                logger.info(f"[ProgramExecution] Log {log_id} skipped by risk guard: "
+                            f"{order_result.get('reason')} {detail}")
                 return
 
             # If order failed (order_result is None), mark the log as failed
@@ -782,6 +1020,27 @@ class ProgramExecutionService:
                 self._create_hyperliquid_trade(
                     binding, decision, order_result, wallet_address, environment, exchange
                 )
+            # PRP-P2-4: TP/SL對賬 — 主單filled但子單缺失即告警
+            try:
+                if order_status == 'filled' and (getattr(decision, 'take_profit_price', None) or getattr(decision, 'stop_loss_price', None)):
+                    if not order_result.get('tp_order_id') and getattr(decision, 'take_profit_price', None):
+                        logger.error(f"[ProgramExecution][ALERT] binding {binding.id} TP missing for {decision.symbol}")
+                    if not order_result.get('sl_order_id') and getattr(decision, 'stop_loss_price', None):
+                        logger.error(f"[ProgramExecution][ALERT] binding {binding.id} SL missing for {decision.symbol}, consider market close")
+            except Exception:
+                pass
+            # PRP-P2-4: 連虧暫停 — 近5筆4虧即停用
+            try:
+                from database.models import ProgramExecutionLog as _PEL3
+                _last5 = db.query(_PEL3).filter(_PEL3.binding_id == binding.id).order_by(_PEL3.id.desc()).limit(5).all()
+                if len(_last5) >= 5:
+                    _loss = sum(1 for _l in _last5 if _l.success is False)
+                    if _loss >= 4:
+                        binding.is_active = False
+                        db.commit()
+                        logger.error(f"[ProgramExecution][ALERT] binding {binding.id} 4/5 losses, auto-paused")
+            except Exception:
+                pass
 
         except Exception as e:
             logger.error(f"[ProgramExecution] Failed to update log with order: {e}")
@@ -922,12 +1181,16 @@ class ProgramExecutionService:
         )
 
         # Check wallet (for Binance, wallet_address may be API key indicator)
-        if not wallet_address and exchange != "binance":
+        # paper 模式不需要鏈上錢包 —— 資金與持倉都在本地，沒有鏈上身分。
+        # 2026-10-03：原本 paper 模式在這裡直接 return False，導致整條下單路徑走不通。
+        is_paper = (environment == "paper")
+        if not wallet_address and exchange != "binance" and not is_paper:
             logger.error(f"[ProgramExecution] No wallet address for binding {binding.id}")
             return False
 
         if not environment:
             logger.error(f"[ProgramExecution] No trading environment configured")
+            return False
             return False
 
         try:
@@ -936,11 +1199,15 @@ class ProgramExecutionService:
             available_balance = account_info.get("available_balance", 0)
 
             # Get real-time market price based on exchange
+            # paper 模式的行情必須走 mainnet（與回測的 binance 價格同源），
+            # 不能傳 "paper" 給 get_last_price_from_hyperliquid —— 那個函式
+            # 只認 testnet / mainnet。
+            price_env = "mainnet" if is_paper else environment
             if exchange == "binance":
                 market_price = client.get_mark_price(decision.symbol)
             else:
                 from services.hyperliquid_market_data import get_last_price_from_hyperliquid
-                market_price = get_last_price_from_hyperliquid(decision.symbol, environment)
+                market_price = get_last_price_from_hyperliquid(decision.symbol, price_env)
 
             if not market_price or market_price <= 0:
                 market_price = getattr(decision, 'max_price', None) or getattr(decision, 'min_price', None)
@@ -960,6 +1227,77 @@ class ProgramExecutionService:
                 if not tp_valid:
                     logger.error(f"[ProgramExecution] Invalid TP/SL: {tp_errors}")
                     return False
+
+            # PRP-P2-3: portfolio guard — 總暴露<=2x equity, 單幣<=40%, 同簇<=60%, 日虧5%熔斷
+            if op in ("buy", "sell"):
+                try:
+                    _acct = client.get_account_state(db)
+                    _eq = float(_acct.get("total_equity", 0) or 0)
+                    _positions = data_provider.get_positions() if environment and client else {}
+                    _total_notional = 0.0
+                    _cluster_notional = 0.0
+                    _CLUSTER = CLUSTER
+                    try:
+                        from services.hyperliquid_market_data import get_last_price_from_hyperliquid as _lp
+                    except Exception:
+                        _lp = None
+                    for _s, _pp in (_positions or {}).items():
+                        try:
+                            _px = _lp(_s, environment) if _lp else 0
+                            _nv = abs(float(getattr(_pp, "size", 0) or 0)) * float(_px or 0)
+                            _total_notional += _nv
+                            if _s in _CLUSTER:
+                                _cluster_notional += _nv
+                        except Exception:
+                            continue
+                    _new_margin = available_balance * float(getattr(decision, 'target_portion_of_balance', 0))
+                    _new_notional = _new_margin * int(getattr(decision, 'leverage', 1) or 1)
+                    if _eq > 0 and (_total_notional + _new_notional) > _eq * MAX_TOTAL_LEVERAGE:
+                        logger.warning(f"[ProgramExecution] portfolio guard: exposure cap, skip {decision.symbol}")
+                        return self._skip_result("exposure_cap",
+                            f"total={_total_notional:.1f} + new={_new_notional:.1f} > cap={_eq * MAX_TOTAL_LEVERAGE:.1f}")
+                    if _eq > 0 and _new_notional > _eq * MAX_SINGLE_COIN:
+                        logger.warning(f"[ProgramExecution] portfolio guard: single-coin cap, skip {decision.symbol}")
+                        return self._skip_result("single_coin_cap",
+                            f"new_notional={_new_notional:.1f} > cap={_eq * MAX_SINGLE_COIN:.1f} "
+                            f"(portion={getattr(decision, 'target_portion_of_balance', 0)} leverage={getattr(decision, 'leverage', 1)})")
+                    if decision.symbol in _CLUSTER and _eq > 0 and (_cluster_notional + _new_notional) > _eq * MAX_CLUSTER:
+                        logger.warning(f"[ProgramExecution] portfolio guard: cluster cap, skip {decision.symbol}")
+                        return self._skip_result("cluster_cap",
+                            f"cluster={_cluster_notional:.1f} + new={_new_notional:.1f} > cap={_eq * MAX_CLUSTER:.1f}")
+                    from database.models import ProgramExecutionLog as _PEL2
+                    from datetime import timedelta as _td2
+                    _day = datetime.now(timezone.utc) - _td2(hours=24)
+                    _logs = db.query(_PEL2).filter(_PEL2.binding_id == binding.id, _PEL2.created_at >= _day).all()
+                    _day_pnl = sum(float(getattr(_l, "pnl", 0) or 0) for _l in _logs)
+                    if _eq > 0 and _day_pnl < -_eq * 0.05:
+                        logger.error(f"[ProgramExecution] portfolio guard: daily loss fuse, disabling binding {binding.id}")
+                        binding.is_active = False
+                        db.commit()
+                        return self._skip_result("daily_loss_fuse", f"day_pnl={_day_pnl:.1f} limit={-_eq * 0.05:.1f}")
+                except Exception as _ge:
+                    logger.warning(f"[ProgramExecution] portfolio guard check failed: {_ge}")
+            # PRP-P1-3: same-direction add cooldown 4h (4h訊號不反覆加倉)
+            if op in ("buy", "sell"):
+                _pos = positions_dict.get(decision.symbol)
+                if _pos:
+                    _same = (_pos.get("side") == "long" and op == "buy") or (_pos.get("side") == "short" and op == "sell")
+                    if _same:
+                        from database.models import ProgramExecutionLog as _PEL
+                        from datetime import timedelta as _td
+                        try:
+                            _cut = datetime.now(timezone.utc) - _td(hours=4)
+                            _recent = db.query(_PEL).filter(
+                                _PEL.binding_id == binding.id,
+                                _PEL.created_at >= _cut,
+                                _PEL.decision_action.in_(["buy", "sell"]),
+                            ).order_by(_PEL.id.desc()).first()
+                            if _recent is not None:
+                                logger.info(f"[ProgramExecution] Binding {binding.id} {decision.symbol} same-direction cooldown, skip add")
+                                return self._skip_result("same_direction_cooldown",
+                                    f"last add at {_recent.created_at}")
+                        except Exception as _ce:
+                            logger.warning(f"[ProgramExecution] cooldown check failed: {_ce}")
 
             # Execute based on operation type
             order_result = None
@@ -1021,7 +1359,7 @@ class ProgramExecutionService:
             take_profit_price=getattr(decision, 'take_profit_price', None),
             stop_loss_price=getattr(decision, 'stop_loss_price', None),
             tp_execution=getattr(decision, 'tp_execution', 'limit'),
-            sl_execution=getattr(decision, 'sl_execution', 'limit'),
+            sl_execution=getattr(decision, 'sl_execution', 'market'),
         )
 
         # IOC->GTC retry if no liquidity
@@ -1035,10 +1373,22 @@ class ProgramExecutionService:
                     take_profit_price=getattr(decision, 'take_profit_price', None),
                     stop_loss_price=getattr(decision, 'stop_loss_price', None),
                     tp_execution=getattr(decision, 'tp_execution', 'limit'),
-                    sl_execution=getattr(decision, 'sl_execution', 'limit'),
+                    sl_execution=getattr(decision, 'sl_execution', 'market'),
                 )
                 if order_result and order_result.get('status') in ['filled', 'resting']:
                     logger.info(f"[ProgramExecution] BUY {symbol} GTC fallback succeeded")
+                    # PRP-P2-2: GTC TTL 90s — resting單超時撤單, 防計劃外成交
+                    if order_result.get('status') == 'resting':
+                        try:
+                            import time as _t
+                            _oid = order_result.get('order_id')
+                            _t.sleep(90)
+                            _st = client.get_order_status(db, _oid, symbol) if hasattr(client, 'get_order_status') else None
+                            if isinstance(_st, dict) and _st.get('status') == 'resting':
+                                client.cancel_order(db, _oid, symbol)
+                                logger.warning(f"[ProgramExecution] BUY {symbol} GTC TTL expired, cancelled {_oid}")
+                        except Exception as _e:
+                            logger.warning(f"[ProgramExecution] GTC TTL check failed: {_e}")
 
         return order_result
 
@@ -1074,7 +1424,7 @@ class ProgramExecutionService:
             take_profit_price=getattr(decision, 'take_profit_price', None),
             stop_loss_price=getattr(decision, 'stop_loss_price', None),
             tp_execution=getattr(decision, 'tp_execution', 'limit'),
-            sl_execution=getattr(decision, 'sl_execution', 'limit'),
+            sl_execution=getattr(decision, 'sl_execution', 'market'),
         )
 
         # IOC->GTC retry if no liquidity
@@ -1088,10 +1438,22 @@ class ProgramExecutionService:
                     take_profit_price=getattr(decision, 'take_profit_price', None),
                     stop_loss_price=getattr(decision, 'stop_loss_price', None),
                     tp_execution=getattr(decision, 'tp_execution', 'limit'),
-                    sl_execution=getattr(decision, 'sl_execution', 'limit'),
+                    sl_execution=getattr(decision, 'sl_execution', 'market'),
                 )
                 if order_result and order_result.get('status') in ['filled', 'resting']:
                     logger.info(f"[ProgramExecution] SELL {symbol} GTC fallback succeeded")
+                    # PRP-P2-2: GTC TTL 90s
+                    if order_result.get('status') == 'resting':
+                        try:
+                            import time as _t
+                            _oid = order_result.get('order_id')
+                            _t.sleep(90)
+                            _st = client.get_order_status(db, _oid, symbol) if hasattr(client, 'get_order_status') else None
+                            if isinstance(_st, dict) and _st.get('status') == 'resting':
+                                client.cancel_order(db, _oid, symbol)
+                                logger.warning(f"[ProgramExecution] SELL {symbol} GTC TTL expired, cancelled {_oid}")
+                        except Exception as _e:
+                            logger.warning(f"[ProgramExecution] GTC TTL check failed: {_e}")
 
         return order_result
 
