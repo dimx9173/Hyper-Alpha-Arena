@@ -836,6 +836,12 @@ def _promotion_verdict(winfo) -> dict:
 
     樣本不足（少於 2 筆交易或缺時間戳）時回 ``available=False``，呼叫端
     必須視為未通過，不得當成已測量。
+
+    ``window_days``（有則取）：被評估的視窗長度（天）。OOS-only 定價只跑
+    驗證段，出場時間戳跨度約為視窗的 30%，若直接用戳跨度年化，365d 視窗
+    也會得到 years≈0.3 而被硬判 short_sample。有 window_days 時把戳做仿射
+    展開到 [w_end - w_days, w_end] 再送門——年化按視窗走，報酬序列本身不動，
+    利潤仍只計 OOS。不帶 window_days 的舊呼叫沿用純戳跨度路徑。
     """
     rets = list((winfo or {}).get("trade_returns") or [])
     stamps = list((winfo or {}).get("trade_exit_ms") or [])
@@ -852,10 +858,27 @@ def _promotion_verdict(winfo) -> dict:
         from backend.fuxi.validation import PromotionGate  # type: ignore
     import numpy as _np
 
+    ann_stamps = _np.asarray(stamps, dtype=_np.int64)
+    try:
+        w_span = float((winfo or {}).get("window_days") or 0.0)
+    except (TypeError, ValueError):
+        w_span = 0.0
+    if w_span > 0.0:
+        # OOS-only 定價把出場戳壓縮到驗證段（約 30% 視窗）；門必須按被評估
+        # 的視窗長度年化，利潤仍只計 OOS（報酬序列原樣不動，只展開時間軸）。
+        # 右端錨在最後一筆真實出場，不向未來外推。
+        t0, t1 = int(_np.min(ann_stamps)), int(_np.max(ann_stamps))
+        if t1 > t0:
+            w_end = t1
+            w_start = w_end - int(w_span * 86_400_000.0)
+            frac = (ann_stamps.astype(float) - float(t0)) / float(t1 - t0)
+            ann_stamps = (float(w_start) + frac * float(w_end - w_start)).astype(_np.int64)
+        # 零跨度（全同刻出場）不展開：沿舊路徑讓 infer 拋錯 → cannotAnnualize。
+
     try:
         verdict = PromotionGate().evaluate(
             _np.asarray(rets, dtype=float),
-            _np.asarray(stamps, dtype=_np.int64),
+            ann_stamps,
         )
     except ValueError as exc:
         # 時間戳跨度為 0（全部同一刻出場）無法年化，明確回報而非假造數值。
@@ -1020,6 +1043,9 @@ def evaluate_lgbm_spec(
             # 不在這裡先判，留給 primary 視窗的四關做最終門。
             "trade_returns": [float(v) for v in fuxi_out.trade_returns()],
             "trade_exit_ms": [int(v) for v in fuxi_out.exit_timestamps_ms()],
+            # 被評估的視窗長度：OOS-only 定價壓縮戳跨度，門按視窗年化；
+            # 報酬序列原樣不動，利潤仍只計 OOS。見 _promotion_verdict。
+            "window_days": float(w_days),
         }))
 
     refs = _load_ga()
