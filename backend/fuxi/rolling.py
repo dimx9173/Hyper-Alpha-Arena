@@ -16,8 +16,10 @@ an old contract; the new model only prices new entries.
 
 from __future__ import annotations
 
+import json
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import lightgbm as lgb
@@ -73,6 +75,108 @@ class TrainedModel:
     def calibrated_proba(self, X: pd.DataFrame) -> np.ndarray:
         raw = self.booster.predict_proba(X[self.feature_cols])[:, 1]
         return np.asarray(self.calibrator.transform(np.asarray(raw, dtype=float)))
+
+    def save(self, directory: Path) -> Path:
+        """把冠軍模型落盤，讓重啟後的進程不用重訓即可推理。
+
+        目錄結構：``booster.txt`` + ``isotonic.npz`` + ``meta.json``。
+
+        為何不用 pickle：pickle 把 sklearn/LGBM 物件的類別路徑與內部
+        記憶體佈局一起序列化，跨版本（sklearn/LGBM 升級、欄位增刪）即
+        反序列化失敗或靜默錯位；且 pickle 可執行任意程式碼，不適合當
+        模型存檔格式。這裡只存「重建所需的最小資料」。
+
+        為何存 LGBM 原生格式：``booster_.save_model`` 寫出的是純文字
+        樹結構（split/gain/leaf value），不依賴 Python 物件佈局，
+        跨版本可讀，且 ``lgb.Booster(model_file=...)`` 載入後的預測值
+        與原模型逐位一致。
+        """
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        booster_path = directory / "booster.txt"
+        iso_path = directory / "isotonic.npz"
+        meta_path = directory / "meta.json"
+        # LGBM 原生文字格式：只存樹，不存 Python 包裝層。
+        self.booster.booster_.save_model(str(booster_path))
+        # Isotonic 只存擬合陣列：重建時調 _build_f 重做插值函式即可，
+        # 不 pickle 內含 scipy interp1d 閉包的 sklearn 物件。
+        cal = self.calibrator
+        np.savez(
+            str(iso_path),
+            X_thresholds_=np.asarray(cal.X_thresholds_),
+            y_thresholds_=np.asarray(cal.y_thresholds_),
+            X_min_=np.asarray(cal.X_min_),
+            X_max_=np.asarray(cal.X_max_),
+        )
+        _objective = getattr(self.booster, "_objective", None)
+        meta = {
+            "model_id": self.model_id,
+            "params": dict(self.params),
+            "feature_cols": list(self.feature_cols),
+            "lgbm_params": self.booster.get_params(),
+            "classes": np.asarray(self.booster.classes_).tolist(),
+            "classes_dtype": str(np.asarray(self.booster.classes_).dtype),
+            "n_classes": int(self.booster.n_classes_),
+            "n_features": int(getattr(self.booster, "n_features_in_", self.booster._Booster.num_feature())),
+            "fitted_with_feature_names": bool(getattr(self.booster, "_fitted_with_feature_names", False)),
+            "objective": _objective if isinstance(_objective, str) else None,
+            "calibrator": {
+                "y_min": cal.y_min,
+                "y_max": cal.y_max,
+                "increasing": cal.increasing,
+                "increasing_": bool(getattr(cal, "increasing_", cal.increasing is True)),
+                "out_of_bounds": cal.out_of_bounds,
+            },
+        }
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        return directory
+
+    @classmethod
+    def load(cls, directory: Path) -> "TrainedModel":
+        """``save`` 的逆操作：重建 booster 與 calibrator，推理逐位一致。"""
+        directory = Path(directory)
+        meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+        # LGBM 包裝層用建構參數重建，樹本體從原生文字檔載入。
+        booster = lgb.LGBMClassifier(**meta["lgbm_params"])
+        booster._Booster = lgb.Booster(model_file=str(directory / "booster.txt"))
+        booster._classes = np.asarray(meta["classes"], dtype=np.dtype(meta["classes_dtype"]))
+        booster._n_classes = int(meta["n_classes"])
+        booster._objective = meta["objective"]
+        # predict() 走 _le.inverse_transform；predict_proba 不用它，但一併
+        # 重建才能讓載入後的模型保有完整 sklearn 介面。_LGBMLabelEncoder
+        # 是 lightgbm.sklearn 的私有類，版本升級可能消失：延遲匯入並容忍
+        # 失敗——推理路徑（calibrated_proba → predict_proba）不依賴它。
+        try:
+            from lightgbm.sklearn import _LGBMLabelEncoder
+        except ImportError:  # pragma: no cover - 新版 lightgbm 可能改名
+            _LGBMLabelEncoder = None
+        if _LGBMLabelEncoder is not None:
+            booster._le = _LGBMLabelEncoder()
+            booster._le.classes_ = booster._classes
+        booster.fitted_ = True
+        # 補回 sklearn 側的擬合屬性，讓 n_features_in_ / feature_name_ 等
+        # 內省介面在重啟後仍可用（predict 路徑本身不讀它們）。
+        booster._n_features = booster._Booster.num_feature()
+        booster._n_features_in = int(meta.get("n_features", booster._n_features))
+        booster._fitted_with_feature_names = bool(meta.get("fitted_with_feature_names", False))
+        # Isotonic 用存檔陣列重建，再調 _build_f 重做插值函式 f_。
+        iso = np.load(str(directory / "isotonic.npz"))
+        cal_kwargs = dict(meta["calibrator"])
+        increasing_fitted = cal_kwargs.pop("increasing_", None)
+        calibrator = IsotonicRegression(**cal_kwargs)
+        calibrator.X_thresholds_ = np.asarray(iso["X_thresholds_"])
+        calibrator.y_thresholds_ = np.asarray(iso["y_thresholds_"])
+        calibrator.X_min_ = float(np.asarray(iso["X_min_"]))
+        calibrator.X_max_ = float(np.asarray(iso["X_max_"]))
+        calibrator.increasing_ = increasing_fitted if increasing_fitted is not None else cal_kwargs["increasing"]
+        calibrator._build_f(calibrator.X_thresholds_, calibrator.y_thresholds_)
+        return cls(
+            model_id=meta["model_id"],
+            booster=booster,
+            calibrator=calibrator,
+            params=dict(meta["params"]),
+            feature_cols=list(meta["feature_cols"]),
+        )
 
 
 class RollingClosedLoopController:
