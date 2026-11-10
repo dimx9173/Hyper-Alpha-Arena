@@ -416,7 +416,8 @@ class PaperBroker:
         """以指定價格平倉（用於 TP/SL 觸發）。"""
         pos = self.positions[symbol]
         is_long = pos.size >= 0
-        fee = self.fee_model.fee(pos.size * price, is_maker=True)  # TP/SL 視為 maker
+        # TP 是掛單限價→maker；SL/過期/手動等一律吃單→taker（對齊 fuxi/backtest.py cost_leg_exit）。
+        fee = self.fee_model.fee(pos.size * price, is_maker=(reason == "take_profit"))
         # 同 close_position：size 已帶方向，不可再乘方向係數。
         gross = (price - pos.entry_price) * pos.size
         net = gross - fee - pos.fees_paid
